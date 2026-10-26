@@ -3,10 +3,10 @@
 from sqlalchemy import URL, Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from dropshare_server.core.config import Settings
+from dropshare_server.core.config import DatabaseSettings
 
 
-def database_url(settings: Settings) -> URL:
+def database_url(settings: DatabaseSettings) -> URL:
     return URL.create(
         "oracle+oracledb",
         username=settings.db_user,
@@ -17,7 +17,7 @@ def database_url(settings: Settings) -> URL:
     )
 
 
-def create_db_engine(settings: Settings) -> Engine:
+def create_db_engine(settings: DatabaseSettings) -> Engine:
     return create_engine(
         database_url(settings),
         pool_pre_ping=True,

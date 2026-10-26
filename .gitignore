@@ -34,3 +34,5 @@ dist/
 .cursor
 .agent-artifacts/
 .DS_Store
+
+docs/

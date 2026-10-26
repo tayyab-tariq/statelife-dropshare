@@ -33,6 +33,8 @@ Source of truth for server code. Requirements live in `docs/requirements.md`.
 | Validation failed                            | 400 `VALIDATION_ERROR`                                                            |
 | Not authenticated / token invalid or expired | 401 `UNAUTHENTICATED`                                                             |
 | Authenticated but not allowed                | 403 `FORBIDDEN` (use 404 when revealing existence would leak another user's data) |
+| Account disabled (after a correct password)  | 403 `ACCOUNT_DISABLED`                                                            |
+| Temporary password not yet changed           | 403 `PASSWORD_CHANGE_REQUIRED` (every endpoint except password change and logout) |
 | Not found                                    | 404 `NOT_FOUND`                                                                   |
 | Method not supported on this path            | 405 `METHOD_NOT_ALLOWED` (keeps the `Allow` header)                               |
 | Name taken / stale revision                  | 409 `NAME_CONFLICT` / `REVISION_CONFLICT`                                         |
@@ -42,6 +44,11 @@ Source of truth for server code. Requirements live in `docs/requirements.md`.
 | Account locked / rate limited                | 423 `ACCOUNT_LOCKED` / 429 `RATE_LIMITED`                                         |
 | Unexpected                                   | 500 `INTERNAL_ERROR`                                                              |
 | Not ready (database or storage unreachable)  | 503 `SERVICE_UNAVAILABLE` (`/health/ready` only)                                  |
+
+Several codes share a status (403 has three), so clients branch on `error.code`, never on the
+status alone. Errors the client must act on carry typed `details` from
+`dropshare_shared.schemas.error_details` (423 `AccountLockedDetails` plus `Retry-After`, 426
+`UpgradeRequiredDetails`); field-specific 400s use a list of `ValidationIssue`.
 
 Framework-raised `HTTPException`s are mapped to the same codes in `core/error_handlers.py`; any
 other 4xx becomes `VALIDATION_ERROR` and any 5xx becomes 500 `INTERNAL_ERROR`.

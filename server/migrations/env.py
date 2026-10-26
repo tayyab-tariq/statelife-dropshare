@@ -9,7 +9,7 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import Connection
 
-from dropshare_server.core.config import Settings
+from dropshare_server.core.config import DatabaseSettings
 from dropshare_server.core.db import create_db_engine, database_url
 from dropshare_server.models import Base
 
@@ -28,7 +28,7 @@ def _run(connection: Connection) -> None:
 
 def run_migrations_offline() -> None:
     context.configure(
-        url=database_url(Settings()),
+        url=database_url(DatabaseSettings()),
         target_metadata=target_metadata,
         literal_binds=True,
         compare_type=True,
@@ -42,7 +42,7 @@ def run_migrations_online() -> None:
     if isinstance(connection, Connection):
         _run(connection)
         return
-    engine = create_db_engine(Settings())
+    engine = create_db_engine(DatabaseSettings())
     try:
         with engine.connect() as connection:
             _run(connection)

@@ -26,6 +26,15 @@ class ListResponse[T](BaseModel):
     meta: Meta
 
 
+class ValidationIssue(BaseModel):
+    """One entry of 400 VALIDATION_ERROR `details`: which field (`loc`, e.g. ["body",
+    "new_password"]), a message to show, and a stable `type` the client can branch on."""
+
+    loc: list[str | int]
+    msg: str
+    type: str
+
+
 class ErrorBody(BaseModel):
     # Known codes parse to ErrorCode; codes newer than this client stay plain strings, so the
     # client can still show `message` and fall back to the HTTP status.

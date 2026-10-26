@@ -1,19 +1,27 @@
 """Server settings from environment variables, validated at startup (NFR-OPS-03, NFR-SEC-09)."""
 
+from ipaddress import IPv4Address, IPv6Address
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from dropshare_shared.version import parse_version
 
 # server/.env for local development; production sets real environment variables instead.
 ENV_FILE = Path(__file__).resolve().parents[3] / ".env"
 
+_GIB = 1024**3
 
-class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore", frozen=True)
 
-    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+class DatabaseSettings(BaseSettings):
+    """What Alembic and the app need to reach the database, and nothing else."""
+
+    # hide_input_in_errors: a validation error must never echo values such as DB_PASSWORD.
+    model_config = SettingsConfigDict(
+        env_file=ENV_FILE, extra="ignore", frozen=True, hide_input_in_errors=True
+    )
 
     db_host: str = Field(min_length=1)
     db_port: int = Field(default=1521, ge=1, le=65535)
@@ -23,5 +31,30 @@ class Settings(BaseSettings):
     db_pool_size: int = Field(default=5, ge=1)
     db_max_overflow: int = Field(default=10, ge=0)
 
+
+class Settings(DatabaseSettings):
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+
     storage_backend: Literal["local"] = "local"
     storage_local_root: Path
+
+    # Auth (FR-AUTH-03, FR-AUTH-06). The secret signs access tokens; at least 32 bytes.
+    token_secret: SecretStr = Field(min_length=32)
+    access_token_minutes: int = Field(default=15, ge=1)
+    refresh_token_inactivity_days: int = Field(default=30, ge=1)
+    refresh_token_absolute_days: int = Field(default=90, ge=1)
+    lockout_threshold: int = Field(default=5, ge=1)
+    lockout_minutes: int = Field(default=15, ge=1)
+
+    # Clients below this version get 426 UPGRADE_REQUIRED (FR-UPD-04).
+    min_client_version: str = "0.1.0"
+    default_quota_bytes: int = Field(default=50 * _GIB, ge=0)  # NFR-SCALE-03
+
+    # Reverse proxies whose X-Forwarded-For is trusted for the audit source IP.
+    trusted_proxies: list[IPv4Address | IPv6Address] = []
+
+    @field_validator("min_client_version")
+    @classmethod
+    def _valid_version(cls, value: str) -> str:
+        parse_version(value)  # same parser as the request check, so it can never fail open
+        return value.strip()
