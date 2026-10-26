@@ -19,9 +19,11 @@ from dropshare_server.core.config import Settings
 from dropshare_server.core.db import create_db_engine, create_session_factory
 from dropshare_server.core.errors import AppError
 from dropshare_server.services import audit as audit_service
+from dropshare_server.services import uploads as upload_service
 from dropshare_server.services import users as user_service
 from dropshare_server.services.audit import AuditTarget
 from dropshare_server.services.context import CallContext, cli_context
+from dropshare_server.storage.factory import create_storage_backend
 from dropshare_shared.schemas.audit import AuditAction, AuditOutcome
 from dropshare_shared.schemas.users import UserRole
 
@@ -129,6 +131,22 @@ def _export_audit(
     return 0
 
 
+def _run_job(
+    args: argparse.Namespace, sessions: sessionmaker[Session], settings: Settings, _: CallContext
+) -> int:
+    """Scheduled maintenance, run by the OS scheduler (NFR-REL-05). Jobs log what they did."""
+    match args.job:
+        case "expire-uploads":
+            result = upload_service.expire_uploads(
+                sessions, create_storage_backend(settings), datetime.now(UTC)
+            )
+            _out(
+                f"Expired {result.expired} upload(s); "
+                f"removed {result.swept} staged upload folder(s)."
+            )
+    return 0
+
+
 def _day_start(day: date | None) -> datetime | None:
     return None if day is None else datetime.combine(day, time.min, tzinfo=UTC)
 
@@ -194,13 +212,23 @@ def _build_parser() -> argparse.ArgumentParser:
     export.add_argument("--action", choices=[action.value for action in AuditAction])
     export.add_argument("--outcome", choices=[outcome.value for outcome in AuditOutcome])
     export.set_defaults(handler=_export_audit, audit_action=AuditAction.AUDIT_EXPORTED)
+
+    jobs = groups.add_parser("jobs", help="Scheduled maintenance jobs").add_subparsers(
+        dest="command", required=True
+    )
+    run = jobs.add_parser("run", help="Run one job now")
+    run.add_argument("job", choices=["expire-uploads"])
+    run.set_defaults(handler=_run_job, audit_action=None)
     return parser
 
 
 def _record_failure(
     sessions: sessionmaker[Session], ctx: CallContext, args: argparse.Namespace, code: str
 ) -> None:
-    """Failed commands are audited too (FR-ADMIN-01), in their own transaction."""
+    """Failed commands are audited too (FR-ADMIN-01), in their own transaction. Maintenance
+    jobs aren't administrative actions and have no audit action."""
+    if args.audit_action is None:
+        return
     username: str | None = getattr(args, "username", None)
     audit_service.record_now(
         sessions,

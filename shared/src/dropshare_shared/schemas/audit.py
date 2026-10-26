@@ -16,6 +16,10 @@ class AuditAction(StrEnum):
     USER_ENABLED = "user.enabled"
     USER_LISTED = "user.listed"
     AUDIT_EXPORTED = "audit.exported"
+    FOLDER_CREATED = "folder.created"
+    FILE_UPLOADED = "file.uploaded"
+    FILE_DOWNLOADED = "file.downloaded"
+    NODE_TRASHED = "node.trashed"
     ACCESS_DENIED = "access.denied"
 
 

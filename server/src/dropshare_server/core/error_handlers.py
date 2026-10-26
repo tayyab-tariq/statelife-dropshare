@@ -12,6 +12,7 @@ from dropshare_server.core.errors import AppError
 from dropshare_server.dependencies.context import build_call_context
 from dropshare_server.dependencies.resources import get_resources
 from dropshare_server.services import audit as audit_service
+from dropshare_server.services.audit import AuditTarget
 from dropshare_shared.errors import ErrorCode
 from dropshare_shared.schemas.audit import AuditAction, AuditOutcome
 from dropshare_shared.schemas.envelope import ErrorBody, ErrorResponse, ValidationIssue
@@ -44,7 +45,7 @@ def error_response(
 
 async def _app_error(request: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, AppError)  # noqa: S101 - registered for AppError only
-    if exc.status_code in (401, 403) and not exc.audited:
+    if (exc.status_code in (401, 403) or exc.denied) and not exc.audited:
         await run_in_threadpool(_record_access_denied, request, exc)
     headers = dict(exc.headers)
     if exc.status_code == 401:
@@ -60,6 +61,7 @@ def _record_access_denied(request: Request, exc: AppError) -> None:
         build_call_context(request, resources),
         AuditAction.ACCESS_DENIED,
         AuditOutcome.DENIED,
+        target=AuditTarget(type=exc.target[0], id=exc.target[1]) if exc.target else None,
         details={"method": request.method, "path": request.url.path, "code": exc.code.value},
     )
 
