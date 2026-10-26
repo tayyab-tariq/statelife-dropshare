@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(uv run ruff:*)",
+      "Bash(uv run mypy:*)",
+      "Bash(uv run pytest:*)",
+      "Bash(uv sync:*)",
+      "Bash(uv tree:*)",
+      "Bash(uv run alembic -c server/alembic.ini revision:*)",
+      "Bash(uv run alembic -c server/alembic.ini check:*)",
+      "Bash(uv run alembic -c server/alembic.ini current:*)",
+      "Bash(uv run alembic -c server/alembic.ini history:*)",
+      "Bash(uv run alembic -c server/alembic.ini upgrade head --sql:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(uv run --no-project python .claude/skills/session-audit/scripts/collect_changes.py:*)"
+    ],
+    "ask": [
+      "Bash(uv add:*)",
+      "Bash(uv remove:*)",
+      "Bash(uv pip install:*)",
+      "Bash(pip install:*)",
+      "Bash(uv run alembic -c server/alembic.ini upgrade:*)",
+      "Bash(uv run alembic -c server/alembic.ini downgrade:*)",
+      "Bash(pwsh scripts/build_client.ps1:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)"
+    ],
+    "deny": [
+      "Read(./**/.env)",
+      "Read(./**/.env.*)",
+      "Edit(./**/.env)",
+      "Edit(./**/.env.*)",
+      "Read(./**/*.pfx)",
+      "Read(./**/*.p12)",
+      "Read(./**/*.key)",
+      "Bash(rm -rf:*)",
+      "Bash(git push --force:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(uv run alembic -c server/alembic.ini downgrade base:*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          { "type": "command", "command": "uv run --no-project python \"$CLAUDE_PROJECT_DIR/.claude/hooks/session_start.py\"" }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": "uv run --no-project python \"$CLAUDE_PROJECT_DIR/.claude/hooks/protect_migrations.py\"", "timeout": 15 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          { "type": "command", "command": "uv run --no-project python \"$CLAUDE_PROJECT_DIR/.claude/hooks/format.py\"", "timeout": 30 }
+        ]
+      }
+    ]
+  }
+}
