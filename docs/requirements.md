@@ -743,6 +743,10 @@ These need an answer from the project owner. Items marked **Blocks** stop the na
 | OQ-3 | v1: accounts created directly against the database via the server CLI (FR-ADMIN-01). Admin UI is Phase 2 (BL-19); self-registration is out of scope. | 2026-10-26 |
 | OQ-4 | Proposed limits confirmed (D18). | 2026-10-26 |
 | OQ-5 | Product name: **StateLife DropShare** (D20). | 2026-10-26 |
+| OQ-12 | Local development: the client accepts `http://` only for `localhost`/`127.0.0.1`; every other server URL must be HTTPS (NFR-SEC-01 unchanged for real deployments). | 2026-10-26 |
+| OQ-13 | Development-only `--profile <name>` client flag: separate app-data folder, sync root, credential entry and single-instance name, so two clients can run on one Mac for sync testing. Not exposed in shipped builds. | 2026-10-26 |
+| OQ-14 | NFR-SEC-04: length rules (12–128) enforced first; the common-password list is added once a source/licence is supplied. | 2026-10-26 |
+| OQ-15 | Interim behaviour until roadmap F1/F2/F5 land: a local rename/move is sent as trash + re-upload (no data loss; FR-SYNC-10 pending); conflict notifications appear only as tray messages until the Activity view exists; uploads resume within a session but not across app restarts. | 2026-10-26 |
 
 ## 16. Glossary
 

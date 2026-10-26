@@ -1,0 +1,21 @@
+[project]
+name = "dropshare-server"
+version = "0.1.0"
+description = "StateLife DropShare API server"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "dropshare-shared",
+    "alembic>=1.14",
+    "fastapi>=0.115",
+    "oracledb>=2.5",
+    "pydantic-settings>=2.6",
+    "sqlalchemy>=2.0.36",
+    "uvicorn>=0.32",
+]
+
+[tool.uv.sources]
+dropshare-shared = { workspace = true }
+
+[build-system]
+requires = ["uv_build>=0.8,<0.14"]
+build-backend = "uv_build"

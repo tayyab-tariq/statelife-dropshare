@@ -34,12 +34,17 @@ Source of truth for server code. Requirements live in `docs/requirements.md`.
 | Not authenticated / token invalid or expired | 401 `UNAUTHENTICATED`                                                             |
 | Authenticated but not allowed                | 403 `FORBIDDEN` (use 404 when revealing existence would leak another user's data) |
 | Not found                                    | 404 `NOT_FOUND`                                                                   |
+| Method not supported on this path            | 405 `METHOD_NOT_ALLOWED` (keeps the `Allow` header)                               |
 | Name taken / stale revision                  | 409 `NAME_CONFLICT` / `REVISION_CONFLICT`                                         |
 | Too large                                    | 413 `FILE_TOO_LARGE`                                                              |
 | Over quota                                   | 409 `QUOTA_EXCEEDED`                                                              |
 | Client too old                               | 426 `UPGRADE_REQUIRED`                                                            |
 | Account locked / rate limited                | 423 `ACCOUNT_LOCKED` / 429 `RATE_LIMITED`                                         |
 | Unexpected                                   | 500 `INTERNAL_ERROR`                                                              |
+| Not ready (database or storage unreachable)  | 503 `SERVICE_UNAVAILABLE` (`/health/ready` only)                                  |
+
+Framework-raised `HTTPException`s are mapped to the same codes in `core/error_handlers.py`; any
+other 4xx becomes `VALIDATION_ERROR` and any 5xx becomes 500 `INTERNAL_ERROR`.
 
 ## 2. Response envelope
 
@@ -60,7 +65,7 @@ class ListResponse(BaseModel, Generic[T]):
     meta: Meta
 
 class ErrorBody(BaseModel):
-    code: ErrorCode
+    code: Annotated[ErrorCode | str, Field(union_mode="left_to_right")]  # unknown codes stay str
     message: str
     details: dict[str, object] | list[object] | None = None
 
@@ -88,6 +93,7 @@ validates outgoing data and drops any field not in the model.
 ## 5. Validation
 
 - Every body, query, and path model comes from `shared/` with `extra="forbid"` and explicit constraints (`min_length`, `max_length`, `ge`, `le`).
+- Response models do **not** use `extra="forbid"`: they keep the default (`ignore`) so installed clients keep parsing responses after the server adds fields (FR-UPD-04). Clients must also tolerate unknown `ErrorCode` values (`ErrorBody.code` is `ErrorCode | str`).
 - File and folder names: always `dropshare_shared.naming.validate_name()` (rules in NFR-COMPAT-02) and store `normalize_name()` (NFC + casefold) for uniqueness checks.
 - FastAPI returns 422 for validation errors by default; we override it so validation errors become `400 VALIDATION_ERROR` with `details` = list of `{loc, msg, type}`.
 

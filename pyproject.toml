@@ -1,0 +1,61 @@
+[project]
+name = "dropshare"
+version = "0.1.0"
+description = "StateLife DropShare workspace root"
+requires-python = ">=3.12,<3.13"
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["shared", "server", "client"]
+
+[tool.uv.sources]
+dropshare-shared = { workspace = true }
+dropshare-server = { workspace = true }
+dropshare-client = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "dropshare-shared",
+    "dropshare-server",
+    "dropshare-client",
+    "httpx>=0.27",
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-qt>=4.4",
+    "ruff>=0.8",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [".claude"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "N", "S", "BLE", "SIM", "RUF", "PTH", "DTZ", "T20"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["S101"]
+"server/migrations/**" = ["N999"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["dropshare_shared", "dropshare_server", "dropshare_client"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+mypy_path = ["shared/src", "server/src", "client/src"]
+explicit_package_bases = true
+exclude = ["^\\.venv/", "^\\.claude/", "^build/", "^dist/"]
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.pytest.ini_options]
+addopts = ["--import-mode=importlib", "--strict-markers"]
+testpaths = ["shared/tests", "server/tests", "client/tests"]
+markers = ["windows_only: needs real Windows APIs; skipped on other platforms"]
