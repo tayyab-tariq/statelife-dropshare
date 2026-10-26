@@ -39,6 +39,9 @@ Source of truth for server code. Requirements live in `docs/requirements.md`.
 | Method not supported on this path            | 405 `METHOD_NOT_ALLOWED` (keeps the `Allow` header)                               |
 | Name taken / stale revision                  | 409 `NAME_CONFLICT` / `REVISION_CONFLICT`                                         |
 | Too large                                    | 413 `FILE_TOO_LARGE`                                                              |
+| Upload completed with chunks missing         | 409 `UPLOAD_INCOMPLETE`                                                           |
+| Chunk or whole-file checksum wrong           | 400 `CHUNK_HASH_MISMATCH` / `FILE_HASH_MISMATCH`                                  |
+| Range outside the file                       | 416 `RANGE_NOT_SATISFIABLE` (with `Content-Range: bytes */size`)                  |
 | Over quota                                   | 409 `QUOTA_EXCEEDED`                                                              |
 | Client too old                               | 426 `UPGRADE_REQUIRED`                                                            |
 | Account locked / rate limited                | 423 `ACCOUNT_LOCKED` / 429 `RATE_LIMITED`                                         |
@@ -47,8 +50,12 @@ Source of truth for server code. Requirements live in `docs/requirements.md`.
 
 Several codes share a status (403 has three), so clients branch on `error.code`, never on the
 status alone. Errors the client must act on carry typed `details` from
-`dropshare_shared.schemas.error_details` (423 `AccountLockedDetails` plus `Retry-After`, 426
-`UpgradeRequiredDetails`); field-specific 400s use a list of `ValidationIssue`.
+`dropshare_shared.schemas.error_details`, the one module for them (423 `AccountLockedDetails` plus
+`Retry-After`, 426 `UpgradeRequiredDetails`, 409 `NameConflictDetails` / `RevisionConflictDetails`
+/ `UploadIncompleteDetails`, 413 `FileTooLargeDetails`, 416 `RangeNotSatisfiableDetails`).
+`400 VALIDATION_ERROR` details are always a list of `ValidationIssue` with a stable `type`:
+raise them with `core.errors.invalid(message, type, loc)`. `POST /uploads/{id}/complete`
+answers 200 (it is an action), not 201.
 
 Framework-raised `HTTPException`s are mapped to the same codes in `core/error_handlers.py`; any
 other 4xx becomes `VALIDATION_ERROR` and any 5xx becomes 500 `INTERNAL_ERROR`.
@@ -100,7 +107,7 @@ validates outgoing data and drops any field not in the model.
 ## 5. Validation
 
 - Every body, query, and path model comes from `shared/` with `extra="forbid"` and explicit constraints (`min_length`, `max_length`, `ge`, `le`).
-- Response models do **not** use `extra="forbid"`: they keep the default (`ignore`) so installed clients keep parsing responses after the server adds fields (FR-UPD-04). Clients must also tolerate unknown `ErrorCode` values (`ErrorBody.code` is `ErrorCode | str`).
+- Response models do **not** use `extra="forbid"`: they keep the default (`ignore`) so installed clients keep parsing responses after the server adds fields (FR-UPD-04). Clients must also tolerate unknown `ErrorCode` values (`ErrorBody.code` is `ErrorCode | str`), and enum fields in response models are `Annotated[Enum | str, Field(union_mode="left_to_right")]` for the same reason; the client treats an unknown value as "refetch".
 - File and folder names: always `dropshare_shared.naming.validate_name()` (rules in NFR-COMPAT-02) and store `normalize_name()` (NFC + casefold) for uniqueness checks.
 - FastAPI returns 422 for validation errors by default; we override it so validation errors become `400 VALIDATION_ERROR` with `details` = list of `{loc, msg, type}`.
 
