@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 
 from dropshare_server.api import health
+from dropshare_server.api import v1 as api_v1
 from dropshare_server.core.config import Settings
 from dropshare_server.core.db import create_db_engine, create_session_factory
 from dropshare_server.core.error_handlers import error_response, register_error_handlers
@@ -49,6 +50,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     register_error_handlers(app)
     app.middleware("http")(_request_context)
     app.include_router(health.router)
+    app.include_router(api_v1.router)
     return app
 
 

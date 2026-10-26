@@ -5,11 +5,16 @@ from collections.abc import Mapping
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from dropshare_server.core.errors import AppError
+from dropshare_server.dependencies.context import build_call_context
+from dropshare_server.dependencies.resources import get_resources
+from dropshare_server.services import audit as audit_service
 from dropshare_shared.errors import ErrorCode
-from dropshare_shared.schemas.envelope import ErrorBody, ErrorResponse
+from dropshare_shared.schemas.audit import AuditAction, AuditOutcome
+from dropshare_shared.schemas.envelope import ErrorBody, ErrorResponse, ValidationIssue
 
 # Framework-raised HTTP errors (routing, security helpers, body parsing) mapped to stable codes.
 _HTTP_ERRORS: dict[int, tuple[ErrorCode, str]] = {
@@ -37,16 +42,33 @@ def error_response(
     )
 
 
-async def _app_error(_: Request, exc: Exception) -> JSONResponse:
+async def _app_error(request: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, AppError)  # noqa: S101 - registered for AppError only
-    return error_response(exc.status_code, exc.code, exc.message, exc.details)
+    if exc.status_code in (401, 403) and not exc.audited:
+        await run_in_threadpool(_record_access_denied, request, exc)
+    headers = dict(exc.headers)
+    if exc.status_code == 401:
+        headers.setdefault("WWW-Authenticate", "Bearer")
+    return error_response(exc.status_code, exc.code, exc.message, exc.details, headers or None)
+
+
+def _record_access_denied(request: Request, exc: AppError) -> None:
+    """FR-AUDIT-01: authorization failures, in their own transaction (the request rolls back)."""
+    resources = get_resources(request)
+    audit_service.record_now(
+        resources.session_factory,
+        build_call_context(request, resources),
+        AuditAction.ACCESS_DENIED,
+        AuditOutcome.DENIED,
+        details={"method": request.method, "path": request.url.path, "code": exc.code.value},
+    )
 
 
 async def _validation_error(_: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, RequestValidationError)  # noqa: S101 - registered for this type only
     # Only location, message and type: the rejected input itself may contain secrets.
     details: list[object] = [
-        {"loc": list(error["loc"]), "msg": error["msg"], "type": error["type"]}
+        ValidationIssue(loc=list(error["loc"]), msg=error["msg"], type=error["type"]).model_dump()
         for error in exc.errors()
     ]
     return error_response(400, ErrorCode.VALIDATION_ERROR, "The request is not valid", details)
