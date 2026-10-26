@@ -23,6 +23,9 @@ class User(Base):
     role: Mapped[UserRole] = mapped_column(string_enum(UserRole))
     status: Mapped[UserStatus] = mapped_column(string_enum(UserStatus))
     quota_bytes: Mapped[int] = mapped_column(BigInteger)
+    # Current versions of the files in the user's own namespaces, trashed ones included until
+    # purged (FR-TRASH-04). Changed only with the user row locked (database.md §7).
+    used_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     failed_login_count: Mapped[int] = mapped_column(Integer, default=0)
     locked_until: Mapped[datetime | None] = mapped_column(UtcDateTime())
     must_change_password: Mapped[bool] = mapped_column(Flag())

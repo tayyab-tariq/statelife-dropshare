@@ -8,8 +8,9 @@ from sqlalchemy.orm import Session
 
 from dropshare_server.core.errors import AppError
 from dropshare_server.core.security import generate_temporary_password, hash_password
-from dropshare_server.models import Namespace, NamespaceKind, User
+from dropshare_server.models import Namespace, Node, User
 from dropshare_server.repositories import namespaces as namespace_repository
+from dropshare_server.repositories import nodes as node_repository
 from dropshare_server.repositories import users as user_repository
 from dropshare_server.services import audit as audit_service
 from dropshare_server.services import sessions as session_service
@@ -18,6 +19,7 @@ from dropshare_server.services.context import CallContext
 from dropshare_shared.errors import ErrorCode
 from dropshare_shared.naming import normalize_name
 from dropshare_shared.schemas.audit import AuditAction
+from dropshare_shared.schemas.nodes import NamespaceKind, NodeKind
 from dropshare_shared.schemas.users import (
     DISPLAY_NAME_MAX_LENGTH,
     EMAIL_MAX_LENGTH,
@@ -91,9 +93,20 @@ def create_user(
         updated_at=now,
     )
     user_repository.add(session, user)
-    namespace_repository.add(
+    namespace = Namespace(kind=NamespaceKind.PERSONAL, owner_user_id=user.id, created_at=now)
+    namespace_repository.add(session, namespace)
+    node_repository.add(
         session,
-        Namespace(kind=NamespaceKind.PERSONAL, owner_user_id=user.id, created_at=now),
+        Node(
+            namespace_id=namespace.id,
+            kind=NodeKind.FOLDER,
+            size_bytes=0,
+            revision=1,
+            created_at=now,
+            created_by_user_id=user.id,
+            modified_at=now,
+            modified_by_user_id=user.id,
+        ),
     )
     audit_service.record(
         session,

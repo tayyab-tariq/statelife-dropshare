@@ -1,8 +1,11 @@
 """Clients built today must keep parsing responses from newer servers (FR-UPD-04)."""
 
+import uuid
+
 from dropshare_shared.errors import ErrorCode
 from dropshare_shared.schemas.envelope import DataResponse, ErrorResponse, ListResponse
 from dropshare_shared.schemas.health import HealthOut
+from dropshare_shared.schemas.sync import ChangeOut, ChangeType
 
 
 def test_responses_tolerate_fields_added_by_newer_servers() -> None:
@@ -37,3 +40,27 @@ def test_unknown_error_code_is_kept_as_text() -> None:
     assert parsed.error.code == "SOME_FUTURE_CODE"
     assert not isinstance(parsed.error.code, ErrorCode)
     assert parsed.error.message == "Try again later"
+
+
+def test_response_enums_accept_values_from_a_newer_server() -> None:
+    """A server may add a change type, node kind or upload status later (FR-UPD-04)."""
+    change = ChangeOut.model_validate(
+        {
+            "cursor": 7,
+            "type": "restored",
+            "occurred_at": "2026-10-26T10:00:00Z",
+            "node_id": str(uuid.uuid4()),
+            "parent_id": None,
+            "name": None,
+            "kind": "symlink",
+            "size_bytes": 0,
+            "content_hash": None,
+            "revision": 1,
+            "modified_at": "2026-10-26T10:00:00Z",
+            "modified_by_user_id": str(uuid.uuid4()),
+        }
+    )
+    known = ChangeOut.model_validate({**change.model_dump(mode="json"), "type": "created"})
+
+    assert (change.type, change.kind) == ("restored", "symlink")
+    assert known.type is ChangeType.CREATED

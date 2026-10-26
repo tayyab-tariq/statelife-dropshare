@@ -15,6 +15,16 @@ def get(session: Session, user_id: uuid.UUID) -> User | None:
     return session.get(User, user_id)
 
 
+def get_for_update(session: Session, user_id: uuid.UUID) -> User | None:
+    """Lock the user row: quota usage is read and changed under this lock (database.md §7)."""
+    return session.scalars(
+        select(User)
+        .where(User.id == user_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).one_or_none()
+
+
 def get_by_username(session: Session, username_normalized: str) -> User | None:
     return session.scalars(
         select(User).where(User.username_normalized == username_normalized)

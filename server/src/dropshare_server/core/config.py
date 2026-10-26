@@ -12,6 +12,7 @@ from dropshare_shared.version import parse_version
 # server/.env for local development; production sets real environment variables instead.
 ENV_FILE = Path(__file__).resolve().parents[3] / ".env"
 
+_MIB = 1024**2
 _GIB = 1024**3
 
 
@@ -49,6 +50,15 @@ class Settings(DatabaseSettings):
     # Clients below this version get 426 UPGRADE_REQUIRED (FR-UPD-04).
     min_client_version: str = "0.1.0"
     default_quota_bytes: int = Field(default=50 * _GIB, ge=0)  # NFR-SCALE-03
+
+    # Files and transfers (FR-XFER-01, NFR-SCALE-01, requirements §7.2).
+    max_file_size_bytes: int = Field(default=10 * _GIB, ge=0)
+    upload_chunk_size_bytes: int = Field(default=8 * _MIB, ge=1)
+    upload_expiry_hours: int = Field(default=24, ge=1)
+
+    # Long-poll (FR-SYNC-03): how long POST /changes/wait holds, and how often it re-checks.
+    long_poll_timeout_seconds: float = Field(default=55, gt=0)
+    long_poll_interval_seconds: float = Field(default=1, gt=0)
 
     # Reverse proxies whose X-Forwarded-For is trusted for the audit source IP.
     trusted_proxies: list[IPv4Address | IPv6Address] = []

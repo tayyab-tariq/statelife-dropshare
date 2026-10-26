@@ -18,9 +18,10 @@ from sqlalchemy.orm import Session, sessionmaker
 from dropshare_server.cli import main as cli_main
 from dropshare_server.core.config import Settings
 from dropshare_server.core.errors import AppError
-from dropshare_server.models import AuditEvent, Namespace, NamespaceKind, User
+from dropshare_server.models import AuditEvent, Namespace, User
 from dropshare_shared.errors import ErrorCode
 from dropshare_shared.schemas.audit import AuditAction, AuditActorType, AuditOutcome
+from dropshare_shared.schemas.nodes import NamespaceKind
 from dropshare_shared.schemas.users import UserRole, UserStatus
 
 type Cli = Callable[..., tuple[int, str, str]]
@@ -350,3 +351,10 @@ def test_failed_export_leaves_no_file_behind(
     assert code == 1
     assert "Export failed midway." in err
     assert list(tmp_path.iterdir()) == [tmp_path / "storage"]
+
+
+def test_expire_uploads_job_runs_from_the_cli(cli: Cli) -> None:
+    code, out, _ = cli("jobs", "run", "expire-uploads")
+
+    assert code == 0
+    assert out == "Expired 0 upload(s); removed 0 staged upload folder(s).\n"

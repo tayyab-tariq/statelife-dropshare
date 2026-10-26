@@ -6,9 +6,21 @@ responses after the server adds fields (FR-UPD-04). Only request models use `ext
 
 from typing import Annotated
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from dropshare_shared.errors import ErrorCode
+
+PAGE_LIMIT_DEFAULT = 50
+PAGE_LIMIT_MAX = 200
+
+
+class PageQuery(BaseModel):
+    """`?page=&limit=` for page-based lists."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    page: int = Field(default=1, ge=1)
+    limit: int = Field(default=PAGE_LIMIT_DEFAULT, ge=1, le=PAGE_LIMIT_MAX)
 
 
 class Meta(BaseModel):

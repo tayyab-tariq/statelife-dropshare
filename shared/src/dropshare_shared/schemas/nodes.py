@@ -1,0 +1,74 @@
+"""Namespaces, files and folders (requirements §8, FR-FILE-04)."""
+
+import uuid
+from datetime import datetime
+from enum import StrEnum
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, Field
+
+# Coarse bound on request size only; the real rules are dropshare_shared.naming (NFR-COMPAT-02),
+# applied by the server so a rejected name comes back with its NameProblem code.
+NAME_INPUT_MAX_LENGTH = 1024
+
+
+class NamespaceKind(StrEnum):
+    PERSONAL = "personal"
+    SHARED = "shared"
+
+
+class NodeKind(StrEnum):
+    FILE = "file"
+    FOLDER = "folder"
+
+
+class AccessRole(StrEnum):
+    """The caller's effective role on a namespace or node."""
+
+    OWNER = "owner"
+    EDITOR = "editor"
+    VIEWER = "viewer"
+
+
+# Response enums also accept values this client doesn't know yet, so a newer server can add
+# one without breaking installed clients (FR-UPD-04). Clients treat an unknown value as
+# "refetch this item" rather than failing.
+type TolerantNamespaceKind = Annotated[NamespaceKind | str, Field(union_mode="left_to_right")]
+type TolerantAccessRole = Annotated[AccessRole | str, Field(union_mode="left_to_right")]
+type TolerantNodeKind = Annotated[NodeKind | str, Field(union_mode="left_to_right")]
+
+
+class NamespaceOut(BaseModel):
+    id: uuid.UUID
+    kind: TolerantNamespaceKind
+    root_node_id: uuid.UUID
+    role: TolerantAccessRole
+
+
+class NodeOut(BaseModel):
+    id: uuid.UUID
+    namespace_id: uuid.UUID
+    parent_id: uuid.UUID | None  # None only for a namespace's root folder
+    name: str | None  # None only for a namespace's root folder
+    kind: TolerantNodeKind
+    size_bytes: int  # 0 for folders
+    content_hash: str | None  # hex SHA-256 of the current version; None for folders
+    revision: int  # send back as the base revision of the next write (409 REVISION_CONFLICT)
+    created_at: datetime
+    modified_at: datetime
+    modified_by_user_id: uuid.UUID
+
+
+class FolderCreateIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    parent_id: uuid.UUID
+    name: str = Field(min_length=1, max_length=NAME_INPUT_MAX_LENGTH)
+
+
+class NodeDeleteQuery(BaseModel):
+    """`DELETE /nodes/{id}?if_revision=`: the revision the client last saw."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    if_revision: int = Field(ge=1)

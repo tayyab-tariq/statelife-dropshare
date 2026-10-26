@@ -5,6 +5,7 @@ server/.env), migrated to head once per session and emptied before each test. Wi
 settings they are skipped.
 """
 
+import hashlib
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -110,9 +111,23 @@ def storage_root(tmp_path: Path) -> Path:
     return root
 
 
+# Tiny transfer limits so chunking, quota and long-poll timeouts are quick to exercise.
+TEST_CHUNK_SIZE = 4
+TEST_MAX_FILE_SIZE = 4096
+TEST_QUOTA = 1024  # given to every user made by `make_user`
+
+
 @pytest.fixture
 def db_settings(test_database: Settings, clean_db: None, storage_root: Path) -> Settings:
-    return test_database.model_copy(update={"storage_local_root": storage_root})
+    return test_database.model_copy(
+        update={
+            "storage_local_root": storage_root,
+            "upload_chunk_size_bytes": TEST_CHUNK_SIZE,
+            "max_file_size_bytes": TEST_MAX_FILE_SIZE,
+            "long_poll_timeout_seconds": 1.0,
+            "long_poll_interval_seconds": 0.05,
+        }
+    )
 
 
 @pytest.fixture
@@ -167,7 +182,7 @@ def make_user(
                 email=f"{username}@example.com",
                 display_name=username.title(),
                 role=role,
-                quota_bytes=1024,
+                quota_bytes=TEST_QUOTA,
             )
         return created.user.username, created.temporary_password
 
@@ -199,20 +214,91 @@ def login(api: TestClient) -> Login:
     return post
 
 
+type SignIn = Callable[..., dict[str, str]]
+
+
 @pytest.fixture
-def signed_in(
-    api: TestClient, make_user: Callable[..., tuple[str, str]], login: Login
-) -> dict[str, str]:
+def sign_in(api: TestClient, make_user: Callable[..., tuple[str, str]], login: Login) -> SignIn:
+    """sign_in(username="alice"): create a user who signed in and replaced the temporary
+    password; returns username, password, tokens and ready-made `Authorization` header value."""
+
+    def create(username: str = "alice") -> dict[str, str]:
+        username, temporary = make_user(username)
+        first = login(username, temporary).json()["data"]
+        changed = api.post(
+            "/api/v1/me/password",
+            json={"current_password": temporary, "new_password": NEW_PASSWORD},
+            headers={"Authorization": f"Bearer {first['access_token']}"},
+        )
+        assert changed.status_code == 200, changed.text
+        tokens = changed.json()["data"]
+        return {
+            "username": username,
+            "password": NEW_PASSWORD,
+            "authorization": f"Bearer {tokens['access_token']}",
+            **tokens,
+        }
+
+    return create
+
+
+@pytest.fixture
+def signed_in(sign_in: SignIn) -> dict[str, str]:
     """A user who signed in and replaced the temporary password: username, password, tokens."""
-    username, temporary = make_user()
-    first = login(username, temporary).json()["data"]
-    changed = api.post(
-        "/api/v1/me/password",
-        json={"current_password": temporary, "new_password": NEW_PASSWORD},
-        headers={"Authorization": f"Bearer {first['access_token']}"},
-    )
-    assert changed.status_code == 200, changed.text
-    return {"username": username, "password": NEW_PASSWORD, **changed.json()["data"]}
+    return sign_in()
+
+
+type RootOf = Callable[[dict[str, str]], str]
+type UploadFile = Callable[..., Response]
+
+
+@pytest.fixture
+def root_of(api: TestClient) -> RootOf:
+    """root_of(user): the id of the user's personal root folder."""
+
+    def find(user: dict[str, str]) -> str:
+        response = api.get("/api/v1/namespaces", headers={"Authorization": user["authorization"]})
+        assert response.status_code == 200, response.text
+        root: str = response.json()["data"][0]["root_node_id"]
+        return root
+
+    return find
+
+
+@pytest.fixture
+def upload_file(api: TestClient) -> UploadFile:
+    """upload_file(user, content, parent_id=..., name=...) or (user, content, node_id=...,
+    base_revision=...): start, send every chunk, complete. Returns the complete response."""
+
+    def upload(user: dict[str, str], content: bytes, **target: object) -> Response:
+        headers = {"Authorization": user["authorization"]}
+        started = api.post(
+            "/api/v1/uploads",
+            json={
+                **{
+                    key: str(value) if key.endswith("_id") else value
+                    for key, value in target.items()
+                },
+                "size_bytes": len(content),
+                "sha256": hashlib.sha256(content).hexdigest(),
+            },
+            headers=headers,
+        )
+        assert started.status_code == 201, started.text
+        upload = started.json()["data"]
+        size = upload["chunk_size"]
+        for index in range(upload["chunk_count"]):
+            chunk = content[index * size : (index + 1) * size]
+            sent = api.put(
+                f"/api/v1/uploads/{upload['id']}/chunks/{index}",
+                content=chunk,
+                headers={**headers, "X-Chunk-SHA256": hashlib.sha256(chunk).hexdigest()},
+            )
+            assert sent.status_code == 204, sent.text
+        completed: Response = api.post(f"/api/v1/uploads/{upload['id']}/complete", headers=headers)
+        return completed
+
+    return upload
 
 
 @pytest.fixture

@@ -40,7 +40,7 @@ NAMING_CONVENTION = {
 
   Keep resulting names ≤ 128 bytes (Oracle 12.2+ limit); shorten table/column names or give an explicit `name=` if needed.
 - Table names plural snake_case (`users`, `nodes`, `file_versions`). Avoid Oracle reserved words as **column** names (`size`, `level`, `comment`, `date`, `number`, `mode`, `uid`, `user`, `access`, `file`, `session`, `resource`, `group`, `order`, `rows`): quoting them makes them case-sensitive in Oracle. Use `size_bytes`, `group_id`, `sort_order`, etc.
-- Primary keys: `Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)`. Append-only tables (`changes`, `audit_events`) use `BigInteger` with `Identity()` — the ID doubles as the sync cursor/ordering.
+- Primary keys: `Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)`. Append-only tables (`changes`, `audit_events`) use `BigInteger` with `Identity()`. An identity ID is **not** a sync cursor: concurrent transactions can commit its values out of order. The change cursor is `changes.seq`, numbered per namespace under a namespace row lock (`services/changes.record`).
 - Timestamps: `DateTime(timezone=True)`, set from `datetime.now(UTC)` in Python (not DB defaults), so all databases behave the same.
 - Relationships: explicit `lazy="raise"` by default on collections to prevent accidental N+1 queries; load with `selectinload`/`joinedload` where needed.
 
