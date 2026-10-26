@@ -1,0 +1,10 @@
+[project]
+name = "dropshare-shared"
+version = "0.1.0"
+description = "StateLife DropShare shared API contract: Pydantic models, error codes, name rules"
+requires-python = ">=3.12,<3.13"
+dependencies = ["pydantic>=2.9"]
+
+[build-system]
+requires = ["uv_build>=0.8,<0.14"]
+build-backend = "uv_build"

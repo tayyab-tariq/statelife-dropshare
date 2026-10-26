@@ -1,0 +1,1 @@
+"""StateLife DropShare desktop client."""
