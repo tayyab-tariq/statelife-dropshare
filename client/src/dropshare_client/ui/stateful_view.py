@@ -3,6 +3,7 @@
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QAccessible, QAccessibleEvent
 from PySide6.QtWidgets import (
+    QHBoxLayout,
     QLabel,
     QProgressBar,
     QPushButton,
@@ -11,15 +12,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from dropshare_client.ui import theme
+
 _LOADING_DELAY_MS = 300  # fast loads never flash a spinner
 
 
 def _page(*widgets: QWidget) -> QWidget:
     page = QWidget()
     layout = QVBoxLayout(page)
+    layout.setSpacing(theme.SPACE.lg)
     layout.addStretch()
     for widget in widgets:
-        layout.addWidget(widget, alignment=Qt.AlignmentFlag.AlignHCenter)
+        # Stretches rather than an alignment flag, so wrapped messages get their full height.
+        row = QHBoxLayout()
+        row.addStretch()
+        row.addWidget(widget)
+        row.addStretch()
+        layout.addLayout(row)
     layout.addStretch()
     return page
 
@@ -30,6 +39,7 @@ def _message_label(object_name: str) -> QLabel:
     label.setObjectName(object_name)
     label.setWordWrap(True)
     label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    label.setFixedWidth(theme.STATE_MAX_WIDTH)  # wraps within this; sized to it, not clipped
     label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
     return label
 
@@ -45,16 +55,20 @@ class StatefulView(QStackedWidget):
         busy.setRange(0, 0)  # indeterminate
         busy.setAccessibleName("Loading")
         busy.setTextVisible(False)
+        busy.setFixedWidth(theme.STATE_MAX_WIDTH // 2)
         self._loading_label = _message_label("loading_message")
+        self._loading_label.setProperty("textRole", "caption")
         self._loading = _page(busy, self._loading_label)
 
         self._error_label = _message_label("error_message")
         self._retry = QPushButton("&Try again")
+        self._retry.setProperty("variant", "primary")
         self._retry.clicked.connect(self.retry_requested)
         self._error = _page(self._error_label, self._retry)
 
         self._empty_label = _message_label("empty_message")
         self._empty_button = QPushButton()
+        self._empty_button.setProperty("variant", "primary")
         self._empty_button.clicked.connect(self.empty_action_requested)
         self._empty = _page(self._empty_label, self._empty_button)
 

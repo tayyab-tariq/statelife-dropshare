@@ -29,6 +29,7 @@ from dropshare_client.single_instance import SingleInstance, instance_name
 from dropshare_client.sync import binding
 from dropshare_client.sync.engine import SyncEngine, SyncListener
 from dropshare_client.ui.app_shell import AppShell
+from dropshare_client.ui.theme import Theme
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +130,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     app.setApplicationName("StateLife DropShare")
     app.setOrganizationName("StateLife")
     app.setQuitOnLastWindowClosed(False)  # closing the window hides it to the tray
+    Theme(app)  # before any window, so every widget is polished with it
 
     app_data = system.paths.app_data_dir()
     instance = SingleInstance(
