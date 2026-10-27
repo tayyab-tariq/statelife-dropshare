@@ -44,5 +44,5 @@ Requirements: FR-XFER-01..03, FR-SYNC-03, NFR-REL-02/04, NFR-PERF-02/04.
 | Delete to trash | On `NOT_FOUND`, check trash/state; if already trashed, success. |
 | Any 5xx / network error | Exponential backoff with jitter, max ~5 attempts per cycle, then mark the item for the next cycle. |
 | 4xx other than the above | Don't retry; mark the item `cant_sync` with the mapped reason. |
-| 401 | Refresh token once (API client handles it); `SessionExpired` → stop engine, show sign-in. |
+| 401 | Refresh token once (API client handles it); `SessionExpiredError` → stop engine, show sign-in. |
 | 426 | Stop the engine (`upgrade_required`) and trigger the updater. |
