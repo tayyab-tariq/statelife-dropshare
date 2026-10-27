@@ -1,17 +1,20 @@
 """Sign in with username or email and password (FR-AUTH-01, FR-CLIENT-05)."""
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
-    QDialogButtonBox,
     QFormLayout,
+    QFrame,
     QLabel,
     QLineEdit,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
 
 from dropshare_client.controllers.session_controller import SessionController
+from dropshare_client.ui import theme
 from dropshare_client.ui.forms import add_field, message_label, password_field, show_message
 
 
@@ -23,9 +26,20 @@ class SignInDialog(QDialog):
         self._controller = controller
         self.setWindowTitle("Sign in to StateLife DropShare")
         self.setAccessibleName("Sign in")
+        self.setMinimumWidth(theme.DIALOG_WIDTH)
 
+        strip = QFrame()
+        strip.setObjectName("brandStrip")
+        strip.setFixedHeight(theme.BRAND_STRIP_HEIGHT)
+        logo = QLabel()
+        logo.setPixmap(theme.logo(theme.LOGO_HEIGHT, self.devicePixelRatioF()))
+        heading = QLabel("Sign in to DropShare")
+        heading.setProperty("textRole", "subtitle")
         intro = QLabel("Sign in with the username or email your administrator gave you.")
+        intro.setProperty("textRole", "caption")
         intro.setWordWrap(True)
+        for label in (logo, heading, intro):
+            label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         self._message = message_label("sign_in_message")
 
         self._login = QLineEdit()
@@ -38,6 +52,8 @@ class SignInDialog(QDialog):
         # A saved override shows as such; unticking goes back to the built-in server.
         self._use_other_server.setChecked(controller.server_url != controller.default_server_url)
         form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)  # labels above fields
+        form.setVerticalSpacing(theme.SPACE.sm)
         add_field(form, "&Username or email", self._login)
         add_field(form, "&Password", self._password)
         form.addRow(self._use_other_server)
@@ -46,18 +62,38 @@ class SignInDialog(QDialog):
         self._use_other_server.toggled.connect(self._show_server)
         self._show_server(self._use_other_server.isChecked())
 
-        self._buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
-        self._cancel = self._buttons.button(QDialogButtonBox.StandardButton.Cancel)
-        self._sign_in = self._buttons.addButton("Sign in", QDialogButtonBox.ButtonRole.AcceptRole)
+        # One full-width primary action, with Cancel quiet beneath it.
+        self._sign_in = QPushButton("Sign in")
+        self._sign_in.setProperty("variant", "primary")
         self._sign_in.setDefault(True)
-        self._buttons.accepted.connect(self.accept)
-        self._buttons.rejected.connect(self.reject)
+        self._cancel = QPushButton("Cancel")
+        self._cancel.setProperty("variant", "subtle")
+        self._sign_in.clicked.connect(self.accept)
+        self._cancel.clicked.connect(self.reject)
+
+        body = QVBoxLayout()
+        space = theme.SPACE
+        body.setContentsMargins(space.xl, space.xl, space.xl, space.xl)
+        body.setSpacing(0)
+        body.addWidget(logo)
+        body.addSpacing(space.lg)
+        body.addWidget(heading)
+        body.addSpacing(space.xs)
+        body.addWidget(intro)
+        body.addSpacing(space.xl)
+        body.addLayout(form)
+        body.addSpacing(space.md)
+        body.addWidget(self._message)
+        body.addSpacing(space.lg)
+        body.addWidget(self._sign_in)
+        body.addSpacing(space.xs)
+        body.addWidget(self._cancel)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(intro)
-        layout.addWidget(self._message)
-        layout.addLayout(form)
-        layout.addWidget(self._buttons)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(strip)
+        layout.addLayout(body)
 
         controller.busy_changed.connect(self._set_busy)
         controller.sign_in_failed.connect(self._failed)

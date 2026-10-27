@@ -4,6 +4,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -12,6 +13,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from dropshare_client.ui import theme
 from dropshare_client.ui.stateful_view import StatefulView
 from dropshare_shared.schemas.users import UserOut
 
@@ -34,6 +36,32 @@ class _Value(QLabel):
         self.setAccessibleName(f"{self._caption}: {value}" if value else self._caption)
 
 
+def _caption(text: str) -> QLabel:
+    label = QLabel(text)
+    label.setProperty("textRole", "caption")
+    return label
+
+
+def _card(heading: str, rows: list[tuple[str, QWidget]]) -> tuple[QFrame, QVBoxLayout]:
+    """A titled card of caption/value rows; returns its layout for anything added below."""
+    space = theme.SPACE
+    card = QFrame()
+    card.setProperty("card", True)
+    title = QLabel(heading)
+    title.setProperty("textRole", "subtitle")
+    form = QFormLayout()
+    form.setHorizontalSpacing(space.xl)
+    form.setVerticalSpacing(space.md)
+    for caption, value in rows:
+        form.addRow(_caption(caption), value)
+    layout = QVBoxLayout(card)
+    layout.setContentsMargins(space.xl, space.lg, space.xl, space.xl)
+    layout.setSpacing(space.lg)
+    layout.addWidget(title)
+    layout.addLayout(form)
+    return card, layout
+
+
 class MainWindow(QMainWindow):
     open_folder_requested = Signal()
     choose_folder_requested = Signal()
@@ -50,47 +78,67 @@ class MainWindow(QMainWindow):
         self._quitting = False
         self._hide_on_close = True
 
-        heading = QLabel("StateLife DropShare")
+        self.setMinimumSize(theme.MAIN_WINDOW_MIN_SIZE)
+        space = theme.SPACE
+
         self._account = _Value("Signed in as")
         self._server = _Value("Server")
         self._folder = _Value("Sync folder")
         self._status = _Value("Status")
-        details = QFormLayout()
-        for caption, value in (
-            ("Signed in as", self._account),
-            ("Server", self._server),
-            ("Sync folder", self._folder),
-            ("Status", self._status),
-        ):
-            details.addRow(caption, value)
         self._open_folder = QPushButton("&Open sync folder")
+        self._open_folder.setProperty("variant", "primary")
         self._pause = QPushButton(_PAUSE)
         self._paused = False
 
-        content = QWidget()
-        layout = QVBoxLayout(content)
-        layout.addWidget(heading)
-        layout.addLayout(details)
+        sync_card, sync_layout = _card(
+            "Sync", [("Status", self._status), ("Sync folder", self._folder)]
+        )
         folder_actions = QHBoxLayout()
+        folder_actions.setSpacing(space.sm)
         folder_actions.addWidget(self._open_folder)
         folder_actions.addWidget(self._pause)
         folder_actions.addStretch()
-        layout.addLayout(folder_actions)
+        sync_layout.addLayout(folder_actions)
+        account_card, _ = _card(
+            "Account", [("Signed in as", self._account), ("Server", self._server)]
+        )
+
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(space.xxl, space.xl, space.xxl, space.xl)
+        layout.setSpacing(space.lg)
+        layout.addWidget(sync_card)
+        layout.addWidget(account_card)
         layout.addStretch()
         self._view = StatefulView(content)
 
-        # Account actions stay reachable in every state, including empty and error.
+        # Account actions live in the header, so they stay reachable in every state,
+        # including empty and error.
+        header = QFrame()
+        header.setObjectName("appHeader")
+        mark = QLabel()
+        mark.setPixmap(theme.logo_mark(theme.HEADER_MARK_SIZE, self.devicePixelRatioF()))
+        wordmark = QLabel("StateLife DropShare")
+        wordmark.setProperty("textRole", "subtitle")
         self._change_password = QPushButton("&Change password…")
         self._sign_out = QPushButton("&Sign out…")
-        actions = QHBoxLayout()
+        actions = QHBoxLayout(header)
+        actions.setContentsMargins(space.xl, space.md, space.xl, space.md)
+        actions.setSpacing(space.sm)
+        actions.addWidget(mark)
+        actions.addSpacing(space.xs)
+        actions.addWidget(wordmark)
         actions.addStretch()
-        actions.addWidget(self._change_password)
-        actions.addWidget(self._sign_out)
+        for button in (self._change_password, self._sign_out):
+            button.setProperty("variant", "subtle")
+            actions.addWidget(button)
 
         central = QWidget()
         outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(header)
         outer.addWidget(self._view, stretch=1)
-        outer.addLayout(actions)
         self.setCentralWidget(central)
 
         self._open_folder.clicked.connect(self.open_folder_requested)

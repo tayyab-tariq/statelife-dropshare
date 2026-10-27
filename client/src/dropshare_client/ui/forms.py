@@ -13,6 +13,7 @@ def message_label(object_name: str) -> QLabel:
     """
     label = QLabel()
     label.setObjectName(object_name)
+    label.setProperty("textRole", "error")
     label.setWordWrap(True)
     label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
     label.hide()
