@@ -92,3 +92,60 @@ def _locked_message(details: object) -> str:
     minutes = max(1, math.ceil(seconds / 60))
     unit = "minute" if minutes == 1 else "minutes"
     return f"Too many failed sign-in attempts. Try again in {minutes} {unit}."
+
+
+# --- syncing ---------------------------------------------------------------------------------
+
+SYNC_FOLDER_MISSING = (
+    "The sync folder can't be found. Reconnect its drive, or sign out and choose a new folder."
+)
+NO_PERSONAL_FOLDER = "Your account has no DropShare storage yet. Contact your administrator."
+SYNC_PROBLEM = "Syncing ran into a problem and will try again shortly."
+OTHER_ACCOUNT_FOLDER = (
+    "The sync folder holds files from another DropShare account. Choose a new, empty folder."
+)
+
+
+def _files(count: int) -> str:
+    return "1 file" if count == 1 else f"{count} files"
+
+
+def items_left(count: int) -> str:
+    """FR-CLIENT-01 "Syncing (n items)"; empty once nothing is left."""
+    if count <= 0:
+        return ""
+    return "1 item" if count == 1 else f"{count} items"
+
+
+def conflicts_message(count: int) -> str:
+    """Several conflicts at once, as one notification (ui.md §7)."""
+    return (
+        f"{count} files were changed on this computer and on the server. The server's "
+        "versions kept their names; yours were saved as conflicted copies next to them."
+    )
+
+
+def conflict_message(path: str, copy_path: str) -> str:
+    """FR-CONF-01: which file, and where the user's own version went."""
+    name = path.rpartition("/")[2]
+    copy_name = copy_path.rpartition("/")[2]
+    return (
+        f'"{name}" was changed on this computer and on the server. The server\'s version '
+        f'kept the name; yours was saved as "{copy_name}".'
+    )
+
+
+def mass_delete_message(here: int, on_server: int) -> str:
+    """FR-SYNC-08: what would be deleted where, and where it would go."""
+    parts = []
+    if here:
+        parts.append(
+            f"{_files(here)} deleted on the server would be removed from this computer "
+            "(to the Recycle Bin)."
+        )
+    if on_server:
+        parts.append(
+            f"{_files(on_server)} deleted on this computer would be removed from the server "
+            "(to your DropShare trash)."
+        )
+    return " ".join(parts) + " Delete them, or pause syncing to check first?"

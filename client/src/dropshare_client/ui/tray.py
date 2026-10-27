@@ -33,6 +33,7 @@ class Tray(QObject):
         self.quit = self._action("Quit", self.quit_requested.emit)
         self._icon.setContextMenu(self._menu)
         self._icon.activated.connect(self._activated)
+        self._icon.messageClicked.connect(self.open_app_requested.emit)
         self.state = TrayState.SIGNED_OUT
         self._detail = ""
         self._paused = False
@@ -70,6 +71,10 @@ class Tray(QObject):
 
     def tooltip(self) -> str:
         return self._icon.toolTip()
+
+    def notify(self, title: str, message: str) -> None:
+        """A balloon/toast; the tray icon's only way to tell the user something unasked."""
+        self._icon.showMessage(title, message, QSystemTrayIcon.MessageIcon.Information)
 
     def _refresh(self) -> None:
         self._icon.setIcon(status_icon(self.state))

@@ -1,9 +1,10 @@
 """The sign-in flow end to end through real controllers and services against a fake server
 (FR-AUTH-01/02/04/05, FR-SYNC-01, FR-CLIENT-01). Widgets are found by accessible name."""
 
+import json
 import logging
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -22,26 +23,14 @@ from pytestqt.qtbot import QtBot
 from dropshare_client.controllers import messages
 from dropshare_client.ui.app_shell import AppShell
 from dropshare_client.ui.theme import TrayState
+from dropshare_shared.schemas.users import UserOut
 
 type FindByName = Callable[[QWidget, type[QWidget], str], QWidget]
 type MakeClient = Callable[[], Client]
 type MakeShell = Callable[..., AppShell]
 
-
-@pytest.fixture
-def make_shell(qtbot: QtBot) -> Iterator[MakeShell]:
-    shells: list[AppShell] = []
-
-    def make(client: Client, *, tray_available: bool = True) -> AppShell:
-        shell = AppShell(client.session, client.folders, tray_available=tray_available)
-        qtbot.addWidget(shell.window)
-        qtbot.addWidget(shell.sign_in_dialog)
-        shells.append(shell)
-        return shell
-
-    yield make
-    for shell in shells:
-        shell.tray.hide()
+# Signed in, but nothing syncs until a folder is chosen.
+SIGNED_IN_WITHOUT_FOLDER = TrayState.PAUSED
 
 
 def _type(find: FindByName, root: QWidget, name: str, text: str) -> None:
@@ -62,6 +51,15 @@ def _sign_in(qtbot: QtBot, find: FindByName, shell: AppShell, login: str, passwo
     _type(find, dialog, "Username or email", login)
     _type(find, dialog, "Password", password)
     _click(qtbot, find, dialog, "Sign in")
+
+
+def _owned_by(client: Client, user: UserOut | None, folder: Path) -> None:
+    """Record `folder` as `user`'s, as a previous run would have (sync.binding)."""
+    assert user is not None
+    marker = folder / ".dropshare-tmp" / "owner.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    owner = {"server_url": client.config.config.server_url, "user_id": str(user.id)}
+    marker.write_text(json.dumps(owner))
 
 
 def _message(find: FindByName, root: QWidget, object_name: str) -> str:
@@ -143,7 +141,7 @@ def test_temporary_password_must_be_changed_before_anything_else(
     _type(find_by_name, dialog, "Confirm new password", NEW_PASSWORD)
     _click(qtbot, find_by_name, dialog, "Change password")
 
-    qtbot.waitUntil(lambda: shell.tray.state is TrayState.UP_TO_DATE)
+    qtbot.waitUntil(lambda: shell.tray.state is SIGNED_IN_WITHOUT_FOLDER)
     assert shell.password_dialog is None
     assert client.server.accounts["alice"].password == NEW_PASSWORD
     find_by_name(shell.window, QLabel, "Signed in as: Alice (alice)")
@@ -222,7 +220,7 @@ def test_starting_offline_keeps_the_sign_in_and_offers_retry(
 ) -> None:
     first = make_client()
     first.auth.sign_in(first.config.config.server_url, "alice", USER_PASSWORD)
-    first.config.update(sync_root=Path.home())
+    first.config.update(sync_root=first.app_data.parent / "Sync")
     client = make_client()
     client.server.offline = True
     shell = make_shell(client)
@@ -249,8 +247,9 @@ def test_sign_out_forgets_the_credential_and_can_recycle_the_files(
     sync_root = tmp_path / "Sync"
     (sync_root / "notes.txt").parent.mkdir()
     (sync_root / "notes.txt").write_text("keep me safe")
-    client.auth.sign_in(client.config.config.server_url, "alice", USER_PASSWORD)
+    session = client.auth.sign_in(client.config.config.server_url, "alice", USER_PASSWORD)
     client.config.update(sync_root=sync_root)
+    _owned_by(client, session.user, sync_root)  # synced before: the folder is alice's
     shell = make_shell(client)
     shell.start()
     qtbot.waitUntil(lambda: shell.tray.state is TrayState.UP_TO_DATE)
@@ -318,7 +317,7 @@ def test_the_forced_change_cannot_be_left_while_it_is_being_sent(
 
     assert dialog.isVisible() and not leave.isEnabled()
     gate.set()
-    qtbot.waitUntil(lambda: shell.tray.state is TrayState.UP_TO_DATE)
+    qtbot.waitUntil(lambda: shell.tray.state is SIGNED_IN_WITHOUT_FOLDER)
     assert client.credentials.secret in client.server.refresh  # still signed in
 
 
@@ -337,7 +336,7 @@ def test_sign_in_cannot_be_cancelled_half_way(
     assert shell.sign_in_dialog.isVisible()
     assert not find_by_name(shell.sign_in_dialog, QPushButton, "Cancel").isEnabled()
     gate.set()
-    qtbot.waitUntil(lambda: shell.tray.state is TrayState.UP_TO_DATE)
+    qtbot.waitUntil(lambda: shell.tray.state is SIGNED_IN_WITHOUT_FOLDER)
 
 
 def test_a_failed_account_load_after_a_password_change_keeps_the_change(
@@ -364,7 +363,7 @@ def test_a_failed_account_load_after_a_password_change_keeps_the_change(
     assert client.credentials.secret in client.server.refresh
     client.server.me_offline = False
     _click(qtbot, find_by_name, shell.window, "Try again")
-    qtbot.waitUntil(lambda: shell.tray.state is TrayState.UP_TO_DATE)
+    qtbot.waitUntil(lambda: shell.tray.state is SIGNED_IN_WITHOUT_FOLDER)
 
 
 def test_unticking_the_other_server_signs_in_to_the_built_in_one(
@@ -384,7 +383,7 @@ def test_unticking_the_other_server_signs_in_to_the_built_in_one(
     other.setChecked(False)
     _sign_in(qtbot, find_by_name, shell, "alice", USER_PASSWORD)
 
-    qtbot.waitUntil(lambda: shell.tray.state is TrayState.UP_TO_DATE)
+    qtbot.waitUntil(lambda: shell.tray.state is SIGNED_IN_WITHOUT_FOLDER)
     assert client.server.hosts[-1] == "127.0.0.1:8000"
     assert client.config.config.server_url == client.session.default_server_url
 
@@ -434,9 +433,10 @@ def test_sign_out_never_recycles_a_folder_dropshare_does_not_own(
     tmp_path: Path,
 ) -> None:
     client = make_client()
-    client.auth.sign_in(client.config.config.server_url, "alice", USER_PASSWORD)
+    session = client.auth.sign_in(client.config.config.server_url, "alice", USER_PASSWORD)
     unsafe = tmp_path / "app-data"  # DropShare's own data folder, as if mis-configured
     client.config.update(sync_root=unsafe)
+    _owned_by(client, session.user, unsafe)
     shell = make_shell(client)
     shell.start()
     qtbot.waitUntil(lambda: shell.tray.state is TrayState.UP_TO_DATE)

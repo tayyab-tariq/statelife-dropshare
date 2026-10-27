@@ -10,12 +10,17 @@ from pathlib import Path
 import httpx
 
 from dropshare_client.controllers.session_controller import SessionController
+from dropshare_client.controllers.sync_controller import SyncController
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
 from dropshare_client.platform.base import VolumeInfo, VolumeKind
+from dropshare_client.platform.macos.attributes import MacFileAttributes
 from dropshare_client.services.api_client import ApiClient
 from dropshare_client.services.auth import AuthService
 from dropshare_client.services.config import ConfigStore
 from dropshare_client.services.tokens import TokenStore
+from dropshare_client.store.index import Index
+from dropshare_client.sync import binding
+from dropshare_client.sync.engine import SyncListener, SyncState
 from dropshare_shared.version import Version, parse_version
 
 SERVER_URL = "http://127.0.0.1:8000"
@@ -221,6 +226,79 @@ class FakeVolumes:
         return [self.root / "OneDrive"]
 
 
+class FakeEngine:
+    """Stands in for the sync engine in UI tests: reports states like the real one, and owns
+    its index like the real one (closed once stopped)."""
+
+    def __init__(self, root: Path, index: Index, listener: SyncListener, display_name: str) -> None:
+        self.root = root
+        self.index = index
+        self.listener = listener
+        self.display_name = display_name
+        self.calls: list[str] = []
+        self.paused = False
+
+    def start(self) -> None:
+        self.calls.append("start")
+        self.listener.state_changed(SyncState.PAUSED if self.paused else SyncState.UP_TO_DATE, None)
+
+    def stop(self, timeout: float = 15.0) -> bool:
+        self.calls.append("stop")
+        self.listener.state_changed(SyncState.STOPPED, None)
+        self.index.close()
+        return True
+
+    def pause(self) -> None:
+        self.calls.append("pause")
+        self.paused = True
+        self.listener.state_changed(SyncState.PAUSED, None)
+
+    def resume(self) -> None:
+        self.calls.append("resume")
+        self.paused = False
+        self.listener.state_changed(SyncState.UP_TO_DATE, None)
+
+    def confirm_deletes(self, approved: bool) -> None:
+        self.calls.append(f"confirm_deletes({approved})")
+        if not approved:
+            self.pause()
+
+
+class FakeEngines:
+    """The engine factory for SyncController, keeping every engine it made. The folder's
+    ownership check is the real one (sync.binding), as in app.main."""
+
+    def __init__(self, index_path: Path) -> None:
+        self.index_path = index_path
+        self.made: list[FakeEngine] = []
+        self.gate: threading.Event | None = None  # hold starting here until set
+        self.fail_with: Exception | None = None
+
+    def __call__(
+        self,
+        root: Path,
+        user_id: uuid.UUID,
+        display_name: str,
+        server_url: str,
+        listener: SyncListener,
+    ) -> FakeEngine:
+        if self.gate is not None:
+            self.gate.wait(timeout=10)
+        if self.fail_with is not None:
+            raise self.fail_with
+        index = binding.open_index(self.index_path, root, server_url, user_id, MacFileAttributes())
+        engine = FakeEngine(root, index, listener, display_name)
+        self.made.append(engine)
+        return engine
+
+    def forget(self) -> None:
+        binding.forget(self.index_path)
+
+    @property
+    def last(self) -> FakeEngine:
+        return self.made[-1]
+
+
 @dataclass
 class Client:
     """One client install, wired like app.main but against the fake server."""
@@ -233,5 +311,7 @@ class Client:
     auth: AuthService
     session: SessionController
     folders: SyncFolderController
+    sync: SyncController
+    engines: FakeEngines
     trash: Path
     app_data: Path
