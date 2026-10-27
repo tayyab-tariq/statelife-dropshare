@@ -22,6 +22,7 @@ class SyncFolderController(QObject):
     checked = Signal(str, str)  # path, problem ("" when the folder can be used)
     saved = Signal(str)
     save_failed = Signal(str)
+    cleared = Signal()
 
     def __init__(
         self,
@@ -73,3 +74,14 @@ class SyncFolderController(QObject):
                 self.save_failed.emit(messages.message_for(exc))
 
         self._worker.submit(save, self.saved.emit, failed)
+
+    def clear(self) -> None:
+        """Forget the sync folder (its files stay where they are); a new one must be chosen."""
+
+        def failed(exc: Exception) -> None:
+            logger.error("Couldn't save the settings", exc_info=exc)
+            self.cleared.emit()
+
+        self._worker.submit(
+            lambda: self._config.update(sync_root=None), lambda _: self.cleared.emit(), failed
+        )

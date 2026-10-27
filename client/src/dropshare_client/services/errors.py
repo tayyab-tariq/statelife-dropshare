@@ -49,3 +49,19 @@ class SessionExpiredError(Exception):
 
 class InvalidInputError(ValueError):
     """What the user typed can't be sent (e.g. too long). The message never includes it."""
+
+
+class TransferCancelledError(Exception):
+    """The caller asked the transfer to stop. A partial download is kept to resume from."""
+
+
+class SourceChangedError(Exception):
+    """The file changed while it was being uploaded; hash it again and start over."""
+
+
+class RemoteContentChangedError(Exception):
+    """The server's content isn't the version asked for any more; fetch the changes first."""
+
+
+class ContentMismatchError(Exception):
+    """A download didn't match its SHA-256 even after a fresh attempt (NFR-REL-02)."""

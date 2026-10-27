@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from dropshare_server.core.errors import AppError, invalid
 from dropshare_server.models import Node
+from dropshare_server.repositories import changes as change_repository
 from dropshare_server.repositories import namespaces as namespace_repository
 from dropshare_server.repositories import nodes as node_repository
 from dropshare_server.repositories.nodes import LiveNameTakenError
@@ -158,12 +159,19 @@ def create_folder(
 
 
 def trash_node(
-    session: Session, ctx: CallContext, user_id: uuid.UUID, node_id: uuid.UUID, if_revision: int
+    session: Session,
+    ctx: CallContext,
+    user_id: uuid.UUID,
+    node_id: uuid.UUID,
+    if_revision: int,
+    if_cursor: int | None = None,
 ) -> None:
     """Move an item and everything inside it to the owner's trash (FR-TRASH-01).
 
     Repeating a delete that already succeeded (a retry after a timeout) succeeds again without
-    changing anything, so the client can confirm its own delete (NFR-REL-04).
+    changing anything, so the client can confirm its own delete (NFR-REL-04). With
+    `if_cursor`, a change to anything inside after that cursor refuses the delete: the client
+    hasn't seen it, and it wins over the delete (FR-CONF-03).
     """
     node = access.require_node(session, user_id, node_id, write=True, lock=True, allow_trashed=True)
     if node.trashed_at is not None:
@@ -178,6 +186,10 @@ def trash_node(
         raise revision_conflict(node.revision)
 
     descendant_ids = node_repository.lock_live_descendant_ids(session, node.id)
+    if if_cursor is not None and change_repository.any_after(
+        session, node.namespace_id, if_cursor, descendant_ids
+    ):
+        raise revision_conflict(node.revision)
     now = datetime.now(UTC)
     node.revision += 1
     node_repository.trash(session, node, descendant_ids, user_id, now)

@@ -5,9 +5,11 @@ import logging
 import re
 import sys
 import threading
+import uuid
 from collections.abc import Sequence
 from importlib.metadata import version
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from types import TracebackType
 
 from PySide6.QtCore import QThreadPool
@@ -15,13 +17,17 @@ from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from dropshare_client import platform
 from dropshare_client.controllers.session_controller import SessionController
+from dropshare_client.controllers.sync_controller import SyncController
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
 from dropshare_client.platform.base import Paths
 from dropshare_client.services.api_client import ApiClient
 from dropshare_client.services.auth import AuthService, this_device
 from dropshare_client.services.config import ConfigStore
+from dropshare_client.services.files import RemoteFiles
 from dropshare_client.services.tokens import TokenStore
 from dropshare_client.single_instance import SingleInstance, instance_name
+from dropshare_client.sync import binding
+from dropshare_client.sync.engine import SyncEngine, SyncListener
 from dropshare_client.ui.app_shell import AppShell
 
 logger = logging.getLogger(__name__)
@@ -149,9 +155,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     folders = SyncFolderController(
         system.volumes, config, system.paths.default_sync_root(), app_data
     )
+    files = RemoteFiles(api)
+    index_path = app_data / "index.db"
+
+    def make_engine(
+        root: Path, user_id: uuid.UUID, name: str, server_url: str, listener: SyncListener
+    ) -> SyncEngine:
+        index = binding.open_index(index_path, root, server_url, user_id, system.file_attributes)
+        return SyncEngine(
+            root,
+            index,
+            files,
+            system.recycle_bin,
+            system.file_identity,
+            system.file_attributes,
+            listener,
+            display_name=name,
+            max_path=platform.max_path_length(),
+        )
+
+    sync = SyncController(config, make_engine, lambda: binding.forget(index_path))
     shell = AppShell(
         session,
         folders,
+        sync,
         background=args.background,
         tray_available=QSystemTrayIcon.isSystemTrayAvailable(),
     )
@@ -164,6 +191,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return app.exec()
     finally:
+        sync.shutdown()  # at a safe point: the journal and index are consistent
         # Let running requests finish before their HTTP client goes away (architecture §2).
         if not QThreadPool.globalInstance().waitForDone(_QUIT_WAIT_MS):
             logger.warning("Quit while work was still running")

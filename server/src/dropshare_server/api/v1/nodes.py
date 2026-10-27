@@ -52,7 +52,12 @@ def trash_node(
     ctx: Context,
 ) -> Response:
     node_service.trash_node(
-        db, ctx.as_actor(current.actor), current.user.id, node_id, query.if_revision
+        db,
+        ctx.as_actor(current.actor),
+        current.user.id,
+        node_id,
+        query.if_revision,
+        query.if_cursor,
     )
     return Response(status_code=204)
 

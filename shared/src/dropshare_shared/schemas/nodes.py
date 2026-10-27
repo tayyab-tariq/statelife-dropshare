@@ -67,8 +67,12 @@ class FolderCreateIn(BaseModel):
 
 
 class NodeDeleteQuery(BaseModel):
-    """`DELETE /nodes/{id}?if_revision=`: the revision the client last saw."""
+    """`DELETE /nodes/{id}?if_revision=&if_cursor=`: the revision the client last saw, and
+    optionally the namespace cursor it had read up to. With `if_cursor`, the delete is
+    refused (409 REVISION_CONFLICT) if anything inside the folder changed after that cursor,
+    so a file another device just added isn't taken to the trash with it (FR-CONF-03)."""
 
     model_config = ConfigDict(extra="forbid")
 
     if_revision: int = Field(ge=1)
+    if_cursor: int | None = Field(default=None, ge=0)

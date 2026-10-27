@@ -214,6 +214,52 @@ def test_root_folder_cannot_be_deleted(api: TestClient, sign_in: SignIn, root_of
     assert response.status_code == 400
 
 
+def _cursor(api: TestClient, user: User) -> int:
+    namespace = api.get("/api/v1/namespaces", headers=_auth(user)).json()["data"][0]["id"]
+    page = api.get(f"/api/v1/namespaces/{namespace}/changes", headers=_auth(user)).json()
+    cursor: int = page["meta"]["cursor"]
+    return cursor
+
+
+def test_delete_with_a_cursor_is_refused_if_something_inside_changed_since(
+    api: TestClient, sign_in: SignIn, root_of: RootOf, upload_file: UploadFile
+) -> None:
+    """FR-CONF-03: another device's new file inside isn't taken to the trash unseen."""
+    alice = sign_in()
+    folder = _mkdir(api, alice, root_of(alice), "Shared").json()["data"]
+    seen = _cursor(api, alice)
+    added = upload_file(alice, b"new", parent_id=folder["id"], name="new.txt")
+    assert added.status_code == 200
+
+    refused = api.delete(
+        f"/api/v1/nodes/{folder['id']}?if_revision=1&if_cursor={seen}", headers=_auth(alice)
+    )
+    assert refused.status_code == 409
+    assert refused.json()["error"]["code"] == "REVISION_CONFLICT"
+
+    current = _cursor(api, alice)
+    allowed = api.delete(
+        f"/api/v1/nodes/{folder['id']}?if_revision=1&if_cursor={current}", headers=_auth(alice)
+    )
+    assert allowed.status_code == 204
+
+
+def test_delete_with_a_cursor_ignores_changes_elsewhere(
+    api: TestClient, sign_in: SignIn, root_of: RootOf
+) -> None:
+    alice = sign_in()
+    root = root_of(alice)
+    folder = _mkdir(api, alice, root, "A").json()["data"]
+    seen = _cursor(api, alice)
+    _mkdir(api, alice, root, "B")  # outside the folder
+
+    response = api.delete(
+        f"/api/v1/nodes/{folder['id']}?if_revision=1&if_cursor={seen}", headers=_auth(alice)
+    )
+
+    assert response.status_code == 204
+
+
 def test_probing_another_users_trashed_item_is_audited_with_its_target(
     api: TestClient, sign_in: SignIn, root_of: RootOf, audit_events: AuditEvents
 ) -> None:

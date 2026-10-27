@@ -41,7 +41,7 @@ Requirements: FR-XFER-01..03, FR-SYNC-03, NFR-REL-02/04, NFR-PERF-02/04.
 | Upload complete | Safe: completing a completed session returns the same node. |
 | Create folder | On `NAME_CONFLICT`, fetch the existing item; if it's a folder in the right place, treat as success. |
 | Move/rename (`PATCH`) | On `REVISION_CONFLICT` after a timeout, fetch the node; if it already has the intended parent/name, treat as success; otherwise conflict. |
-| Delete to trash | On `NOT_FOUND`, check trash/state; if already trashed, success. |
+| Delete to trash | Send `if_cursor` too. Repeating a delete that worked returns 204; `NOT_FOUND` means already gone (success); `REVISION_CONFLICT` means something changed there: plan again, the edit wins. |
 | Any 5xx / network error | Exponential backoff with jitter, max ~5 attempts per cycle, then mark the item for the next cycle. |
 | 4xx other than the above | Don't retry; mark the item `cant_sync` with the mapped reason. |
 | 401 | Refresh token once (API client handles it); `SessionExpiredError` → stop engine, show sign-in. |

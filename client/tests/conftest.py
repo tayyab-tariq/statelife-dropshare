@@ -5,16 +5,20 @@ from pathlib import Path
 
 import httpx
 import pytest
-from client_fakes import Client, FakeServer, FakeVolumes, MemoryCredentials
+from client_fakes import Client, FakeEngines, FakeServer, FakeVolumes, MemoryCredentials
+from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import QAbstractButton, QLabel, QWidget
+from pytestqt.qtbot import QtBot
 
 from dropshare_client.controllers.session_controller import SessionController
+from dropshare_client.controllers.sync_controller import SyncController
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
 from dropshare_client.platform.macos.recycle_bin import MacTrash
 from dropshare_client.services.api_client import ApiClient
 from dropshare_client.services.auth import AuthService, Device
 from dropshare_client.services.config import ConfigStore
 from dropshare_client.services.tokens import TokenStore
+from dropshare_client.ui.app_shell import AppShell
 
 # Headless Qt so tests run without a display (CI, SSH sessions). Visual checks on the Windows
 # machine run the app itself, not these tests.
@@ -89,6 +93,7 @@ def make_client(
         )
         made.append(api)
         auth = AuthService(api, tokens, Device(name="Test PC", os="Windows 11"))
+        engines = FakeEngines(tmp_path / "app-data" / "index.db")
         return Client(
             server=server,
             credentials=credentials,
@@ -103,6 +108,8 @@ def make_client(
                 tmp_path / "StateLife DropShare",
                 tmp_path / "app-data",
             ),
+            sync=SyncController(config, engines, engines.forget),
+            engines=engines,
             trash=trash,
             app_data=tmp_path / "app-data",
         )
@@ -110,3 +117,31 @@ def make_client(
     yield make
     for api in made:
         api.close()
+
+
+type MakeShell = Callable[..., AppShell]
+
+
+@pytest.fixture
+def make_shell(qtbot: QtBot) -> Iterator[MakeShell]:
+    shells: list[AppShell] = []
+    clients: list[Client] = []
+
+    def make(client: Client, *, tray_available: bool = True) -> AppShell:
+        clients.append(client)
+        shell = AppShell(client.session, client.folders, client.sync, tray_available=tray_available)
+        qtbot.addWidget(shell.window)
+        qtbot.addWidget(shell.sign_in_dialog)
+        shells.append(shell)
+        return shell
+
+    yield make
+    for shell in shells:
+        shell.tray.hide()
+    # pytest-qt has deleted the widgets by now: silence what still arrives for them.
+    for client in clients:
+        for controller in (client.sync, client.session, client.folders):
+            controller.blockSignals(True)
+        client.sync.shutdown()
+    QThreadPool.globalInstance().waitForDone(5000)
+    qtbot.wait(10)

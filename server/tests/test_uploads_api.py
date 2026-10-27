@@ -221,6 +221,30 @@ def test_completing_again_returns_the_same_file(
     assert _used_bytes(session_factory, "alice") == 3
 
 
+def test_completing_again_after_the_file_was_trashed_is_a_conflict(
+    api: TestClient, sign_in: SignIn, root_of: RootOf
+) -> None:
+    """A lost answer, then another device trashed the file: the retry must not report a
+    trashed file as the client's live upload (it uploads again as a new file)."""
+    alice = sign_in()
+    upload_id = _start(api, alice, 3, _sha(b"abc"), parent_id=root_of(alice), name="r").json()[
+        "data"
+    ]["id"]
+    _put(api, alice, upload_id, 0, b"abc")
+    node = _complete(api, alice, upload_id).json()["data"]
+    trashed = api.delete(
+        f"/api/v1/nodes/{node['id']}?if_revision={node['revision']}",
+        headers={"Authorization": alice["authorization"]},
+    )
+    assert trashed.status_code == 204
+
+    retry = _complete(api, alice, upload_id)
+
+    assert retry.status_code == 409
+    assert retry.json()["error"]["code"] == "REVISION_CONFLICT"
+    assert retry.json()["error"]["details"] == {"current_revision": None}
+
+
 def test_empty_file_needs_no_chunks(
     api: TestClient, sign_in: SignIn, root_of: RootOf, upload_file: UploadFile
 ) -> None:

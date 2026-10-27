@@ -46,6 +46,12 @@ class RecycleBin(Protocol):
         ...
 
 
+class FileAttributes(Protocol):
+    def hide(self, path: Path) -> None:
+        """Hide DropShare's own folder inside the sync folder from Explorer; best effort."""
+        ...
+
+
 @dataclass(frozen=True)
 class FileId:
     """Stable identity of a file across renames on one volume, for move detection."""

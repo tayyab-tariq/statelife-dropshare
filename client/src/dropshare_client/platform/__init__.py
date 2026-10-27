@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from dropshare_client.platform.base import (
     CredentialStore,
+    FileAttributes,
     FileIdentity,
     Paths,
     RecycleBin,
@@ -25,6 +26,7 @@ class Platform:
     credentials: CredentialStore
     recycle_bin: RecycleBin
     file_identity: FileIdentity
+    file_attributes: FileAttributes
     volumes: Volumes
 
 
@@ -38,6 +40,13 @@ def paths() -> Paths:
 
         return MacPaths()
     raise RuntimeError(f"Unsupported platform: {sys.platform}")
+
+
+def max_path_length() -> int | None:
+    """The longest full path the client may use, or None for no limit. Windows without
+    long-path support stops at MAX_PATH (260 including the terminator); paths beyond it are
+    listed as "can't sync" until long paths are supported (NFR-COMPAT-03, decision D4)."""
+    return 259 if sys.platform == "win32" else None
 
 
 def allow_foreground_handover() -> None:
@@ -62,20 +71,26 @@ def current(profile: str | None = None) -> Platform:
     )
     recycle_bin: RecycleBin
     volumes: Volumes
+    attributes: FileAttributes
     if sys.platform == "win32":
+        from dropshare_client.platform.windows.attributes import WindowsFileAttributes
         from dropshare_client.platform.windows.recycle_bin import WindowsRecycleBin
         from dropshare_client.platform.windows.volumes import WindowsVolumes
 
         recycle_bin, volumes = WindowsRecycleBin(), WindowsVolumes()
+        attributes = WindowsFileAttributes()
     else:
+        from dropshare_client.platform.macos.attributes import MacFileAttributes
         from dropshare_client.platform.macos.recycle_bin import MacTrash
         from dropshare_client.platform.macos.volumes import MacVolumes
 
         recycle_bin, volumes = MacTrash(), MacVolumes()
+        attributes = MacFileAttributes()
     return Platform(
         paths=selected,
         credentials=KeyringCredentialStore(service),
         recycle_bin=recycle_bin,
         file_identity=StatFileIdentity(),
+        file_attributes=attributes,
         volumes=volumes,
     )

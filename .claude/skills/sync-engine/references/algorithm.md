@@ -38,11 +38,18 @@ engine's executor thread (one writer). WAL mode on.
 
 | Table | Purpose |
 |---|---|
-| `entries` | One row per synced item: relative path, normalized path, node ID, namespace ID, kind, server revision, content hash, size, local mtime, local file ID, state (`synced`, `pending_upload`, `pending_download`, `conflict`, `cant_sync`), reason |
-| `cursors` | Change cursor per namespace |
-| `mounts` | Accepted shared folders and their local top-level names, role (viewer/editor) |
+| `meta` | Schema version and the binding (server URL, user ID, sync root) the index describes |
+| `entries` | The base: one row per item as last in sync on both sides — normalized path (key), on-disk path, node ID, kind, server revision, content hash, size, local mtime, local file ID. Only written after the operation it records succeeded |
+| `remote_nodes` | The server's live tree as the change journal last described it; saved in the same transaction as the cursor it brings us to |
+| `cursors` | Change cursor and root node per namespace |
+| `mounts` | Accepted shared folders and their local top-level names, role (viewer/editor) — roadmap F4 |
 | `journal` | In-flight multi-step operations (section 10) |
 | `activity` | Recent events for the Activity view (bounded, oldest pruned) |
+| `problems` | Items that can't sync and why ("Can't sync", FR-SYNC-07) |
+
+The index is a cache of what was last in sync: a schema change rebuilds it instead of migrating.
+Without a base the reconciler never deletes; it links equal items and keeps both copies of
+different ones.
 
 Paths are stored relative to the sync root with `/` separators; comparisons use the normalized
 form (NFC + casefold) because NTFS is case-insensitive.
@@ -108,7 +115,8 @@ For files **and** folders, each combination of local {none, create, modify, dele
 
 - Before applying a batch, count pending deletions (both directions). If > 500 files or > 25% of synced files, pause the engine in a `needs_confirmation` state and ask the user (FR-SYNC-08). Nothing is deleted until they confirm.
 - Remote deletes: move the local item to the Recycle Bin via the platform helper (FR-SYNC-09). If that fails (e.g. Recycle Bin disabled on the drive), move it to `<sync root>\.dropshare-tmp\deleted\` and surface it in Can't sync — never hard-delete.
-- Local deletes: `DELETE /nodes/{id}` (server trash).
+- Local deletes: `DELETE /nodes/{id}?if_revision=&if_cursor=` (server trash). The cursor makes the server refuse (`409 REVISION_CONFLICT`) if anything inside a folder changed since the client last fetched, so another device's new file isn't trashed with it (OQ-19).
+- A sync folder that already holds files is only adopted if the index or `.dropshare-tmp/owner.json` says it is this account's (OQ-20, `sync/binding.py`).
 
 ## 9. Shared folders and viewers
 

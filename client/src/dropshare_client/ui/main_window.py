@@ -15,6 +15,9 @@ from PySide6.QtWidgets import (
 from dropshare_client.ui.stateful_view import StatefulView
 from dropshare_shared.schemas.users import UserOut
 
+_PAUSE = "&Pause syncing"
+_RESUME = "&Resume syncing"
+
 
 class _Value(QLabel):
     """A value next to a visible row label. Its accessible name says both ("Server:
@@ -37,6 +40,7 @@ class MainWindow(QMainWindow):
     change_password_requested = Signal()
     sign_out_requested = Signal()
     retry_requested = Signal()
+    pause_toggled = Signal(bool)  # True: pause (FR-SYNC-05; reachable without a tray too)
     quit_requested = Signal()  # closing the window when there's no tray to hide into
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -60,12 +64,18 @@ class MainWindow(QMainWindow):
         ):
             details.addRow(caption, value)
         self._open_folder = QPushButton("&Open sync folder")
+        self._pause = QPushButton(_PAUSE)
+        self._paused = False
 
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.addWidget(heading)
         layout.addLayout(details)
-        layout.addWidget(self._open_folder, alignment=Qt.AlignmentFlag.AlignLeft)
+        folder_actions = QHBoxLayout()
+        folder_actions.addWidget(self._open_folder)
+        folder_actions.addWidget(self._pause)
+        folder_actions.addStretch()
+        layout.addLayout(folder_actions)
         layout.addStretch()
         self._view = StatefulView(content)
 
@@ -84,6 +94,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self._open_folder.clicked.connect(self.open_folder_requested)
+        self._pause.clicked.connect(lambda: self.pause_toggled.emit(not self._paused))
         self._change_password.clicked.connect(self.change_password_requested)
         self._sign_out.clicked.connect(self.sign_out_requested)
         self._view.retry_requested.connect(self.retry_requested)
@@ -123,6 +134,10 @@ class MainWindow(QMainWindow):
 
     def set_status(self, status: str) -> None:
         self._status.set_value(status)
+
+    def set_paused(self, paused: bool) -> None:
+        self._paused = paused
+        self._pause.setText(_RESUME if paused else _PAUSE)
 
     def set_actions_enabled(self, enabled: bool) -> None:
         """Off while a sign-in, password change or sign-out is in progress."""

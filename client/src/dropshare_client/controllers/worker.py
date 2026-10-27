@@ -59,6 +59,10 @@ class Worker:
         signals.failed.connect(failed, Qt.ConnectionType.QueuedConnection)
         self._pool.start(_Task(fn, signals))
 
+    def wait(self, msecs: int) -> bool:
+        """Block until the pool's work is done (only at quit, after the event loop ended)."""
+        return self._pool.waitForDone(msecs)
+
     def _finish(self, signals: _Signals) -> None:
         """Release a finished task's signal object on the GUI thread that owns it; dropping it
         anywhere else could destroy a GUI-thread QObject from a pool thread."""

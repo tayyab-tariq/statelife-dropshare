@@ -15,6 +15,10 @@ WAIT_MAX_NAMESPACES = 100
 
 
 class ChangeType(StrEnum):
+    """Clients that don't know a type ask for that node (`GET /nodes/{id}`) and carry on, so
+    new types can be added. Restoring from the trash (F3) must send CREATED for the restored
+    item and for every item below it: clients dropped the whole subtree on TRASHED."""
+
     CREATED = "created"
     MODIFIED = "modified"
     # The node and everything below it went to the trash; descendants get no rows of their own.
@@ -31,7 +35,7 @@ class ChangesQuery(BaseModel):
 class ChangeOut(BaseModel):
     """One journal entry, with the node as it was right after the change.
 
-    A `type` this client doesn't know (a newer server) means: refetch that node's namespace.
+    A `type` this client doesn't know (a newer server) means: refetch that node.
     """
 
     cursor: int  # per namespace, increasing in commit order
