@@ -45,6 +45,11 @@ class InvalidNameError(ValueError):
         self.problem = problem
 
 
+def is_allowed_character(char: str) -> bool:
+    """Whether one character may appear in a name (NFR-COMPAT-02)."""
+    return char not in _FORBIDDEN_CHARACTERS and ord(char) >= 32 and ord(char) != 127
+
+
 def validate_name(name: str) -> str:
     """Return the name in NFC form, or raise InvalidNameError explaining what is wrong."""
     nfc = unicodedata.normalize("NFC", name)

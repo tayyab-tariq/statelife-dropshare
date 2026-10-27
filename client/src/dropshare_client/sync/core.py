@@ -1,0 +1,441 @@
+"""One sync cycle, start to finish, on the calling thread (algorithm.md §1).
+
+fetch remote changes → snapshot the affected paths on disk, on the server and in the index →
+hash what changed → reconcile → check for a mass delete → execute → report what to retry.
+SyncEngine runs this on its own thread; tests call it directly.
+"""
+
+import logging
+import threading
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from dropshare_client.platform.base import FileAttributes, FileIdentity, RecycleBin
+from dropshare_client.services.errors import (
+    ApiError,
+    ContentMismatchError,
+    OfflineError,
+    RemoteContentChangedError,
+    SessionExpiredError,
+    SourceChangedError,
+    TransferCancelledError,
+    UpgradeRequiredError,
+)
+from dropshare_client.store.index import Index
+from dropshare_client.store.records import Entry, NamespaceCursor, Problem
+from dropshare_client.sync import paths
+from dropshare_client.sync.errors import (
+    CantSyncError,
+    FileChangingError,
+    LocalChangedError,
+    RetryLaterError,
+    SyncRootMissingError,
+    SyncStoppedError,
+    UnsafePathError,
+)
+from dropshare_client.sync.executor import ActivityLog, Executor, no_crash
+from dropshare_client.sync.reconciler import (
+    Action,
+    Op,
+    Plan,
+    is_mass_delete,
+    needs_hash,
+    reconcile,
+)
+from dropshare_client.sync.remote_tree import RemoteItem, RemoteTree, TreeDelta, from_node
+from dropshare_client.sync.scanner import STABLE_AFTER_NS, LocalItem, Scanner
+from dropshare_client.sync.server import FileServer
+from dropshare_shared.errors import ErrorCode
+from dropshare_shared.schemas.nodes import NamespaceKind
+
+logger = logging.getLogger(__name__)
+
+# Seconds before looking again at an item that is still being written (FR-SYNC-06).
+STILL_WRITING_DELAY = 2.0
+# Locked or failing items: 2 s, 4 s, ... up to this (windows-fs.md "Locked and changing").
+MAX_RETRY_DELAY = 60.0
+# The server state moved on: refetch and plan again right away.
+_REPLAN = frozenset({ErrorCode.REVISION_CONFLICT, ErrorCode.NAME_CONFLICT, ErrorCode.NOT_FOUND})
+# Our copy of the node may be out of date: ask the server for it before planning again.
+_REFRESH = frozenset({ErrorCode.REVISION_CONFLICT, ErrorCode.NOT_FOUND})
+# Passing trouble on the way or on the server: try again a little later.
+_TRANSIENT: frozenset[str] = frozenset(
+    {
+        ErrorCode.UPLOAD_INCOMPLETE,
+        ErrorCode.CHUNK_HASH_MISMATCH,
+        ErrorCode.RATE_LIMITED,
+        ErrorCode.SERVICE_UNAVAILABLE,
+        ErrorCode.INTERNAL_ERROR,
+        "INVALID_RESPONSE",
+    }
+)
+# Failures the user can do something about; anything else is retried later.
+_PROBLEM_REASONS: dict[str, str] = {
+    ErrorCode.QUOTA_EXCEEDED: "There isn't enough space left in your DropShare storage. "
+    "Free up space (empty the DropShare trash) or ask your administrator for more.",
+    ErrorCode.FILE_TOO_LARGE: "The file is larger than the maximum DropShare accepts.",
+    ErrorCode.FORBIDDEN: "You don't have permission to change this item.",
+}
+# Passed through to the engine: they stop the whole cycle, not just one item.
+_FATAL = (
+    OfflineError,
+    SessionExpiredError,
+    UpgradeRequiredError,
+    SyncRootMissingError,
+    SyncStoppedError,
+)
+
+
+class NoPersonalFolderError(Exception):
+    """The server listed no personal namespace for this user."""
+
+
+@dataclass
+class CycleResult:
+    again: bool = False  # run another cycle right away (after fetching changes)
+    retry: dict[str, float] = field(default_factory=dict)  # key -> seconds from now
+    confirm_deletes: tuple[int, int] | None = None  # (here, on the server): waiting for OK
+    changed_anything: bool = False
+
+
+class SyncCore:
+    def __init__(
+        self,
+        root: Path,
+        index: Index,
+        server: FileServer,
+        recycle_bin: RecycleBin,
+        file_identity: FileIdentity,
+        file_attributes: FileAttributes,
+        log: ActivityLog,
+        *,
+        display_name: str,
+        stop: threading.Event,
+        stable_after_ns: int = STABLE_AFTER_NS,
+        max_path: int | None = None,
+        crash_point: Callable[[str], None] = no_crash,
+        progress: Callable[[int], None] = lambda _: None,
+    ) -> None:
+        self._index = index
+        self._server = server
+        self._recycle_bin = recycle_bin
+        self._file_attributes = file_attributes
+        self._log = log
+        self._display_name = display_name
+        self._stop = stop
+        self._crash_point = crash_point
+        self._progress = progress
+        self._scanner = Scanner(
+            root, file_identity, stable_after_ns=stable_after_ns, max_path=max_path
+        )
+        self._namespace: NamespaceCursor | None = None
+        self._tree: RemoteTree | None = None
+        self._attempts: dict[str, int] = {}
+        self._pending_deletes: frozenset[str] = frozenset()
+        self._approved_deletes: frozenset[str] = frozenset()
+
+    # --- connecting and remote changes ---------------------------------------------------
+
+    def connect(self) -> None:
+        """Find the personal namespace and load what we know of it."""
+        personal = next(
+            (n for n in self._server.namespaces() if n.kind == NamespaceKind.PERSONAL), None
+        )
+        if personal is None:
+            raise NoPersonalFolderError()
+        known = {c.namespace_id: c for c in self._index.cursors()}
+        cursor = known.get(personal.id)
+        if cursor is None or cursor.root_node_id != personal.root_node_id:
+            if cursor is not None:
+                # A different root: the base describes another tree. Without a base nothing
+                # is deleted, so start from links and conflicted copies instead.
+                logger.warning("The personal folder's root changed; forgetting the base")
+                self._index.remove_entries("", subtree=True)
+            self._index.start_namespace(personal.id, personal.root_node_id)
+            cursor = NamespaceCursor(personal.id, personal.root_node_id, 0)
+        self._namespace = cursor
+        self._load_tree()
+
+    def _load_tree(self) -> None:
+        """The remote tree and cursor as last saved (they are always saved together)."""
+        namespace = self._namespace
+        if namespace is None:
+            raise RuntimeError("connect() first")
+        saved = {c.namespace_id: c for c in self._index.cursors()}
+        self._namespace = saved.get(namespace.namespace_id, namespace)
+        nodes = [n for n in self._index.remote_nodes() if n.namespace_id == namespace.namespace_id]
+        self._tree = RemoteTree(namespace.root_node_id, nodes)
+
+    @property
+    def connected(self) -> bool:
+        return self._namespace is not None
+
+    def cursors(self) -> dict[uuid.UUID, int]:
+        return (
+            {}
+            if self._namespace is None
+            else {self._namespace.namespace_id: self._namespace.cursor}
+        )
+
+    def fetch(self) -> set[str]:
+        """Apply every new change, then settle anything the journal says was interrupted;
+        returns the keys the changes touched. If anything fails part way, the tree in memory
+        goes back to what was saved, so it never runs ahead of its cursor."""
+        try:
+            dirty = self._fetch_pages()
+        except BaseException:
+            self._load_tree()
+            raise
+        self.recover()
+        return dirty
+
+    def _fetch_pages(self) -> set[str]:
+        namespace, tree = self._require_connected()
+        dirty: set[str] = set()
+        while True:
+            page = self._server.changes(namespace.namespace_id, namespace.cursor)
+            delta = tree.apply(namespace.namespace_id, page.data)
+            for node_id in delta.refetch:  # a change type this client doesn't know
+                self._refresh_node(node_id, tree, delta)
+            advanced = page.meta.cursor > namespace.cursor
+            namespace = NamespaceCursor(
+                namespace.namespace_id,
+                namespace.root_node_id,
+                max(page.meta.cursor, namespace.cursor),
+            )
+            self._index.save_remote(delta.upserts.values(), delta.removed, namespace)
+            self._namespace = namespace
+            dirty |= delta.dirty
+            if not page.meta.has_more or not advanced:
+                return dirty
+
+    def _refresh_node(self, node_id: uuid.UUID, tree: RemoteTree, delta: TreeDelta) -> None:
+        """Ask the server for one node and take its answer as the truth."""
+        try:
+            node = from_node(self._server.get_node(node_id))
+        except ApiError as exc:
+            if exc.code != ErrorCode.NOT_FOUND:
+                raise
+            node = None
+        if node is None:
+            tree.remove(node_id, delta)
+        else:
+            tree.upsert(node, delta)
+
+    def recover(self) -> None:
+        """Settle operations that were interrupted (algorithm.md §10): by a crash, or by an
+        answer that never came. Runs after every fetch, once the tree is current.
+
+        Every executor step is safe to redo through normal reconciliation; the one thing the
+        journal adds is an upload that reached the server before the crash. Recording it as
+        the base turns a later local edit into an ordinary upload, not a conflicted copy.
+        """
+        _, tree = self._require_connected()
+        for item in self._index.journal():
+            if item.kind == "upload":
+                self._recover_upload(item.key, item.data.get("sha256"), tree)
+            else:
+                logger.info(
+                    "Journal: %s of %s was interrupted; the next cycle checks it",
+                    item.kind,
+                    item.key,
+                )
+            self._index.finish(item.id)
+
+    def _recover_upload(self, key: str, sha256: str | None, tree: RemoteTree) -> None:
+        remote = tree.items_under(key).get(key)
+        if remote is None or sha256 is None or remote.node.sha256 != sha256:
+            return
+        try:
+            path = self._scanner.resolve(key)
+        except UnsafePathError:
+            return
+        if path is None:
+            return
+        logger.info("Journal: the upload of %s had completed", path)
+        node = remote.node
+        # Size and time no file has, so whatever is on disk now is hashed and compared.
+        self._index.put_entry(
+            Entry(key, path, node.node_id, node.kind, node.revision, node.sha256, -1, -1, None)
+        )
+
+    # --- mass-delete confirmation --------------------------------------------------------
+
+    def approve_deletes(self) -> None:
+        """The user confirmed the deletes the last cycle stopped at (FR-SYNC-08)."""
+        self._approved_deletes = self._pending_deletes
+
+    # --- the cycle -----------------------------------------------------------------------
+
+    def cycle(self, dirty: set[str]) -> CycleResult:
+        _, tree = self._require_connected()
+        self._scanner.require_root()
+        result = CycleResult()
+        local: dict[str, LocalItem] = {}
+        remote: dict[str, RemoteItem] = {}
+        base: dict[str, Entry] = {}
+        deferred: set[str] = set()
+        for root in paths.outermost(dirty):
+            scan = self._scanner.scan(root)
+            local.update(scan.items)
+            deferred |= scan.deferred
+            for key in scan.still_writing:
+                result.retry[key] = STILL_WRITING_DELAY
+            for key in scan.unreadable:
+                result.retry[key] = self._backoff(key)
+            self._index.clear_problems(root)
+            problems = dict(scan.problems)
+            remote.update(tree.items_under(root, problems))
+            for problem in problems.values():
+                self._index.set_problem(problem)
+            base.update(self._index.entries_under(root))
+        self._scanner.require_root()  # a vanished root must never read as "all deleted"
+
+        self._hash_changed(local, base, deferred, result)
+        plan = reconcile(local.keys() | remote.keys() | base.keys(), local, remote, base, deferred)
+        if (
+            plan.deletes
+            and not self._deletes_approved(plan)
+            and is_mass_delete(plan.deletes, self._index.file_count())
+        ):
+            self._pending_deletes = _delete_keys(plan)
+            result.confirm_deletes = (plan.local_deletes, plan.remote_deletes)
+            return result
+        self._approved_deletes = frozenset()
+        self._execute(plan, tree, result)
+        result.again = result.again or plan.again
+        return result
+
+    def _hash_changed(
+        self,
+        local: dict[str, LocalItem],
+        base: dict[str, Entry],
+        deferred: set[str],
+        result: CycleResult,
+    ) -> None:
+        for key, item in list(local.items()):
+            if key in deferred or not needs_hash(item, base.get(key)):
+                continue
+            if self._stop.is_set():
+                raise SyncStoppedError()
+            try:
+                local[key] = self._scanner.hash(item, self._stop)
+            except (FileChangingError, FileNotFoundError):
+                deferred.add(key)
+                result.retry[key] = STILL_WRITING_DELAY
+            except OSError as exc:  # locked by another program: "waiting" (FR-SYNC-06)
+                logger.info("Can't read %s yet (%s); trying again later", item.path, exc)
+                deferred.add(key)
+                result.retry[key] = self._backoff(key)
+
+    def _deletes_approved(self, plan: Plan) -> bool:
+        return bool(self._approved_deletes) and _delete_keys(plan) <= self._approved_deletes
+
+    def _execute(self, plan: Plan, tree: RemoteTree, result: CycleResult) -> None:
+        executor = Executor(
+            self._scanner,
+            self._index,
+            self._server,
+            tree,
+            self._recycle_bin,
+            self._file_attributes,
+            self._log,
+            display_name=self._display_name,
+            cursor=lambda: self._require_connected()[0].cursor,
+            stop=self._stop,
+            crash_point=self._crash_point,
+        )
+        for done, action in enumerate(plan.actions):
+            if self._stop.is_set():
+                raise SyncStoppedError()
+            self._progress(len(plan.actions) - done)
+            try:
+                created = executor.run(action)
+            except _FATAL:
+                raise
+            except TransferCancelledError as exc:
+                raise SyncStoppedError() from exc
+            except RetryLaterError as exc:
+                result.again = True
+                result.retry[action.key] = 0.0
+                if exc.key:
+                    result.retry[exc.key] = 0.0
+                continue
+            except CantSyncError as exc:
+                self._cant_sync(action.key, action.path, exc.reason)
+                continue
+            except UnsafePathError as exc:
+                self._cant_sync(paths.key_of(exc.path), exc.path, exc.reason)
+                continue
+            except (
+                LocalChangedError,
+                FileChangingError,
+                SourceChangedError,
+                RemoteContentChangedError,
+            ) as exc:
+                logger.info(
+                    "%s changed while syncing (%s); planning it again",
+                    action.path,
+                    type(exc).__name__,
+                )
+                result.again = True
+                result.retry[action.key] = STILL_WRITING_DELAY
+                continue
+            except ApiError as exc:
+                self._api_failed(action, exc, tree, result)
+                continue
+            except (ContentMismatchError, OSError) as exc:
+                logger.warning("%s of %s failed: %s", action.op, action.path, exc)
+                result.retry[action.key] = self._backoff(action.key)
+                continue
+            self._attempts.pop(action.key, None)
+            if created is not None:
+                result.retry[created] = 0.0
+            if action.op != Op.RECORD:
+                result.changed_anything = True
+        self._progress(0)
+
+    def _api_failed(
+        self, action: Action, exc: ApiError, tree: RemoteTree, result: CycleResult
+    ) -> None:
+        key, path = action.key, action.path
+        logger.info("%s of %s: %s (request %s)", action.op, path, exc.code, exc.request_id)
+        if exc.code in _REPLAN:
+            result.again = True
+            result.retry[key] = 0.0
+            if exc.code in _REFRESH and action.remote is not None:
+                # Our copy may be stale (e.g. a replayed upload of a file since trashed).
+                delta = TreeDelta()
+                self._refresh_node(action.remote.node.node_id, tree, delta)
+                self._index.save_remote(delta.upserts.values(), delta.removed)
+        elif exc.code in _TRANSIENT or exc.status >= 500 or exc.status == 429:
+            result.retry[key] = self._backoff(key)
+        elif exc.code in _PROBLEM_REASONS or 400 <= exc.status < 500:
+            reason = _PROBLEM_REASONS.get(exc.code, exc.message)
+            if exc.request_id:
+                reason = f"{reason} (reference {exc.request_id})"
+            self._cant_sync(key, path, reason)
+        else:
+            result.retry[key] = self._backoff(key)
+
+    def _cant_sync(self, key: str, path: str, reason: str) -> None:
+        """Listed for the user (FR-SYNC-07), not retried until the item changes."""
+        logger.info("Can't sync %s: %s", path, reason)
+        self._index.set_problem(Problem(key, path, reason))
+        self._log.activity("cant_sync", path, reason)
+
+    def _backoff(self, key: str) -> float:
+        attempt = self._attempts.get(key, 0) + 1
+        self._attempts[key] = attempt
+        return min(2.0 * float(2 ** min(attempt - 1, 6)), MAX_RETRY_DELAY)
+
+    def _require_connected(self) -> tuple[NamespaceCursor, RemoteTree]:
+        if self._namespace is None or self._tree is None:
+            raise RuntimeError("connect() first")
+        return self._namespace, self._tree
+
+
+def _delete_keys(plan: Plan) -> frozenset[str]:
+    return frozenset(a.key for a in plan.actions if a.op in (Op.DELETE_LOCAL, Op.DELETE_REMOTE))

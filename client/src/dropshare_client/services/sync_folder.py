@@ -10,6 +10,8 @@ from pathlib import Path
 
 from dropshare_client.platform.base import VolumeKind, Volumes
 
+# DropShare's own hidden folder inside the sync folder (partial downloads, owner marker).
+TEMP_DIR = ".dropshare-tmp"
 # Standard per-user folders that hold the user's own files.
 _SHELL_FOLDERS = ("Desktop", "Documents", "Downloads", "Music", "Pictures", "Videos")
 # Left by the OS in otherwise empty folders; they don't make a folder "in use".
@@ -87,3 +89,11 @@ def problem_with(path: Path, volumes: Volumes, app_data: Path) -> str | None:
 
 def create(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def holds_files(path: Path) -> bool:
+    """Whether the folder has anything in it besides OS litter and DropShare's own temp folder."""
+    if not path.is_dir():
+        return False
+    ignored = _OS_LITTER | {TEMP_DIR}
+    return any(entry.name.lower() not in ignored for entry in path.iterdir())

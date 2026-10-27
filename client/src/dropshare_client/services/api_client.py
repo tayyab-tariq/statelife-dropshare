@@ -8,6 +8,8 @@ Logs method, path, status, duration and request ID; never headers, tokens or bod
 import contextlib
 import logging
 import time
+from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import NoReturn
 
 import httpx
@@ -40,6 +42,18 @@ _REFUSED_BEFORE_USE = frozenset({400, 426, 429})
 _GATEWAY_ERRORS = frozenset({502, 503, 504})
 
 type Json = dict[str, object]
+type Params = dict[str, str | int]
+
+
+@dataclass(frozen=True)
+class _Call:
+    """What a request carries besides its method and path."""
+
+    json: Json | None = None
+    params: Params | None = None
+    content: bytes | None = None
+    headers: dict[str, str] | None = None
+    timeout: httpx.Timeout | None = None  # None: the client's default
 
 
 class _ObjectData(BaseModel):
@@ -92,34 +106,75 @@ class ApiClient:
         model: type[T],
         *,
         json: Json | None = None,
+        params: Params | None = None,
+        timeout: httpx.Timeout | None = None,
         authenticated: bool = True,
     ) -> T:
         """Send a request and return its `data`, parsed as `model`."""
-        response = self._request(method, path, json, authenticated)
+        response = self._request(
+            method, path, _Call(json=json, params=params, timeout=timeout), authenticated
+        )
         try:
             return model.model_validate(_ObjectData.model_validate_json(response.content).data)
         except ValidationError:
             raise self._invalid_response(response) from None
 
+    def envelope[T: BaseModel](
+        self, method: str, path: str, model: type[T], *, params: Params | None = None
+    ) -> T:
+        """Send a request and parse the whole response body (`{data, meta}` lists)."""
+        response = self._request(method, path, _Call(params=params), True)
+        try:
+            return model.model_validate_json(response.content)
+        except ValidationError:
+            raise self._invalid_response(response) from None
+
     def no_content(
-        self, method: str, path: str, *, json: Json | None = None, authenticated: bool = True
+        self,
+        method: str,
+        path: str,
+        *,
+        json: Json | None = None,
+        params: Params | None = None,
+        content: bytes | None = None,
+        headers: dict[str, str] | None = None,
+        authenticated: bool = True,
     ) -> None:
-        self._request(method, path, json, authenticated)
+        call = _Call(json=json, params=params, content=content, headers=headers)
+        self._request(method, path, call, authenticated)
+
+    @contextlib.contextmanager
+    def stream(
+        self, method: str, path: str, *, headers: dict[str, str] | None = None
+    ) -> Iterator[httpx.Response]:
+        """A response whose body is read by the caller (downloads). Errors are raised before
+        it is handed over; a connection lost while reading raises httpx.TransportError."""
+        call = _Call(headers=headers)
+        token = self.ensure_access_token()
+        response = self._send(method, path, call, token, stream=True)
+        try:
+            if response.status_code == 401:
+                response.close()
+                response = self._send(method, path, call, self._refresh(stale=token), stream=True)
+            if not response.is_success:
+                response.read()
+                self._raise_error(response)
+            yield response
+        finally:
+            response.close()
 
     def ensure_access_token(self) -> str:
         """An access token, refreshing first if there is none in memory (resume at startup)."""
         return self._tokens.access_token() or self._refresh(stale=None)
 
-    def _request(
-        self, method: str, path: str, json: Json | None, authenticated: bool
-    ) -> httpx.Response:
+    def _request(self, method: str, path: str, call: _Call, authenticated: bool) -> httpx.Response:
         if not authenticated:
-            response = self._send(method, path, json, token=None)
+            response = self._send(method, path, call, token=None)
         else:
             token = self.ensure_access_token()
-            response = self._send(method, path, json, token)
+            response = self._send(method, path, call, token)
             if response.status_code == 401:
-                response = self._send(method, path, json, self._refresh(stale=token))
+                response = self._send(method, path, call, self._refresh(stale=token))
         if response.is_success:
             return response
         self._raise_error(response)
@@ -128,17 +183,29 @@ class ApiClient:
         self,
         method: str,
         path: str,
-        json: Json | None,
+        call: _Call,
         token: str | None,
         *,
+        stream: bool = False,
         offline_on_failure: bool = True,
     ) -> httpx.Response:
         """One request, logged without headers or bodies. Transport failures become
         OfflineError, unless the caller needs to know exactly how the request failed."""
-        headers = {"Authorization": f"Bearer {token}"} if token else None
+        headers = dict(call.headers or {})
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        request = self._http.build_request(
+            method,
+            path,
+            json=call.json,
+            params=call.params,
+            content=call.content,
+            headers=headers,
+            timeout=call.timeout if call.timeout is not None else httpx.USE_CLIENT_DEFAULT,
+        )
         started = time.perf_counter()
         try:
-            response = self._http.request(method, path, json=json, headers=headers)
+            response = self._http.send(request, stream=stream)
         except httpx.TransportError as exc:
             logger.info("%s %s failed: %s", method, path, type(exc).__name__)
             if offline_on_failure:
@@ -173,7 +240,7 @@ class ApiClient:
             body = RefreshIn(refresh_token=refresh_token).model_dump()
             try:
                 response = self._send(
-                    "POST", _REFRESH_PATH, body, token=None, offline_on_failure=False
+                    "POST", _REFRESH_PATH, _Call(json=body), token=None, offline_on_failure=False
                 )
             except _NOT_SENT as exc:
                 self._tokens.give_back(refresh_token)
