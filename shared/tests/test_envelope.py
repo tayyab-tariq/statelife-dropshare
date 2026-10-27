@@ -6,6 +6,7 @@ from dropshare_shared.errors import ErrorCode
 from dropshare_shared.schemas.envelope import DataResponse, ErrorResponse, ListResponse
 from dropshare_shared.schemas.health import HealthOut
 from dropshare_shared.schemas.sync import ChangeOut, ChangeType
+from dropshare_shared.schemas.users import UserOut
 
 
 def test_responses_tolerate_fields_added_by_newer_servers() -> None:
@@ -64,3 +65,18 @@ def test_response_enums_accept_values_from_a_newer_server() -> None:
 
     assert (change.type, change.kind) == ("restored", "symlink")
     assert known.type is ChangeType.CREATED
+
+
+def test_user_role_accepts_roles_from_a_newer_server() -> None:
+    user = UserOut.model_validate(
+        {
+            "id": str(uuid.uuid4()),
+            "username": "a",
+            "email": "a@example.com",
+            "display_name": "A",
+            "role": "auditor",
+            "quota_bytes": 1,
+        }
+    )
+
+    assert user.role == "auditor"

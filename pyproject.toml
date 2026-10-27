@@ -46,7 +46,7 @@ known-first-party = ["dropshare_shared", "dropshare_server", "dropshare_client"]
 python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy"]
-mypy_path = ["shared/src", "server/src", "client/src"]
+mypy_path = ["shared/src", "server/src", "client/src", "client/tests"]
 explicit_package_bases = true
 exclude = ["^\\.venv/", "^\\.claude/", "^build/", "^dist/"]
 
@@ -58,4 +58,6 @@ warn_required_dynamic_aliases = true
 [tool.pytest.ini_options]
 addopts = ["--import-mode=importlib", "--strict-markers"]
 testpaths = ["shared/tests", "server/tests", "client/tests"]
+# Test-only helper modules importable by name (importlib mode doesn't add test folders).
+pythonpath = ["client/tests"]
 markers = ["windows_only: needs real Windows APIs; skipped on other platforms"]

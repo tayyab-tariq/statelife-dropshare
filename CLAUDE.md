@@ -34,13 +34,14 @@ The packages above are the **approved baseline**. Anything else needs my approva
 ## 2. Commands
 
 ```bash
-uv sync                                   # install/refresh the whole workspace
-uv run ruff check .                       # lint
-uv run ruff format .                      # format
-uv run mypy .                             # type check (strict)
-uv run pytest                             # all tests
-uv run pytest server/tests                # server tests (needs Oracle test schema)
-uv run pytest client/tests                # client tests (pytest-qt, no server needed)
+uv sync                                           # install/refresh the whole workspace
+uv run ruff check .                               # lint
+uv run ruff format .                              # format
+uv run mypy .                                     # type check (strict)
+uv run pytest                                     # all tests
+uv run pytest server/tests/test_auth_api.py       # single file tests
+uv run pytest server/tests                        # server tests (needs Oracle test schema)
+uv run pytest client/tests                        # client tests (pytest-qt, no server needed)
 
 # Server
 uv run --package dropshare-server uvicorn dropshare_server.main:app --reload

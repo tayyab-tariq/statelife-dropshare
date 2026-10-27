@@ -86,9 +86,9 @@ implements it by emitting Qt signals (`status_changed`, `activity_added`, `confl
 - Parses every response into the `shared/` envelope models; returns `data` typed by the endpoint function.
 - Raises a small exception hierarchy that controllers and the engine branch on:
   - `ApiError(status, code: ErrorCode, message, details, request_id)` for envelope errors
-  - `Offline` for connection failures/timeouts (engine switches to Offline state and backs off)
-  - `UpgradeRequired` for 426 (stop sync, offer the update)
-  - `SessionExpired` when refresh fails (go to the sign-in screen)
+  - `OfflineError` for connection failures/timeouts (engine switches to Offline state and backs off)
+  - `UpgradeRequiredError` for 426 (stop sync, offer the update)
+  - `SessionExpiredError` when refresh fails (go to the sign-in screen). A refresh that was sent but got no answer also ends the session: the token may already be rotated, and re-sending it would revoke the whole family (OQ-16). Only a request that never connected keeps the token (`OfflineError`).
 - Token refresh: on `401 UNAUTHENTICATED`, refresh under a lock so concurrent requests trigger **one** refresh, then retry the original request once.
 - Logs method, path, status, duration, and `X-Request-ID`; never headers, tokens, or bodies.
 
