@@ -3,8 +3,9 @@
 import re
 import uuid
 from enum import StrEnum
+from typing import Annotated
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]{3,64}$")
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -27,5 +28,6 @@ class UserOut(BaseModel):
     username: str
     email: str
     display_name: str
-    role: UserRole
+    # Tolerant: a role added by a newer server must not stop installed clients parsing /me.
+    role: Annotated[UserRole | str, Field(union_mode="left_to_right")]
     quota_bytes: int

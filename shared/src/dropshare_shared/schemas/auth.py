@@ -9,7 +9,8 @@ PASSWORD_MAX_LENGTH = 128
 
 
 class LoginIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # hide_input_in_errors: a validation error must never echo a password or token.
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     login: str = Field(min_length=1, max_length=320, description="Username or email")
     password: str = Field(min_length=1, max_length=PASSWORD_MAX_LENGTH)
@@ -18,13 +19,15 @@ class LoginIn(BaseModel):
 
 
 class RefreshIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # hide_input_in_errors: a validation error must never echo a password or token.
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     refresh_token: str = Field(min_length=1, max_length=128)
 
 
 class PasswordChangeIn(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    # hide_input_in_errors: a validation error must never echo a password or token.
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     current_password: str = Field(min_length=1, max_length=PASSWORD_MAX_LENGTH)
     new_password: str = Field(min_length=PASSWORD_MIN_LENGTH, max_length=PASSWORD_MAX_LENGTH)

@@ -55,7 +55,7 @@ def _create_user(
             role=UserRole(args.role),
             quota_bytes=quota,
         )
-    _out(f"Created user '{created.user.username}' ({created.user.role.value}).")
+    _out(f"Created user '{created.user.username}' ({created.user.role}).")
     _out(f"Temporary password (shown once): {created.temporary_password}")
     _out("The user must change it at first sign-in.")
     return 0
@@ -94,7 +94,7 @@ def _list_users(
     _out(f"{'USERNAME':<24} {'EMAIL':<32} {'ROLE':<6} {'STATUS':<9} QUOTA_GB")
     for user, status in users:
         _out(
-            f"{user.username:<24} {user.email:<32} {user.role.value:<6} {status.value:<9} "
+            f"{user.username:<24} {user.email:<32} {user.role:<6} {status.value:<9} "
             f"{user.quota_bytes / _GIB:g}"
         )
     return 0
