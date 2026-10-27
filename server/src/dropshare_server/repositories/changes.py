@@ -1,7 +1,7 @@
 """The change journal: insert and read only, like the audit log."""
 
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -23,6 +23,29 @@ def list_after(session: Session, namespace_id: uuid.UUID, cursor: int, limit: in
             .limit(limit)
         )
     )
+
+
+_IN_LIST_LIMIT = 1000  # Oracle ORA-01795
+
+
+def any_after(
+    session: Session, namespace_id: uuid.UUID, cursor: int, node_ids: Sequence[uuid.UUID]
+) -> bool:
+    """Whether any of `node_ids` has a journal row after `cursor`."""
+    for start in range(0, len(node_ids), _IN_LIST_LIMIT):
+        batch = node_ids[start : start + _IN_LIST_LIMIT]
+        found = session.scalar(
+            select(Change.seq)
+            .where(
+                Change.namespace_id == namespace_id,
+                Change.seq > cursor,
+                Change.node_id.in_(batch),
+            )
+            .limit(1)
+        )
+        if found is not None:
+            return True
+    return False
 
 
 def latest_cursors(session: Session, namespace_ids: Collection[uuid.UUID]) -> dict[uuid.UUID, int]:

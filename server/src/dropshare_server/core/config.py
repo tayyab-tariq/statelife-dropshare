@@ -57,7 +57,7 @@ class Settings(DatabaseSettings):
     upload_expiry_hours: int = Field(default=24, ge=1)
 
     # Long-poll (FR-SYNC-03): how long POST /changes/wait holds, and how often it re-checks.
-    long_poll_timeout_seconds: float = Field(default=55, gt=0)
+    long_poll_timeout_seconds: float = Field(default=55, gt=0, le=60)  # clients wait 75 s
     long_poll_interval_seconds: float = Field(default=1, gt=0)
 
     # Reverse proxies whose X-Forwarded-For is trusted for the audit source IP.

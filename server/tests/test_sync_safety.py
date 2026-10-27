@@ -101,7 +101,7 @@ def test_repeated_complete_returns_this_uploads_result_not_later_edits(
     )
     first = api.post(f"/api/v1/uploads/{started['id']}/complete", headers=_auth(alice))
     upload_file(alice, b"by B", node_id=file["id"], base_revision=2)
-    api.delete(f"/api/v1/nodes/{file['id']}?if_revision=3", headers=_auth(alice))
+    # (Trashed meanwhile is a conflict instead: test_uploads_api, audit S1.)
 
     retry = api.post(f"/api/v1/uploads/{started['id']}/complete", headers=_auth(alice))
 

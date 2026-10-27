@@ -274,10 +274,16 @@ def complete(
 
 def _replay(session: Session, user_id: uuid.UUID, upload: UploadSession) -> NodeOut:
     """The file's content state as this upload left it, not as later edits made it: a client
-    retrying after a lost response must not take another device's revision as its own (B2)."""
+    retrying after a lost response must not take another device's revision as its own (B2).
+
+    If the file has gone to the trash since, the answer is 409 REVISION_CONFLICT (current
+    revision None), as for an upload to a trashed file: the client must not record a file
+    that is only in the trash as synced, and uploads its copy again as a new file."""
     if upload.node_id is None or upload.result_revision is None or upload.completed_at is None:
         raise RuntimeError(f"Completed upload {upload.id} has no result")
     node = access.require_node(session, user_id, upload.node_id, allow_trashed=True)
+    if node.trashed_at is not None:
+        raise node_service.revision_conflict(None)
     return node_service.to_out(node).model_copy(
         update={
             "revision": upload.result_revision,
