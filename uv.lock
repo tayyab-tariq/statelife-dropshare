@@ -281,7 +281,7 @@ requires-dist = [
     { name = "dropshare-shared", editable = "shared" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "keyring", specifier = ">=25" },
-    { name = "pyside6", specifier = ">=6.8" },
+    { name = "pyside6", specifier = ">=6.10" },
     { name = "sqlalchemy", specifier = ">=2.0.36" },
     { name = "watchdog", specifier = ">=5" },
 ]
