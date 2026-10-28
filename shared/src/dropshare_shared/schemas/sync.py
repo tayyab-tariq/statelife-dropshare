@@ -23,6 +23,8 @@ class ChangeType(StrEnum):
     MODIFIED = "modified"
     # The node and everything below it went to the trash; descendants get no rows of their own.
     TRASHED = "trashed"
+    # Renamed and/or moved to another parent. Descendants move with it and get no rows.
+    MOVED = "moved"
 
 
 class ChangesQuery(BaseModel):

@@ -31,3 +31,6 @@ class UserOut(BaseModel):
     # Tolerant: a role added by a newer server must not stop installed clients parsing /me.
     role: Annotated[UserRole | str, Field(union_mode="left_to_right")]
     quota_bytes: int
+    # Includes trashed items (FR-TRASH-01). Defaults to 0 for servers from before it was sent;
+    # the server's own quota check at upload start is what's enforced.
+    used_bytes: int = 0

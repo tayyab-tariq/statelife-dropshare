@@ -3,9 +3,9 @@
 import uuid
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated
+from typing import Annotated, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Coarse bound on request size only; the real rules are dropshare_shared.naming (NFR-COMPAT-02),
 # applied by the server so a rejected name comes back with its NameProblem code.
@@ -64,6 +64,23 @@ class FolderCreateIn(BaseModel):
 
     parent_id: uuid.UUID
     name: str = Field(min_length=1, max_length=NAME_INPUT_MAX_LENGTH)
+
+
+class NodeUpdateIn(BaseModel):
+    """`PATCH /nodes/{id}`: rename (`name`), move (`parent_id`), or both, within the node's
+    namespace (FR-FILE-04, FR-SYNC-10). `if_revision` is the revision the client last saw."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    if_revision: int = Field(ge=1)
+    name: str | None = Field(default=None, min_length=1, max_length=NAME_INPUT_MAX_LENGTH)
+    parent_id: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def _changes_something(self) -> Self:
+        if self.name is None and self.parent_id is None:
+            raise ValueError("Give a new name, a new parent, or both.")
+        return self
 
 
 class NodeDeleteQuery(BaseModel):
