@@ -16,7 +16,7 @@ from dropshare_server.repositories.nodes import LiveNameTakenError
 from dropshare_server.services import access
 from dropshare_server.services import audit as audit_service
 from dropshare_server.services import changes as change_service
-from dropshare_server.services.audit import AuditTarget
+from dropshare_server.services.audit import AuditDetails, AuditTarget
 from dropshare_server.services.context import CallContext
 from dropshare_server.storage.base import StorageBackend
 from dropshare_shared.errors import ErrorCode
@@ -34,6 +34,7 @@ from dropshare_shared.schemas.nodes import (
     NamespaceOut,
     NodeKind,
     NodeOut,
+    NodeUpdateIn,
 )
 from dropshare_shared.schemas.sync import ChangeType
 
@@ -156,6 +157,86 @@ def create_folder(
     change_service.record(session, folder, ChangeType.CREATED, user_id, now)
     audit_service.record(session, ctx, AuditAction.FOLDER_CREATED, target=node_target(folder))
     return to_out(folder)
+
+
+def move_node(
+    session: Session,
+    ctx: CallContext,
+    user_id: uuid.UUID,
+    node_id: uuid.UUID,
+    body: NodeUpdateIn,
+) -> NodeOut:
+    """Rename and/or move an item within its namespace (FR-FILE-04, FR-SYNC-10).
+
+    Everything inside a folder moves with it and keeps its ID; one journal row covers the
+    subtree. Repeating a move that already succeeded (a retry after a timeout) succeeds again
+    without changing anything (NFR-REL-04).
+    """
+    node = access.require_node(session, user_id, node_id, write=True)
+    if node.parent_id is None:
+        raise invalid("The root folder can't be moved.", "root_not_movable", ["path", "node_id"])
+    new_name = None if body.name is None else valid_name(body.name, ["body", "name"])
+    if body.parent_id is not None and body.parent_id != node.parent_id:
+        # Moves between folders run one at a time per namespace: the check below that a
+        # folder isn't moved into itself reads the target's ancestors, which two moves at
+        # once could each change (A into B while B into A). Nothing else locks the root
+        # after another node, so taking it first adds no lock cycle.
+        node_repository.lock_root(session, node.namespace_id)
+    # The target folder is locked before the item, as creating a folder locks its parent first.
+    parent = access.require_node(
+        session, user_id, body.parent_id or node.parent_id, write=True, lock=True, resource="Folder"
+    )
+    node = access.require_node(session, user_id, node_id, write=True, lock=True)
+    assert node.parent_id is not None and node.name is not None  # noqa: S101 - not the root
+    name, normalized = new_name or (node.name, node.name_normalized or normalize_name(node.name))
+    if node.parent_id == parent.id and node.name == name:
+        if node.revision in (body.if_revision, body.if_revision + 1):
+            return to_out(node)  # nothing to change, or our own earlier success
+        raise revision_conflict(node.revision)
+    if node.revision != body.if_revision:
+        raise revision_conflict(node.revision)
+
+    if parent.id != node.parent_id:
+        require_folder(parent)
+        if parent.namespace_id != node.namespace_id:
+            raise invalid(
+                "Items can't be moved into a shared folder yet.",
+                "cross_namespace",
+                ["body", "parent_id"],
+            )
+        if parent.id == node.id or node.id in node_repository.ancestor_ids(session, parent.id):
+            raise invalid(
+                "A folder can't be moved into itself.", "into_itself", ["body", "parent_id"]
+            )
+    existing = node_repository.get_live_child(session, parent.namespace_id, parent.id, normalized)
+    if existing is not None and existing.id != node.id:
+        raise name_conflict(existing)
+
+    old_parent_id, old_name = node.parent_id, node.name
+    try:
+        node_repository.move(session, node, parent.id, name, normalized)
+    except LiveNameTakenError:
+        taken = node_repository.get_live_child(session, parent.namespace_id, parent.id, normalized)
+        if taken is None:
+            raise AppError(
+                409, ErrorCode.NAME_CONFLICT, "An item with this name was just created here."
+            ) from None
+        raise name_conflict(taken) from None
+    now = datetime.now(UTC)
+    node.revision += 1
+    change_service.record(session, node, ChangeType.MOVED, user_id, now)
+    moved = old_parent_id != parent.id
+    details: AuditDetails = {"old_name": old_name}
+    if moved:
+        details |= {"from_parent_id": str(old_parent_id), "to_parent_id": str(parent.id)}
+    audit_service.record(
+        session,
+        ctx,
+        AuditAction.NODE_MOVED if moved else AuditAction.NODE_RENAMED,
+        target=node_target(node),
+        details=details,
+    )
+    return to_out(node)
 
 
 def trash_node(

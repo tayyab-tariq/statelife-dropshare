@@ -11,7 +11,7 @@ from dropshare_server.dependencies.context import Context
 from dropshare_server.dependencies.resources import DbSession, Storage
 from dropshare_server.services import nodes as node_service
 from dropshare_shared.schemas.envelope import DataResponse, ListResponse, PageQuery
-from dropshare_shared.schemas.nodes import FolderCreateIn, NodeDeleteQuery, NodeOut
+from dropshare_shared.schemas.nodes import FolderCreateIn, NodeDeleteQuery, NodeOut, NodeUpdateIn
 
 router = APIRouter(prefix="/nodes", tags=["nodes"])
 
@@ -41,6 +41,15 @@ def list_children(
 ) -> ListResponse[NodeOut]:
     children, meta = node_service.list_children(db, current.user.id, node_id, page)
     return ListResponse(data=children, meta=meta)
+
+
+@router.patch("/{node_id}", response_model=DataResponse[NodeOut])
+def update_node(
+    node_id: uuid.UUID, body: NodeUpdateIn, current: ActiveSession, db: DbSession, ctx: Context
+) -> DataResponse[NodeOut]:
+    """Rename and/or move (FR-FILE-04, FR-SYNC-10)."""
+    node = node_service.move_node(db, ctx.as_actor(current.actor), current.user.id, node_id, body)
+    return DataResponse(data=node)
 
 
 @router.delete("/{node_id}", status_code=204)

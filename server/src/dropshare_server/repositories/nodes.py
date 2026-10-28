@@ -43,6 +43,41 @@ def add(session: Session, node: Node) -> None:
         raise
 
 
+def move(
+    session: Session,
+    node: Node,
+    parent_id: uuid.UUID,
+    name: str,
+    name_normalized: str,
+) -> None:
+    """Give a live node a new parent and/or name; raises LiveNameTakenError on a collision.
+
+    Runs in a savepoint like `add`, so the caller can still look up the item holding the name.
+    """
+    try:
+        with session.begin_nested():
+            node.parent_id, node.name, node.name_normalized = parent_id, name, name_normalized
+            node.live_key = live_key(node.namespace_id, parent_id, name_normalized)
+            session.flush()
+    except IntegrityError as exc:
+        if _LIVE_KEY_CONSTRAINT in str(exc.orig).lower():
+            raise LiveNameTakenError from exc
+        raise
+
+
+def ancestor_ids(session: Session, node_id: uuid.UUID) -> list[uuid.UUID]:
+    """`node_id`'s parent, its parent, and so on up to the namespace root."""
+    found: list[uuid.UUID] = []
+    current: uuid.UUID | None = node_id
+    while current is not None:
+        current = session.scalar(select(Node.parent_id).where(Node.id == current))
+        if current is not None:
+            if current in found:  # a cycle would be a bug elsewhere; never loop on it
+                raise RuntimeError(f"Folder cycle above node {node_id}")
+            found.append(current)
+    return found
+
+
 def get(session: Session, node_id: uuid.UUID) -> Node | None:
     return session.get(Node, node_id)
 
@@ -55,6 +90,13 @@ def get_for_update(session: Session, node_id: uuid.UUID) -> Node | None:
         .with_for_update()
         .execution_options(populate_existing=True)
     ).one_or_none()
+
+
+def lock_root(session: Session, namespace_id: uuid.UUID) -> None:
+    """Lock the namespace's root folder row until commit."""
+    session.execute(
+        select(Node.id).where(Node.live_key == live_key(namespace_id, None, None)).with_for_update()
+    )
 
 
 def get_root(session: Session, namespace_id: uuid.UUID) -> Node | None:
