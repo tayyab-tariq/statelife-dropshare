@@ -10,6 +10,7 @@ from dropshare_server.models import Group, GroupMember, User
 from dropshare_server.repositories import groups as group_repository
 from dropshare_server.repositories import users as user_repository
 from dropshare_server.services import audit as audit_service
+from dropshare_server.services import sharing as sharing_service
 from dropshare_server.services.audit import AuditTarget
 from dropshare_server.services.context import CallContext
 from dropshare_server.services.users import normalize_login
@@ -62,6 +63,7 @@ def create_group(session: Session, ctx: CallContext, name: str) -> GroupSummary:
 
 
 def delete_group(session: Session, ctx: CallContext, name: str) -> None:
+    """Access shared with the group ends with it (FR-SHARE-04)."""
     group = _require(session, name)
     members = group_repository.member_ids(session, group.id)
     audit_service.record(
@@ -71,6 +73,7 @@ def delete_group(session: Session, ctx: CallContext, name: str) -> None:
         target=_target(group),
         details={"members": len(members)},
     )
+    sharing_service.group_deleted(session, group.id, members)
     group_repository.delete_group(session, group)
 
 
@@ -98,6 +101,8 @@ def remove_member(session: Session, ctx: CallContext, name: str, username: str) 
     user = _require_user(session, username)
     if not group_repository.remove_member(session, group.id, user.id):
         raise AppError(404, ErrorCode.NOT_FOUND, f"'{user.username}' isn't in '{group.name}'.")
+    # Access through the group ends on the user's next sync (FR-ADMIN-01).
+    sharing_service.group_member_removed(session, group.id, user.id)
     audit_service.record(
         session,
         ctx,

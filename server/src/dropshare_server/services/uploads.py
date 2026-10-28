@@ -94,7 +94,8 @@ def start(
             FileTooLargeDetails(max_file_size_bytes=settings.max_file_size_bytes).model_dump(),
         )
     if body.node_id is not None and body.base_revision is not None:
-        node = access.require_node(session, user_id, body.node_id, write=True)
+        # An editor of a single shared file may upload a new version of it (OQ-32).
+        node = access.require_node(session, user_id, body.node_id, write=True, file_share=True)
         if node.kind != NodeKind.FILE:
             raise invalid("Only files can get new content.", "not_a_file", ["body", "node_id"])
         if node.revision != body.base_revision:
@@ -102,7 +103,9 @@ def start(
         namespace_id, parent_id, name = node.namespace_id, None, None
     elif body.parent_id is not None and body.name is not None:
         name, normalized = node_service.valid_name(body.name, ["body", "name"])
-        parent = access.require_node(session, user_id, body.parent_id, write=True)
+        parent = access.require_node(
+            session, user_id, body.parent_id, write=True, follow_mount=True
+        )
         node_service.require_folder(parent)
         existing = node_repository.get_live_child(
             session, parent.namespace_id, parent.id, normalized
@@ -252,10 +255,12 @@ def complete(
             "Some chunks haven't arrived yet.",
             UploadIncompleteDetails(missing_chunks=missing[:_MISSING_CHUNKS_SHOWN]).model_dump(),
         )
-    node, _ = _target(session, user_id, upload, lock=False)  # fail early, before assembling
+    node, parent = _target(session, user_id, upload, lock=False)  # fail early, before assembling
     previous_size = node.size_bytes if node is not None else 0
     _check_quota(
-        _owner(session, upload.namespace_id, lock=False), upload.size_bytes - previous_size, 0
+        _owner(session, _namespace_of(node, parent), lock=False),
+        upload.size_bytes - previous_size,
+        0,
     )
 
     blob_key = new_blob_key()
@@ -281,7 +286,9 @@ def _replay(session: Session, user_id: uuid.UUID, upload: UploadSession) -> Node
     that is only in the trash as synced, and uploads its copy again as a new file."""
     if upload.node_id is None or upload.result_revision is None or upload.completed_at is None:
         raise RuntimeError(f"Completed upload {upload.id} has no result")
-    node = access.require_node(session, user_id, upload.node_id, allow_trashed=True)
+    node = access.require_node(
+        session, user_id, upload.node_id, allow_trashed=True, file_share=True
+    )
     if node.trashed_at is not None:
         raise node_service.revision_conflict(None)
     return node_service.to_out(node).model_copy(
@@ -301,7 +308,13 @@ def _target(
     """(edited file, None) or (None, parent folder), still valid for this upload."""
     if upload.node_id is not None:
         node = access.require_node(
-            session, user_id, upload.node_id, write=True, lock=lock, allow_trashed=True
+            session,
+            user_id,
+            upload.node_id,
+            write=True,
+            lock=lock,
+            allow_trashed=True,
+            file_share=True,
         )
         if node.trashed_at is not None:
             raise node_service.revision_conflict(None)  # the file went to the trash
@@ -312,13 +325,28 @@ def _target(
     if upload.parent_id is None or upload.name is None:
         raise RuntimeError(f"Upload {upload.id} has no target")
     parent = access.require_node(
-        session, user_id, upload.parent_id, write=True, lock=lock, resource="Folder"
+        session,
+        user_id,
+        upload.parent_id,
+        write=True,
+        lock=lock,
+        resource="Folder",
+        follow_mount=True,
     )
     normalized = node_service.valid_name(upload.name, ["name"])[1]
     existing = node_repository.get_live_child(session, parent.namespace_id, parent.id, normalized)
     if existing is not None:
         raise node_service.name_conflict(existing)
     return None, parent
+
+
+def _namespace_of(node: Node | None, parent: Node | None) -> uuid.UUID:
+    """Where the file lands now: its folder may have moved to a shared folder's namespace (or
+    out of one) since the upload started, and the quota charged is that namespace owner's."""
+    target = node if node is not None else parent
+    if target is None:
+        raise RuntimeError("An upload target has a file or a folder")
+    return target.namespace_id
 
 
 def _reject_mismatch(
@@ -367,7 +395,7 @@ def _record_version(
     """Lock the target and the owner, check again, and record the version, change and audit."""
     node, parent = _target(session, user_id, upload, lock=True)
     previous_size = node.size_bytes if node is not None else 0
-    owner = _owner(session, upload.namespace_id, lock=True)
+    owner = _owner(session, _namespace_of(node, parent), lock=True)
     delta = stored.size_bytes - previous_size
     _check_quota(owner, delta, 0)  # again under the lock: another upload may have finished
 

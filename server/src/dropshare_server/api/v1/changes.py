@@ -19,7 +19,11 @@ async def wait_for_changes(
 ) -> DataResponse[WaitOut]:
     """Long-poll (FR-SYNC-03): answer as soon as a namespace has news, or empty on timeout."""
     settings = resources.settings
-    await run_in_threadpool(change_service.prepare_wait, db, current.user.id, list(body.cursors))
+    lost = await run_in_threadpool(
+        change_service.prepare_wait, db, current.user.id, list(body.cursors)
+    )
+    if lost:
+        return DataResponse(data=WaitOut(changed=lost))
     deadline = time.monotonic() + settings.long_poll_timeout_seconds
     while True:
         changed = await run_in_threadpool(

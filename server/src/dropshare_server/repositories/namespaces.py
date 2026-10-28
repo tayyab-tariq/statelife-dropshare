@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from dropshare_server.models import Namespace
+from dropshare_shared.schemas.nodes import NamespaceKind
 
 
 def add(session: Session, namespace: Namespace) -> None:
@@ -32,3 +33,11 @@ def list_owned(session: Session, owner_user_id: uuid.UUID) -> list[Namespace]:
             .order_by(Namespace.created_at, Namespace.id)
         )
     )
+
+
+def get_personal(session: Session, owner_user_id: uuid.UUID) -> Namespace | None:
+    return session.scalars(
+        select(Namespace).where(
+            Namespace.owner_user_id == owner_user_id, Namespace.kind == NamespaceKind.PERSONAL
+        )
+    ).one_or_none()
