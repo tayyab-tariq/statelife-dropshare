@@ -1,5 +1,7 @@
 """What can go wrong talking to the server. Controllers map these to messages."""
 
+from enum import StrEnum
+
 from dropshare_shared.errors import ErrorCode
 
 
@@ -49,6 +51,35 @@ class SessionExpiredError(Exception):
 
 class InvalidInputError(ValueError):
     """What the user typed can't be sent (e.g. too long). The message never includes it."""
+
+
+class FileProblem(StrEnum):
+    """Why a file action or an upload from the app (FR-FILE-02/03/04) can't be done. The
+    words for each are in controllers/messages.py; `FileActionError.name` fills them in."""
+
+    BAD_NAME = "bad_name"  # `detail` says why (NFR-COMPAT-02)
+    NAME_TAKEN = "name_taken"
+    GONE = "gone"
+    IN_USE = "in_use"
+    FAILED = "failed"
+    INTO_ITSELF = "into_itself"
+    OUTSIDE = "outside"
+    COPY_EXISTS = "copy_exists"
+    CHANGED = "changed"  # the item isn't the one the list showed any more
+    SOURCE_GONE = "source_gone"
+    SOURCE_LINK = "source_link"
+    DUPLICATE_SOURCE = "duplicate_source"
+    NOT_A_FOLDER = "not_a_folder"
+    NOT_A_FILE = "not_a_file"
+    NO_FREE_NAME = "no_free_name"
+    FOLDER_GONE = "folder_gone"
+    NETWORK_SOURCE = "network_source"
+
+
+class FileActionError(InvalidInputError):
+    def __init__(self, problem: FileProblem, name: str = "", detail: str = "") -> None:
+        super().__init__(problem.value)  # for logs; the user's words come from messages.py
+        self.problem, self.name, self.detail = problem, name, detail
 
 
 class TransferCancelledError(Exception):

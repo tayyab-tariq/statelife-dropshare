@@ -63,6 +63,20 @@ def rename_no_replace(source: Path, target: Path) -> None:
         raise RuntimeError(f"Unsupported platform: {sys.platform}")
 
 
+def reveal(path: Path) -> None:
+    """Show the item in the system file manager, selected (FR-FILE-05)."""
+    if sys.platform == "win32":
+        from dropshare_client.platform.windows.explorer import reveal as explorer_reveal
+
+        explorer_reveal(path)
+    elif sys.platform == "darwin":
+        from dropshare_client.platform.macos.finder import reveal as finder_reveal
+
+        finder_reveal(path)
+    else:
+        raise RuntimeError(f"Unsupported platform: {sys.platform}")
+
+
 def allow_foreground_handover() -> None:
     """Called by a second launch before it wakes the running instance (FR-CLIENT-07)."""
     if sys.platform == "win32":

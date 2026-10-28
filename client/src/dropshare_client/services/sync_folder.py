@@ -12,6 +12,17 @@ from dropshare_client.platform.base import VolumeKind, Volumes
 
 # DropShare's own hidden folder inside the sync folder (partial downloads, owner marker).
 TEMP_DIR = ".dropshare-tmp"
+
+
+def is_link(path: Path) -> bool:
+    """Symlinks and NTFS junctions alike: both lead somewhere else, and neither is followed
+    into or out of the sync folder (FR-SYNC-07). `is_symlink()` alone misses junctions."""
+    try:
+        return path.is_symlink() or path.is_junction()
+    except OSError:
+        return False
+
+
 # Standard per-user folders that hold the user's own files.
 _SHELL_FOLDERS = ("Desktop", "Documents", "Downloads", "Music", "Pictures", "Videos")
 # Left by the OS in otherwise empty folders; they don't make a folder "in use".

@@ -10,14 +10,20 @@ from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import QAbstractButton, QLabel, QWidget
 from pytestqt.qtbot import QtBot
 
+from dropshare_client.controllers.browser_controller import BrowserController
+from dropshare_client.controllers.file_actions_controller import FileActionsController
 from dropshare_client.controllers.session_controller import SessionController
 from dropshare_client.controllers.sync_controller import SyncController
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
 from dropshare_client.controllers.transfers_controller import TransfersController
+from dropshare_client.controllers.upload_controller import UploadController
 from dropshare_client.platform.macos.recycle_bin import MacTrash
 from dropshare_client.services.api_client import ApiClient
 from dropshare_client.services.auth import AuthService, Device
 from dropshare_client.services.config import ConfigStore
+from dropshare_client.services.files import RemoteFiles
+from dropshare_client.services.importer import Importer
+from dropshare_client.services.local_files import LocalFiles
 from dropshare_client.services.tokens import TokenStore
 from dropshare_client.ui.app_shell import AppShell
 
@@ -53,6 +59,8 @@ def find_by_name() -> FindByName:
 
     def find(root: QWidget, widget_type: type[QWidget], name: str) -> QWidget:
         matches = [w for w in root.findChildren(widget_type) if _spoken_name(w) == name]
+        if len(matches) > 1:  # another section's page has one too: the shown one counts
+            matches = [w for w in matches if w.isVisibleTo(root)]
         assert len(matches) == 1, f"expected one {widget_type.__name__} named {name!r}"
         return matches[0]
 
@@ -96,6 +104,8 @@ def make_client(
         auth = AuthService(api, tokens, Device(name="Test PC", os="Windows 11"))
         engines = FakeEngines(tmp_path / "app-data" / "index.db")
         sync = SyncController(config, engines, engines.forget)
+        transfers = TransfersController(sync)
+        revealed: list[Path] = []
         return Client(
             server=server,
             credentials=credentials,
@@ -111,7 +121,20 @@ def make_client(
                 tmp_path / "app-data",
             ),
             sync=sync,
-            transfers=TransfersController(sync),
+            transfers=transfers,
+            browser=BrowserController(
+                RemoteFiles(api), tmp_path / "app-data" / "index.db", transfers
+            ),
+            file_actions=FileActionsController(
+                config,
+                lambda root: LocalFiles(root, MacTrash(trash), revealed.append),
+                sync,
+                tmp_path / "app-data" / "index.db",
+            ),
+            revealed=revealed,
+            uploads=UploadController(
+                config, lambda root: Importer(root, MacTrash(trash)), sync, auth.current_user
+            ),
             engines=engines,
             trash=trash,
             app_data=tmp_path / "app-data",
@@ -137,6 +160,9 @@ def make_shell(qtbot: QtBot) -> Iterator[MakeShell]:
             client.folders,
             client.sync,
             client.transfers,
+            client.browser,
+            client.file_actions,
+            client.uploads,
             tray_available=tray_available,
         )
         qtbot.addWidget(shell.window)
@@ -149,7 +175,15 @@ def make_shell(qtbot: QtBot) -> Iterator[MakeShell]:
         shell.tray.hide()
     # pytest-qt has deleted the widgets by now: silence what still arrives for them.
     for client in clients:
-        for controller in (client.sync, client.transfers, client.session, client.folders):
+        for controller in (
+            client.sync,
+            client.transfers,
+            client.browser,
+            client.file_actions,
+            client.uploads,
+            client.session,
+            client.folders,
+        ):
             controller.blockSignals(True)
         client.sync.shutdown()
     QThreadPool.globalInstance().waitForDone(5000)

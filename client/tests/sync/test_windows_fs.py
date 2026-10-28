@@ -2,6 +2,7 @@
 macOS doesn't lock open files, so these can't be reproduced on the development Mac."""
 
 import ctypes
+import subprocess
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -165,3 +166,58 @@ def test_ntfs_file_ids_survive_a_move_and_the_move_is_sent_as_one(tmp_path: Path
     assert server.tree() == {"Reports": None, "Reports/Report.docx": b"report"}
     assert next(n.id for n in server.nodes.values() if n.name == "Report.docx") == node
     assert "upload" not in server.calls and server.trashed() == []
+
+
+def test_show_in_folder_starts_explorer_by_its_full_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Never a search that could find a planted explorer.exe (audit S12). Check by eye that
+    Explorer opens with the file selected (Windows check list)."""
+    from dropshare_client.platform.windows import explorer
+
+    started: list[str] = []
+    monkeypatch.setattr(subprocess, "Popen", lambda command: started.append(command))
+    item = tmp_path / "report.docx"
+    item.write_text("x")
+
+    explorer.reveal(item)
+
+    [command] = started
+    assert command.lower().startswith('"c:\\windows\\explorer.exe" /select,')
+    assert command.endswith(f'"{item}"')
+
+
+def test_junctions_are_never_followed_by_file_actions_or_uploads(tmp_path: Path) -> None:
+    """is_symlink() misses NTFS junctions (audit S13)."""
+    from dropshare_client.platform.macos.recycle_bin import MacTrash
+    from dropshare_client.services.errors import FileActionError, FileProblem
+    from dropshare_client.services.importer import Importer
+    from dropshare_client.services.local_files import LocalFiles
+
+    root = tmp_path / "DropShare"
+    root.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "secret.txt").write_text("secret")
+    _junction(root / "Junction", elsewhere)
+    chosen = tmp_path / "Chosen"
+    chosen.mkdir()
+    (chosen / "a.txt").write_text("a")
+    _junction(chosen / "Junction", elsewhere)
+    files = LocalFiles(root, MacTrash(tmp_path / "trash"), lambda _: None)
+
+    with pytest.raises(FileActionError) as raised:
+        files.delete(["Junction/secret.txt"])
+    plan = Importer(root, MacTrash(tmp_path / "trash")).plan([chosen], "")
+
+    assert raised.value.problem is FileProblem.OUTSIDE
+    assert plan.total == 1  # a.txt only; the junction's contents are left out
+
+
+def _junction(link: Path, target: Path) -> None:
+    """An NTFS junction, made as a user would (mklink /J needs no admin rights)."""
+    subprocess.run(  # noqa: S603 - fixed program, paths from the test
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],  # noqa: S607 - cmd is on PATH
+        check=True,
+        capture_output=True,
+    )

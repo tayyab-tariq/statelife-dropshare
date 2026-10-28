@@ -16,15 +16,20 @@ from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from dropshare_client import platform
+from dropshare_client.controllers.browser_controller import BrowserController
+from dropshare_client.controllers.file_actions_controller import FileActionsController
 from dropshare_client.controllers.session_controller import SessionController
 from dropshare_client.controllers.sync_controller import SyncController
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
 from dropshare_client.controllers.transfers_controller import TransfersController
+from dropshare_client.controllers.upload_controller import UploadController
 from dropshare_client.platform.base import Paths
 from dropshare_client.services.api_client import ApiClient
 from dropshare_client.services.auth import AuthService, this_device
 from dropshare_client.services.config import ConfigStore
 from dropshare_client.services.files import RemoteFiles
+from dropshare_client.services.importer import Importer
+from dropshare_client.services.local_files import LocalFiles
 from dropshare_client.services.tokens import TokenStore
 from dropshare_client.single_instance import SingleInstance, instance_name
 from dropshare_client.sync import binding
@@ -152,9 +157,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         client_version=client_version,
         user_agent=f"DropShare/{client_version} ({sys.platform})",
     )
-    session = SessionController(
-        AuthService(api, tokens, this_device()), config, system.recycle_bin, app_data
-    )
+    auth = AuthService(api, tokens, this_device())
+    session = SessionController(auth, config, system.recycle_bin, app_data)
     folders = SyncFolderController(
         system.volumes, config, system.paths.default_sync_root(), app_data
     )
@@ -178,11 +182,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     sync = SyncController(config, make_engine, lambda: binding.forget(index_path))
+    transfers = TransfersController(sync)
     shell = AppShell(
         session,
         folders,
         sync,
-        TransfersController(sync),
+        transfers,
+        BrowserController(files, index_path, transfers),
+        FileActionsController(
+            config,
+            lambda root: LocalFiles(root, system.recycle_bin, platform.reveal),
+            sync,
+            index_path,
+        ),
+        UploadController(
+            config, lambda root: Importer(root, system.recycle_bin), sync, auth.current_user
+        ),
         background=args.background,
         tray_available=QSystemTrayIcon.isSystemTrayAvailable(),
     )

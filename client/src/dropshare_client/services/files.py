@@ -23,7 +23,7 @@ from dropshare_client.services.errors import (
     TransferCancelledError,
 )
 from dropshare_shared.errors import ErrorCode
-from dropshare_shared.schemas.envelope import DataResponse
+from dropshare_shared.schemas.envelope import PAGE_LIMIT_MAX, DataResponse, ListResponse
 from dropshare_shared.schemas.nodes import FolderCreateIn, NamespaceOut, NodeOut, NodeUpdateIn
 from dropshare_shared.schemas.sync import ChangesResponse, WaitIn, WaitOut
 from dropshare_shared.schemas.uploads import (
@@ -116,6 +116,17 @@ class RemoteFiles:
         return self._api.data(
             "POST", "/api/v1/changes/wait", WaitOut, json=body, timeout=_WAIT_TIMEOUT
         ).changed
+
+    def children(
+        self, folder_id: uuid.UUID, page: int, limit: int = PAGE_LIMIT_MAX
+    ) -> ListResponse[NodeOut]:
+        """One page of a folder's live items, folders first, then by name (FR-FILE-01)."""
+        return self._api.envelope(
+            "GET",
+            f"/api/v1/nodes/{folder_id}/children",
+            ListResponse[NodeOut],
+            params={"page": page, "limit": limit},
+        )
 
     def get_node(self, node_id: uuid.UUID) -> NodeOut:
         return self._api.data("GET", f"/api/v1/nodes/{node_id}", NodeOut)

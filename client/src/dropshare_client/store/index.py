@@ -7,6 +7,7 @@ never deletes anything (reconciler.py).
 
 import json
 import logging
+import sqlite3
 import uuid
 from collections.abc import Iterable
 from datetime import UTC, datetime
@@ -29,6 +30,7 @@ from sqlalchemy import (
     select,
 )
 from sqlalchemy.engine import URL
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from sqlalchemy.pool import ConnectionPoolEntry
 from sqlalchemy.sql.elements import ColumnElement
@@ -194,6 +196,39 @@ def _remote_row(node: RemoteNode) -> _RemoteNode:
         revision=node.revision,
         modified_at=node.modified_at,
     )
+
+
+_READ_BATCH = 500  # well under SQLite's bound-variable limit
+
+
+def read_entries(path: Path, node_ids: Iterable[uuid.UUID]) -> dict[uuid.UUID, Entry]:
+    """The synced entries for these nodes, read from another thread than the engine's
+    (the file browser's sync column). Opens the file read-only, so it never creates,
+    migrates or locks it for writing; WAL lets it read while the engine writes. Empty when
+    there is no index (yet), or it is mid-rebuild."""
+    if not path.exists():
+        return {}
+    # The path as a proper file: URI (percent-encoded: a "#" or "%" in a user name stays part
+    # of the path), opened read-only by sqlite3 itself.
+    uri = f"{path.resolve().as_uri()}?mode=ro"
+    engine = create_engine("sqlite://", creator=lambda: sqlite3.connect(uri, uri=True))
+    wanted = list(node_ids)
+    found: dict[uuid.UUID, Entry] = {}
+    try:
+        with engine.connect() as connection:
+            for start in range(0, len(wanted), _READ_BATCH):
+                rows = connection.execute(
+                    select(_Entry).where(_Entry.node_id.in_(wanted[start : start + _READ_BATCH]))
+                )
+                for row in rows:
+                    entry = _Entry(**row._mapping)
+                    found[entry.node_id] = _entry(entry)
+    except OperationalError:
+        logger.info("The index can't be read right now; showing no sync states")
+        return {}
+    finally:
+        engine.dispose()
+    return found
 
 
 class Index:

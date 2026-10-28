@@ -70,6 +70,8 @@ class Engine(Protocol):
 
     def retry_now(self, key: str) -> None: ...
 
+    def local_changed(self, path: str) -> None: ...
+
 
 # (sync folder, user ID, display name, server URL, listener) -> an engine, not yet started.
 # Runs on the pool; raises ForeignFolderError if the folder holds another account's files.
@@ -240,6 +242,13 @@ class SyncController(QObject):
         self._paused = False
         if self._engine is not None:
             self._engine.resume()
+
+    def changed_here(self, paths: list[str]) -> None:
+        """The app itself changed these paths in the sync folder: look at them now rather
+        than waiting for the watcher (which may also report them; that's harmless)."""
+        if self._engine is not None:
+            for path in paths:
+                self._engine.local_changed(path)
 
     def retry(self, key: str) -> None:
         """Try a transfer again now: the Transfers view's Retry (FR-CLIENT-08)."""

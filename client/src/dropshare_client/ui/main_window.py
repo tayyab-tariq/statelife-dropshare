@@ -1,5 +1,6 @@
-"""The main window: a header with the account actions, sections down the side (the overview
-of account and sync folder, Transfers), and the chosen section's page."""
+"""The main window: a header with the account actions, sections down the side (My files,
+Shared with me, Transfers, and the overview of account and sync folder), and the chosen
+section's page."""
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QCloseEvent
@@ -21,6 +22,7 @@ from dropshare_client.ui import theme
 from dropshare_client.ui.stateful_view import StatefulView
 from dropshare_shared.schemas.users import UserOut
 
+OVERVIEW = "Overview"
 _PAUSE = "&Pause syncing"
 _RESUME = "&Resume syncing"
 
@@ -141,10 +143,11 @@ class MainWindow(QMainWindow):
         self._nav = QListWidget()
         self._nav.setObjectName("navList")
         self._nav.setAccessibleName("Sections")
-        self._nav.setFixedWidth(theme.SIDEBAR_WIDTH)
+        self._nav.setMinimumWidth(theme.SIDEBAR_WIDTH)  # grows with larger text sizes
+        self._nav.setMaximumWidth(theme.SIDEBAR_WIDTH * 2)
         self._pages = QStackedWidget()
         self._nav.currentRowChanged.connect(self._pages.setCurrentIndex)
-        self.add_page("Overview", self._view)
+        self.add_page(OVERVIEW, self._view)
         self._nav.setCurrentRow(0)
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
@@ -171,10 +174,14 @@ class MainWindow(QMainWindow):
     def view(self) -> StatefulView:
         return self._view
 
-    def add_page(self, title: str, page: QWidget) -> None:
-        """A section in the sidebar, shown when chosen there."""
-        self._nav.addItem(QListWidgetItem(title))
-        self._pages.addWidget(page)
+    def add_page(self, title: str, page: QWidget, position: int | None = None) -> None:
+        """A section in the sidebar, shown when chosen there; at the end by default."""
+        row = self._nav.count() if position is None else position
+        current = self._nav.currentRow()
+        self._nav.insertItem(row, QListWidgetItem(title))
+        self._pages.insertWidget(row, page)
+        if current >= 0 and row <= current:  # the same section stays shown
+            self._nav.setCurrentRow(current + 1)
 
     def show_page(self, title: str) -> None:
         for row in range(self._nav.count()):
@@ -187,10 +194,17 @@ class MainWindow(QMainWindow):
         """Without a system tray there is nothing to hide into: closing then quits."""
         self._hide_on_close = hide
 
-    def show_loading(self, message: str) -> None:
+    def show_loading(self, message: str, *, switch_page: bool = True) -> None:
+        """App-level states (signing in, offline, syncing couldn't start) show on the overview.
+        `switch_page` opens it too: before signing in nothing else works; once signed in, a
+        passing state (offline, retrying) mustn't pull the user out of what they're doing."""
+        if switch_page:
+            self.show_page(OVERVIEW)
         self._view.show_loading(message)
 
-    def show_error(self, message: str) -> None:
+    def show_error(self, message: str, *, switch_page: bool = True) -> None:
+        if switch_page:
+            self.show_page(OVERVIEW)
         self._view.show_error(message)
 
     def show_account(self, user: UserOut, server: str, folder: str | None, status: str) -> None:

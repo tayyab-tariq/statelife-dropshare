@@ -80,13 +80,23 @@ _PROBLEM_REASONS: dict[str, str] = {
     ErrorCode.FILE_TOO_LARGE: "The file is larger than the maximum DropShare accepts.",
     ErrorCode.FORBIDDEN: "You don't have permission to change this item.",
 }
-# Passed through to the engine: they stop the whole cycle, not just one item.
-# Why a transfer waits (FR-CLIENT-08); it continues on its own.
-_OFFLINE = "Waiting for the connection."
-_STOPPED = "Paused."
+# Why a transfer waits (FR-CLIENT-08); it continues on its own once the cause is gone.
 _IN_USE = "Open in another program. It syncs once it's closed."
 _TRY_AGAIN = "Will try again shortly."
+_STOPPED_BECAUSE: dict[type[Exception], str] = {
+    OfflineError: "Waiting for the connection.",
+    SessionExpiredError: "Waiting for you to sign in again.",
+    UpgradeRequiredError: "Waiting for DropShare to be updated.",
+    SyncRootMissingError: "Waiting for the sync folder to be back.",
+    SyncStoppedError: "Paused.",
+}
 
+
+def _stopped_because(exc: Exception) -> str:
+    return next(text for kind, text in _STOPPED_BECAUSE.items() if isinstance(exc, kind))
+
+
+# Passed through to the engine: they stop the whole cycle, not just one item.
 _FATAL = (
     OfflineError,
     SessionExpiredError,
@@ -441,14 +451,11 @@ class SyncCore:
         in `result` (what to retry and when) and reported as not done."""
         try:
             return True, executor.run(action)
-        except OfflineError:
-            self._transfers.waiting(action.key, _OFFLINE)
-            raise
-        except _FATAL:
-            self._transfers.waiting(action.key, _STOPPED)
+        except _FATAL as exc:
+            self._transfers.waiting(action.key, _stopped_because(exc))
             raise
         except TransferCancelledError as exc:
-            self._transfers.waiting(action.key, _STOPPED)
+            self._transfers.waiting(action.key, _stopped_because(SyncStoppedError()))
             raise SyncStoppedError() from exc
         except RetryLaterError as exc:
             result.again = True
@@ -459,6 +466,7 @@ class SyncCore:
             self._cant_sync(action.key, action.path, exc.reason)
         except UnsafePathError as exc:
             self._cant_sync(paths.key_of(exc.path), exc.path, exc.reason)
+            self._transfers.failed(action.key, exc.reason)  # not retried until it changes
         except (
             LocalChangedError,
             FileChangingError,

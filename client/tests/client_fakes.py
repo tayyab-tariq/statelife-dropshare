@@ -4,15 +4,21 @@ client wired to them like app.main does."""
 import json
 import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
+from pydantic import ValidationError
 
+from dropshare_client.controllers.browser_controller import BrowserController
+from dropshare_client.controllers.file_actions_controller import FileActionsController
 from dropshare_client.controllers.session_controller import SessionController
 from dropshare_client.controllers.sync_controller import SyncController
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
 from dropshare_client.controllers.transfers_controller import TransfersController
+from dropshare_client.controllers.upload_controller import UploadController
 from dropshare_client.platform.base import VolumeInfo, VolumeKind
 from dropshare_client.platform.macos.attributes import MacFileAttributes
 from dropshare_client.services.api_client import ApiClient
@@ -22,6 +28,9 @@ from dropshare_client.services.tokens import TokenStore
 from dropshare_client.store.index import Index
 from dropshare_client.sync import binding
 from dropshare_client.sync.engine import SyncListener, SyncState
+from dropshare_shared.naming import normalize_name
+from dropshare_shared.schemas.envelope import ListResponse, Meta, PageQuery
+from dropshare_shared.schemas.nodes import NodeKind, NodeOut
 from dropshare_shared.version import Version, parse_version
 
 SERVER_URL = "http://127.0.0.1:8000"
@@ -38,6 +47,8 @@ class Account:
     disabled: bool = False
     must_change: bool = False
     failures: int = 0
+    quota_bytes: int = 10**12
+    used_bytes: int = 0
 
 
 class FakeServer:
@@ -58,6 +69,11 @@ class FakeServer:
         # Requests to these paths wait until the event is set (to test "while pending").
         self.gates: dict[str, threading.Event] = {}
         self._next = 0
+        # Alice's files for the browser: folder ID -> its children, as the server lists them.
+        self.namespace_id = uuid.uuid4()
+        self.root_id = uuid.uuid4()
+        self.children: dict[uuid.UUID, list[NodeOut]] = {self.root_id: []}
+        self.files: set[uuid.UUID] = set()
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.calls.append(f"{request.method} {request.url.path}")
@@ -74,16 +90,98 @@ class FakeServer:
         if client_version < self.min_version:
             minimum = ".".join(str(part) for part in self.min_version)
             return _error(426, "UPGRADE_REQUIRED", "Update DropShare.", {"min_version": minimum})
-        route = {
+        route: Callable[[httpx.Request], httpx.Response] | None = {
             ("POST", "/api/v1/auth/login"): self._login,
             ("POST", "/api/v1/auth/refresh"): self._refresh,
             ("POST", "/api/v1/auth/logout"): self._logout,
             ("GET", "/api/v1/me"): self._me,
             ("POST", "/api/v1/me/password"): self._change_password,
         }.get((request.method, request.url.path))
+        if route is None and request.method == "GET":
+            route = self._files_route(request.url.path)
         if route is None:
             return _error(404, "NOT_FOUND", "Not found")
         return route(request)
+
+    # --- files, for the browser (server api/v1/namespaces.py, nodes.py) ---------------------
+
+    def add(self, parent_id: uuid.UUID, name: str, size: int | None = None) -> uuid.UUID:
+        """A folder (no size) or a file in `parent_id`; returns its node ID."""
+        node_id = uuid.uuid4()
+        now = datetime(2026, 10, 28, 9, 30, tzinfo=UTC)
+        self.children.setdefault(parent_id, []).append(
+            NodeOut(
+                id=node_id,
+                namespace_id=self.namespace_id,
+                parent_id=parent_id,
+                name=name,
+                kind=NodeKind.FOLDER if size is None else NodeKind.FILE,
+                size_bytes=size or 0,
+                content_hash=None if size is None else "0" * 64,
+                revision=1,
+                created_at=now,
+                modified_at=now,
+                modified_by_user_id=uuid.UUID(int=1),
+            )
+        )
+        if size is None:
+            self.children[node_id] = []
+        else:
+            self.files.add(node_id)
+        return node_id
+
+    def _files_route(self, path: str) -> Callable[[httpx.Request], httpx.Response] | None:
+        if path == "/api/v1/namespaces":
+            return self._namespaces
+        parts = path.split("/")
+        if len(parts) == 6 and parts[3] == "nodes" and parts[5] == "children":
+            return lambda request: self._children(request, uuid.UUID(parts[4]))
+        return None
+
+    def _namespaces(self, request: httpx.Request) -> httpx.Response:
+        if self._user(request) is None:
+            return _error(401, "UNAUTHENTICATED", "Sign in to continue.")
+        namespace = {
+            "id": str(self.namespace_id),
+            "kind": "personal",
+            "root_node_id": str(self.root_id),
+            "role": "owner",
+        }
+        return httpx.Response(200, json={"data": [namespace]})
+
+    def _children(self, request: httpx.Request, folder_id: uuid.UUID) -> httpx.Response:
+        if self._user(request) is None:
+            return _error(401, "UNAUTHENTICATED", "Sign in to continue.")
+        if folder_id in self.files:  # as the server: a file has no children
+            return _error(
+                400,
+                "VALIDATION_ERROR",
+                "Only folders have children.",
+                [
+                    {
+                        "loc": ["path", "node_id"],
+                        "msg": "Only folders have children.",
+                        "type": "not_a_folder",
+                    }
+                ],
+            )
+        items = self.children.get(folder_id)
+        if items is None:
+            return _error(404, "NOT_FOUND", "Item not found.")
+        try:
+            query = PageQuery.model_validate(dict(request.url.params))
+        except ValidationError:
+            return _error(400, "VALIDATION_ERROR", "Invalid paging.")
+        # As the server orders them: folders first, then by normalized name, then by ID.
+        ordered = sorted(
+            items,
+            key=lambda n: (n.kind != NodeKind.FOLDER, normalize_name(n.name or ""), str(n.id)),
+        )
+        chunk = ordered[(query.page - 1) * query.limit : query.page * query.limit]
+        body = ListResponse[NodeOut](
+            data=chunk, meta=Meta(page=query.page, limit=query.limit, total=len(items))
+        )
+        return httpx.Response(200, content=body.model_dump_json())
 
     def issue(self, username: str) -> dict[str, object]:
         self._next += 1
@@ -147,7 +245,8 @@ class FakeServer:
                 "email": f"{username}@example.com",
                 "display_name": username.title(),
                 "role": "user",
-                "quota_bytes": 1024,
+                "quota_bytes": self.accounts[username].quota_bytes,
+                "used_bytes": self.accounts[username].used_bytes,
             }
         )
 
@@ -252,6 +351,9 @@ class FakeEngine:
     def retry_now(self, key: str) -> None:
         self.calls.append(f"retry {key}")
 
+    def local_changed(self, path: str) -> None:
+        self.calls.append(f"changed {path}")
+
     def pause(self) -> None:
         self.calls.append("pause")
         self.paused = True
@@ -317,6 +419,10 @@ class Client:
     folders: SyncFolderController
     sync: SyncController
     transfers: TransfersController
+    browser: BrowserController
+    file_actions: FileActionsController
+    uploads: UploadController
+    revealed: list[Path]  # what "Show in folder" asked the system to show
     engines: FakeEngines
     trash: Path
     app_data: Path
