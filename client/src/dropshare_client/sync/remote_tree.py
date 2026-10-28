@@ -98,7 +98,8 @@ class RemoteTree:
     def apply(self, namespace_id: uuid.UUID, changes: Iterable[ChangeOut]) -> TreeDelta:
         delta = TreeDelta()
         for change in changes:
-            if change.type in (ChangeType.CREATED, ChangeType.MODIFIED):
+            # A move arrives as the node with its new parent and name; its subtree follows it.
+            if change.type in (ChangeType.CREATED, ChangeType.MODIFIED, ChangeType.MOVED):
                 node = _from_change(namespace_id, change)
                 if node is None:
                     logger.info("Ignoring node %s of unknown kind %s", change.node_id, change.kind)

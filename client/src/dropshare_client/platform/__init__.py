@@ -2,6 +2,7 @@
 
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 from dropshare_client.platform.base import (
     CredentialStore,
@@ -47,6 +48,19 @@ def max_path_length() -> int | None:
     long-path support stops at MAX_PATH (260 including the terminator); paths beyond it are
     listed as "can't sync" until long paths are supported (NFR-COMPAT-03, decision D4)."""
     return 259 if sys.platform == "win32" else None
+
+
+def rename_no_replace(source: Path, target: Path) -> None:
+    """Rename or move within one volume; FileExistsError if `target` exists. Never replaces
+    anything, so a file created at the target meanwhile can't be lost (FR-SYNC-10)."""
+    if sys.platform == "win32":
+        source.rename(target)  # Windows refuses an existing target (no REPLACE_EXISTING)
+    elif sys.platform == "darwin":
+        from dropshare_client.platform.macos.rename import rename_no_replace as mac_rename
+
+        mac_rename(source, target)
+    else:
+        raise RuntimeError(f"Unsupported platform: {sys.platform}")
 
 
 def allow_foreground_handover() -> None:

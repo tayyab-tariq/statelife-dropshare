@@ -7,6 +7,7 @@ finishes the job (tests/sync/test_crash_recovery.py). `crash_point` lets tests s
 """
 
 import contextlib
+import dataclasses
 import logging
 import os
 import stat
@@ -20,6 +21,7 @@ from typing import Protocol
 
 from pydantic import ValidationError
 
+from dropshare_client.platform import rename_no_replace
 from dropshare_client.platform.base import FileAttributes, RecycleBin
 from dropshare_client.services.errors import ApiError, OfflineError
 from dropshare_client.services.files import NewFile, NewVersion, SourceFile
@@ -100,6 +102,8 @@ class Executor:
             Op.RECORD: self._record,
             Op.DELETE_LOCAL: self._delete_local,
             Op.DELETE_REMOTE: self._delete_remote,
+            Op.MOVE_LOCAL: self._move_local,
+            Op.MOVE_REMOTE: self._move_remote,
         }
         handlers[action.op](action)
         return None
@@ -171,7 +175,15 @@ class Executor:
                 raise LocalChangedError(action.key) from None
             path = self._scanner.resolve(action.key) or path  # created meanwhile: link it
         self._crash_point("make_local_folder.created")
-        self._index.put_entry(_entry(action.key, path, remote.node, disk.stat().st_mtime_ns))
+        self._index.put_entry(
+            _entry(
+                action.key,
+                path,
+                remote.node,
+                disk.stat().st_mtime_ns,
+                self._scanner.file_id(path),
+            )
+        )
 
     def _make_remote_folder(self, action: Action) -> None:
         local = _required(action.local)
@@ -184,7 +196,9 @@ class Executor:
             node = self._existing_folder(exc)  # a retry, or made elsewhere too
         self._crash_point("make_remote_folder.created")
         remembered = self._remember(node)
-        self._index.put_entry(_entry(action.key, local.path, remembered, local.mtime_ns))
+        self._index.put_entry(
+            _entry(action.key, local.path, remembered, local.mtime_ns, local.file_id)
+        )
         self._log.activity("folder_added", local.path)
 
     def _existing_folder(self, exc: ApiError) -> NodeOut:
@@ -272,6 +286,77 @@ class Executor:
         )
         self._index.finish(journal)
         self._log.activity("downloaded", path)
+
+    # --- renames and moves (FR-SYNC-10) ---------------------------------------------------
+
+    def _move_remote(self, action: Action) -> None:
+        """Renamed or moved here: one PATCH, so the node keeps its ID and history. Everything
+        inside a folder moves with it. A crash or lost answer is safe: the next cycle finds the
+        item moved on both sides to the same place and only records it."""
+        local, node = _required(action.local), _required(action.remote).node
+        entry = _required(action.base)
+        parent_id = self._remote_parent(action.key)
+        name = _nfc(paths.name_of(local.path))
+        new_parent = parent_id if parent_id != node.parent_id else None
+        new_name = name if name != node.name else None
+        if new_parent is None and new_name is None:
+            # Already where it is here (the server's spelling matches): only the base moves.
+            self._index.move_entries(entry, action.key, local.path)
+            return
+        with self._journaled(
+            "move_remote", action.key, {"from": entry.key}, unsure=(OfflineError,)
+        ) as journal:
+            moved = self._server.move(
+                node.node_id, node.revision, parent_id=new_parent, name=new_name
+            )
+        self._crash_point("move_remote.done")
+        remembered = self._remember(moved)
+        self._index.move_entries(
+            dataclasses.replace(entry, revision=remembered.revision), action.key, local.path
+        )
+        self._index.finish(journal)
+        self._log.activity("moved_on_server", local.path, entry.path)
+
+    def _move_local(self, action: Action) -> None:
+        """Renamed or moved on the server: the same here, never over an existing item. A
+        local edit to the item stays and uploads once its base has moved too."""
+        local, remote, entry = (
+            _required(action.local),
+            _required(action.remote),
+            _required(action.base),
+        )
+        folder = local.kind == NodeKind.FOLDER
+        target_path = paths.join(self._local_parent(action.key), paths.name_of(remote.path))
+        if self._scanner.too_long(target_path, folder=folder):
+            raise CantSyncError(_TOO_LONG)
+        unchanged = folder or remote.node.sha256 == entry.sha256
+        moved = dataclasses.replace(
+            entry, revision=remote.node.revision if unchanged else entry.revision
+        )
+        if target_path == local.path:  # already in place (moved the same way on both sides)
+            self._index.move_entries(moved, action.key, target_path)
+            return
+        source, target = self._disk(local.path), self._disk(target_path)
+        if folder:
+            if not source.is_dir() or source.is_symlink():
+                raise LocalChangedError(action.key)
+        else:
+            self._expect(source, local)
+        with self._journaled("move_local", action.key, {"from": local.path}) as journal:
+            try:
+                rename_no_replace(source, target)
+            except FileExistsError:
+                raise LocalChangedError(action.key) from None
+            except PermissionError:
+                # Windows reports a folder that appeared at a file's target as access
+                # denied, not as "exists": that is a change to plan again, not a lock.
+                if os.path.lexists(target):
+                    raise LocalChangedError(action.key) from None
+                raise
+        self._crash_point("move_local.done")
+        self._index.move_entries(moved, action.key, target_path)
+        self._index.finish(journal)
+        self._log.activity("moved_here", target_path, entry.path)
 
     # --- index only ----------------------------------------------------------------------
 
@@ -426,7 +511,7 @@ class Executor:
         return self._scanner.disk_path(path)
 
 
-def _entry(key: str, path: str, node: RemoteNode, mtime_ns: int) -> Entry:
+def _entry(key: str, path: str, node: RemoteNode, mtime_ns: int, file_id: str | None) -> Entry:
     return Entry(
         key=key,
         path=path,
@@ -436,7 +521,7 @@ def _entry(key: str, path: str, node: RemoteNode, mtime_ns: int) -> Entry:
         sha256=node.sha256,
         size=node.size if node.kind == NodeKind.FILE else 0,
         mtime_ns=mtime_ns,
-        file_id=None,
+        file_id=file_id,
     )
 
 

@@ -7,7 +7,7 @@ import logging
 import os
 import threading
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -24,7 +24,7 @@ from dropshare_client.services.errors import (
 )
 from dropshare_shared.errors import ErrorCode
 from dropshare_shared.schemas.envelope import DataResponse
-from dropshare_shared.schemas.nodes import FolderCreateIn, NamespaceOut, NodeOut
+from dropshare_shared.schemas.nodes import FolderCreateIn, NamespaceOut, NodeOut, NodeUpdateIn
 from dropshare_shared.schemas.sync import ChangesResponse, WaitIn, WaitOut
 from dropshare_shared.schemas.uploads import (
     CHUNK_SHA256_HEADER,
@@ -71,6 +71,12 @@ class NewVersion:
 
 
 type UploadTarget = NewFile | NewVersion
+# Bytes of the file transferred so far; called on the transferring thread (FR-CLIENT-08).
+type Progress = Callable[[int], None]
+
+
+def no_progress(_: int) -> None:
+    pass
 
 
 @dataclass(frozen=True)
@@ -126,9 +132,33 @@ class RemoteFiles:
             params["if_cursor"] = cursor
         self._api.no_content("DELETE", f"/api/v1/nodes/{node_id}", params=params)
 
+    def move(
+        self,
+        node_id: uuid.UUID,
+        revision: int,
+        *,
+        parent_id: uuid.UUID | None = None,
+        name: str | None = None,
+    ) -> NodeOut:
+        """Rename and/or move within the namespace (FR-SYNC-10). Repeating a move that worked
+        returns the node as it is now."""
+        body = NodeUpdateIn(if_revision=revision, parent_id=parent_id, name=name)
+        return self._api.data(
+            "PATCH",
+            f"/api/v1/nodes/{node_id}",
+            NodeOut,
+            json=body.model_dump(mode="json", exclude_none=True),
+        )
+
     # --- uploads -------------------------------------------------------------------------
 
-    def upload(self, source: SourceFile, target: UploadTarget, stop: threading.Event) -> NodeOut:
+    def upload(
+        self,
+        source: SourceFile,
+        target: UploadTarget,
+        stop: threading.Event,
+        progress: Progress = no_progress,
+    ) -> NodeOut:
         """Send the file in chunks and complete it. Retrying after any failure picks the same
         session up and sends only the missing chunks; completing twice returns the same node,
         so a retry after a lost response never makes a duplicate (NFR-REL-04)."""
@@ -141,9 +171,9 @@ class RemoteFiles:
                 self._uploads[key] = upload.id
         try:
             if upload.status != UploadStatus.COMPLETED:
-                self._send_chunks(source, upload, stop)
+                self._send_chunks(source, upload, stop, progress)
                 self._check_unchanged(source)
-            node = self._complete(source, upload, stop)
+            node = self._complete(source, upload, stop, progress)
         except ApiError as exc:
             if exc.code in _UPLOAD_OVER:
                 self._abandon(key, upload.id)
@@ -157,7 +187,9 @@ class RemoteFiles:
             self._uploads.pop(key, None)
         return node
 
-    def _complete(self, source: SourceFile, upload: UploadOut, stop: threading.Event) -> NodeOut:
+    def _complete(
+        self, source: SourceFile, upload: UploadOut, stop: threading.Event, progress: Progress
+    ) -> NodeOut:
         """Complete; if the server is missing a chunk after all, send what it lists, once."""
         timeout = httpx.Timeout(
             connect=10.0,
@@ -172,7 +204,7 @@ class RemoteFiles:
             if exc.code != ErrorCode.UPLOAD_INCOMPLETE:
                 raise
         current = self._api.data("GET", f"/api/v1/uploads/{upload.id}", UploadOut)
-        self._send_chunks(source, current, stop)
+        self._send_chunks(source, current, stop, progress)
         self._check_unchanged(source)
         return self._api.data("POST", path, NodeOut, timeout=timeout)
 
@@ -215,12 +247,16 @@ class RemoteFiles:
             return None
         return upload
 
-    def _send_chunks(self, source: SourceFile, upload: UploadOut, stop: threading.Event) -> None:
+    def _send_chunks(
+        self, source: SourceFile, upload: UploadOut, stop: threading.Event, progress: Progress
+    ) -> None:
         if not 0 < upload.chunk_size <= _MAX_CHUNK_SIZE:
             raise ApiError(
                 200, "INVALID_RESPONSE", "The server asked for chunks of an unexpected size."
             )
         missing = sorted(set(range(upload.chunk_count)) - set(upload.received_chunks))
+        done = source.size - sum(_chunk_length(source.size, upload.chunk_size, i) for i in missing)
+        progress(done)
         with source.path.open("rb") as handle:
             for index in missing:
                 if stop.is_set():
@@ -240,6 +276,8 @@ class RemoteFiles:
                     except ApiError as exc:  # corrupted on the way: send the same bytes again
                         if exc.code != ErrorCode.CHUNK_HASH_MISMATCH or attempt == _CHUNK_ATTEMPTS:
                             raise
+                done += len(data)
+                progress(done)
 
     def _abandon(self, key: tuple[UploadTarget, str, int], upload_id: uuid.UUID) -> None:
         """Forget a session that can't complete, and free its space on the server."""
@@ -259,12 +297,18 @@ class RemoteFiles:
     # --- downloads -----------------------------------------------------------------------
 
     def download(
-        self, node_id: uuid.UUID, sha256: str, size: int, part: Path, stop: threading.Event
+        self,
+        node_id: uuid.UUID,
+        sha256: str,
+        size: int,
+        part: Path,
+        stop: threading.Event,
+        progress: Progress = no_progress,
     ) -> None:
         """Fetch the content into `part`, resuming from what is already there, and verify it
         (FR-SYNC-06, FR-XFER-02). A mismatch starts once more from scratch, then gives up."""
         for attempt in (1, 2):
-            digest = self._fetch(node_id, sha256, size, part, stop)
+            digest = self._fetch(node_id, sha256, size, part, stop, progress)
             if digest == sha256 and part.stat().st_size == size:
                 return
             logger.warning("Download of %s didn't verify (attempt %d)", node_id, attempt)
@@ -272,7 +316,13 @@ class RemoteFiles:
         raise ContentMismatchError(str(node_id))
 
     def _fetch(
-        self, node_id: uuid.UUID, sha256: str, size: int, part: Path, stop: threading.Event
+        self,
+        node_id: uuid.UUID,
+        sha256: str,
+        size: int,
+        part: Path,
+        stop: threading.Event,
+        progress: Progress,
     ) -> str:
         """The SHA-256 of `part` once the rest of the file is appended."""
         offset = part.stat().st_size if part.exists() else 0
@@ -300,6 +350,7 @@ class RemoteFiles:
                     digest = hashlib.sha256()
                 with part.open("ab" if offset else "wb") as out:
                     written = offset
+                    progress(written)
                     for chunk in response.iter_bytes(_READ_SIZE):
                         if stop.is_set():
                             raise TransferCancelledError()
@@ -308,6 +359,7 @@ class RemoteFiles:
                             return ""
                         out.write(chunk)
                         digest.update(chunk)
+                        progress(written)
                     out.flush()
                     os.fsync(out.fileno())
         except httpx.TransportError as exc:
@@ -317,3 +369,7 @@ class RemoteFiles:
                 raise
             part.unlink(missing_ok=True)  # the file got shorter: the next attempt starts over
         return digest.hexdigest()
+
+
+def _chunk_length(size: int, chunk_size: int, index: int) -> int:
+    return max(0, min(chunk_size, size - index * chunk_size))

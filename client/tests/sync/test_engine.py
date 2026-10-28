@@ -266,3 +266,67 @@ def test_with_the_watcher_on_downloaded_folders_stay_put(
         engine.stop()
     assert server.trashed() == []
     assert len(server.tree()) == 5
+
+
+def test_a_server_rename_that_fails_once_here_is_retried_as_a_rename(
+    engine: SyncEngine,
+    root: Path,
+    server: FakeFileServer,
+    listener: Listener,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Word holds the file when another device renames it: the rename waits and is tried
+    again as one, never as Recycle Bin + download (audit B1)."""
+    from dropshare_client import platform
+    from dropshare_client.sync import executor
+
+    _write(root, "doc.txt", b"doc")
+    engine.start()
+    eventually(lambda: server.tree() == {"doc.txt": b"doc"})
+    listener.wait_for(lambda: listener.state == SyncState.UP_TO_DATE)
+    locked = [True]
+
+    def rename(source: Path, target: Path) -> None:
+        if locked:
+            locked.clear()
+            raise PermissionError(32, "The file is in use", str(source))
+        platform.rename_no_replace(source, target)
+
+    monkeypatch.setattr(executor, "rename_no_replace", rename)
+    server.calls.clear()
+    server.relocate("doc.txt", "plan.txt")
+
+    eventually(lambda: (root / "plan.txt").exists() and not (root / "doc.txt").exists())
+    listener.wait_for(lambda: listener.state == SyncState.UP_TO_DATE)
+    assert not locked  # it did fail once
+    assert "download" not in server.calls
+    assert list((tmp_path / "bin").iterdir()) == []
+
+
+def test_a_local_rename_whose_request_fails_once_is_retried_as_a_rename(
+    engine: SyncEngine, root: Path, server: FakeFileServer, listener: Listener
+) -> None:
+    """A 503 on the PATCH: the folder's old path waits with it, so it isn't trashed and
+    uploaded again (audit B1)."""
+    from dropshare_client.services.errors import ApiError
+    from dropshare_shared.errors import ErrorCode
+
+    (root / "F").mkdir()
+    _write(root, "F/a.txt", b"a")
+    engine.start()
+    eventually(lambda: server.tree() == {"F": None, "F/a.txt": b"a"})
+    listener.wait_for(lambda: listener.state == SyncState.UP_TO_DATE)
+    ids = {node.id for node in server.nodes.values()}
+    server.fail("move", ApiError(503, ErrorCode.SERVICE_UNAVAILABLE, "Busy"))
+    server.calls.clear()
+
+    (root / "F").rename(root / "G")
+    engine.local_changed("F")
+    engine.local_changed("G")
+
+    eventually(lambda: server.tree() == {"G": None, "G/a.txt": b"a"})
+    listener.wait_for(lambda: listener.state == SyncState.UP_TO_DATE)
+    assert server.calls.count("move") == 2  # the 503, then the retry
+    assert server.trashed() == [] and "upload" not in server.calls
+    assert {node.id for node in server.nodes.values()} == ids

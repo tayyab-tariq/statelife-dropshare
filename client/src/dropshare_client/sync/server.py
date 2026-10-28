@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Protocol
 
-from dropshare_client.services.files import SourceFile, UploadTarget
+from dropshare_client.services.files import Progress, SourceFile, UploadTarget
 from dropshare_shared.schemas.nodes import NamespaceOut, NodeOut
 from dropshare_shared.schemas.sync import ChangesResponse
 
@@ -24,10 +24,29 @@ class FileServer(Protocol):
 
     def trash(self, node_id: uuid.UUID, revision: int, cursor: int | None = None) -> None: ...
 
+    def move(
+        self,
+        node_id: uuid.UUID,
+        revision: int,
+        *,
+        parent_id: uuid.UUID | None = None,
+        name: str | None = None,
+    ) -> NodeOut: ...
+
     def upload(
-        self, source: SourceFile, target: UploadTarget, stop: threading.Event
+        self,
+        source: SourceFile,
+        target: UploadTarget,
+        stop: threading.Event,
+        progress: Progress = ...,
     ) -> NodeOut: ...
 
     def download(
-        self, node_id: uuid.UUID, sha256: str, size: int, part: Path, stop: threading.Event
+        self,
+        node_id: uuid.UUID,
+        sha256: str,
+        size: int,
+        part: Path,
+        stop: threading.Event,
+        progress: Progress = ...,
     ) -> None: ...

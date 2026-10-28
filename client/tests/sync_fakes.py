@@ -15,20 +15,26 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Concatenate
 
-from dropshare_client.platform.base import FileId, RecycleBin
+from dropshare_client.platform.base import FileId, FileIdentity, RecycleBin
 from dropshare_client.services.errors import (
     ApiError,
     OfflineError,
     RemoteContentChangedError,
     SourceChangedError,
 )
-from dropshare_client.services.files import NewFile, SourceFile, UploadTarget
+from dropshare_client.services.files import (
+    NewFile,
+    Progress,
+    SourceFile,
+    UploadTarget,
+    no_progress,
+)
 from dropshare_client.store.index import Index
 from dropshare_client.sync.core import CycleResult, SyncCore
 from dropshare_client.sync.executor import no_crash
 from dropshare_client.sync.paths import key_of, outermost
 from dropshare_shared.errors import ErrorCode
-from dropshare_shared.naming import normalize_name
+from dropshare_shared.naming import InvalidNameError, normalize_name, validate_name
 from dropshare_shared.schemas.nodes import (
     AccessRole,
     NamespaceKind,
@@ -161,6 +167,19 @@ class FakeFileServer:
         self._trash(node)
 
     @_locked
+    def relocate(self, path: str, new_path: str) -> FakeNode:
+        """Another device renames and/or moves `path` to `new_path`."""
+        node = self._lookup(path)
+        parent = self._lookup(new_path.rpartition("/")[0])
+        name = new_path.rpartition("/")[2]
+        existing = self._child(parent.id, name)
+        assert existing is None or existing.id == node.id, f"{new_path} is taken"
+        node.parent_id, node.name = parent.id, name
+        node.revision += 1
+        self._record(ChangeType.MOVED, node)
+        return node
+
+    @_locked
     def tree(self) -> Tree:
         result: Tree = {}
         for node in self.nodes.values():
@@ -237,6 +256,7 @@ class FakeFileServer:
     @_locked
     def create_folder(self, parent_id: uuid.UUID, name: str) -> NodeOut:
         self._call("create_folder")
+        _check_name(name)
         parent = self._live_folder(parent_id)
         self._check_free(parent, name)
         node = FakeNode(uuid.uuid4(), parent.id, name, NodeKind.FOLDER)
@@ -265,6 +285,47 @@ class FakeFileServer:
         self._trash(node)
         self._after("trash")
 
+    @_locked
+    def move(
+        self,
+        node_id: uuid.UUID,
+        revision: int,
+        *,
+        parent_id: uuid.UUID | None = None,
+        name: str | None = None,
+    ) -> NodeOut:
+        """As the server's PATCH /nodes/{id}."""
+        self._call("move")
+        node = self.nodes.get(node_id)
+        if node is None or node.trashed:
+            raise ApiError(404, ErrorCode.NOT_FOUND, "Not found")
+        if node.parent_id is None:
+            raise _invalid("The root folder can't be moved.", "root_not_movable")
+        if name is not None:
+            _check_name(name)
+        parent = self._live_node(parent_id or node.parent_id)
+        if parent.kind != NodeKind.FOLDER:
+            raise _invalid("The parent must be a folder.", "not_a_folder")
+        new_name = name or node.name or ""
+        if (parent.id, new_name) == (node.parent_id, node.name) and node.revision in (
+            revision,
+            revision + 1,
+        ):
+            self._after("move")
+            return node.out(self.namespace_id)
+        if node.revision != revision:
+            raise _revision_conflict(node.revision)
+        if parent.id == node.id or parent in self._live_below(node):
+            raise _invalid("A folder can't be moved into itself.", "into_itself")
+        existing = self._child(parent.id, new_name)
+        if existing is not None and existing.id != node.id:
+            self._check_free(parent, new_name)
+        node.parent_id, node.name = parent.id, new_name
+        node.revision += 1
+        self._record(ChangeType.MOVED, node)
+        self._after("move")
+        return node.out(self.namespace_id)
+
     def _live_below(self, node: FakeNode) -> list[FakeNode]:
         found: list[FakeNode] = []
         level = [node.id]
@@ -275,7 +336,13 @@ class FakeFileServer:
         return found
 
     @_locked
-    def upload(self, source: SourceFile, target: UploadTarget, stop: threading.Event) -> NodeOut:
+    def upload(
+        self,
+        source: SourceFile,
+        target: UploadTarget,
+        stop: threading.Event,
+        progress: Progress = no_progress,
+    ) -> NodeOut:
         self._call("upload")
         info = source.path.stat()
         content = source.path.read_bytes()
@@ -300,12 +367,19 @@ class FakeFileServer:
             existing.modified_at = datetime.now(UTC)
             node = existing
             self._record(ChangeType.MODIFIED, node)
+        progress(len(content))
         self._after("upload")
         return node.out(self.namespace_id)
 
     @_locked
     def download(
-        self, node_id: uuid.UUID, sha256: str, size: int, part: Path, stop: threading.Event
+        self,
+        node_id: uuid.UUID,
+        sha256: str,
+        size: int,
+        part: Path,
+        stop: threading.Event,
+        progress: Progress = no_progress,
     ) -> None:
         self._call("download")
         node = self.nodes.get(node_id)
@@ -314,6 +388,7 @@ class FakeFileServer:
         if sha(node.content) != sha256:
             raise RemoteContentChangedError(str(node_id))
         part.write_bytes(node.content)
+        progress(len(node.content))
         self._after("download")
 
     # --- internals -------------------------------------------------------------------------
@@ -388,6 +463,12 @@ class FakeFileServer:
             None,
         )
 
+    def _live_node(self, node_id: uuid.UUID) -> FakeNode:
+        node = self.nodes.get(node_id)
+        if node is None or node.trashed:
+            raise ApiError(404, ErrorCode.NOT_FOUND, "Folder not found")
+        return node
+
     def _live_folder(self, node_id: uuid.UUID) -> FakeNode:
         node = self.nodes.get(node_id)
         if node is None or node.trashed or node.kind != NodeKind.FOLDER:
@@ -403,6 +484,24 @@ class FakeFileServer:
                 "Name taken",
                 {"node_id": str(existing.id), "kind": existing.kind.value},
             )
+
+
+def _invalid(message: str, problem: str) -> ApiError:
+    """400 VALIDATION_ERROR shaped as the server's (core.errors.invalid)."""
+    return ApiError(
+        400,
+        ErrorCode.VALIDATION_ERROR,
+        message,
+        [{"loc": ["body"], "msg": message, "type": problem}],
+    )
+
+
+def _check_name(name: str) -> None:
+    """As the server: NFR-COMPAT-02 names, with the NameProblem code as the issue type."""
+    try:
+        validate_name(name)
+    except InvalidNameError as exc:
+        raise _invalid(str(exc), exc.problem.value) from None
 
 
 def _revision_conflict(current: int | None) -> ApiError:
@@ -490,6 +589,7 @@ class Device:
         self,
         crash_point: Callable[[str], None] = no_crash,
         recycle_bin: RecycleBin | None = None,
+        file_identity: FileIdentity | None = None,
     ) -> SyncCore:
         """A fresh engine over the same folder and index, as after the app restarts."""
         self.core = SyncCore(
@@ -497,7 +597,7 @@ class Device:
             self.index,
             self.server,
             recycle_bin or self.bin,
-            InodeIdentity(),
+            file_identity or InodeIdentity(),
             NoAttributes(),
             self.log,
             display_name=DISPLAY_NAME,

@@ -109,6 +109,11 @@ def conflict_name(
     raise ValueError(f"No free conflicted-copy name for {name!r}")
 
 
+def is_conflict_copy(name: str) -> bool:
+    """Whether `name` is one conflict_name() makes."""
+    return f"({_CONFLICT_MARK} {_DASH} " in unicodedata.normalize("NFC", name)
+
+
 def _fit(stem: str, tail: str) -> str:
     """Shorten `stem` so `stem + tail` stays within the 255-character name limit."""
     room = 255 - len(tail.encode("utf-16-le")) // 2

@@ -129,3 +129,39 @@ def test_a_long_path_is_listed_not_lost(tmp_path: Path) -> None:
 
     assert server.tree()["keep.txt"] == b"x"
     assert any("too long" in p.reason for p in device.index.problems())
+
+
+def test_a_rename_never_replaces_an_existing_file_on_ntfs(tmp_path: Path) -> None:
+    """FR-SYNC-10: a server move applied here must refuse, not overwrite, a file in the way."""
+    from dropshare_client import platform
+
+    (tmp_path / "a.txt").write_bytes(b"a")
+    (tmp_path / "b.txt").write_bytes(b"b")
+
+    with pytest.raises(FileExistsError):
+        platform.rename_no_replace(tmp_path / "a.txt", tmp_path / "b.txt")
+    platform.rename_no_replace(tmp_path / "a.txt", tmp_path / "A.TXT")  # case only
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["A.TXT", "b.txt"]
+    assert (tmp_path / "b.txt").read_bytes() == b"b"
+
+
+def test_ntfs_file_ids_survive_a_move_and_the_move_is_sent_as_one(tmp_path: Path) -> None:
+    """The real file index (st_ino via os.stat) pairs a moved file with its old path."""
+    from dropshare_client.platform.common import StatFileIdentity
+
+    server = FakeFileServer()
+    device = Device(tmp_path, server)
+    device.restart(file_identity=StatFileIdentity())  # what the app uses
+    device.write("Docs/report.docx", b"report")
+    device.sync()
+    node = next(n.id for n in server.nodes.values() if n.name == "report.docx")
+    server.calls.clear()
+
+    (device.root / "Docs").rename(device.root / "Reports")
+    (device.root / "Reports" / "report.docx").rename(device.root / "Reports" / "Report.docx")
+    device.sync()
+
+    assert server.tree() == {"Reports": None, "Reports/Report.docx": b"report"}
+    assert next(n.id for n in server.nodes.values() if n.name == "Report.docx") == node
+    assert "upload" not in server.calls and server.trashed() == []

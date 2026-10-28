@@ -279,6 +279,38 @@ class Index:
                 )
             )
 
+    def move_entries(self, entry: Entry, key: str, path: str) -> None:
+        """Record that `entry` (and, for a folder, everything below it) now lives at `key` /
+        `path`, in one transaction. Items below keep their own spelling below the new path.
+        `entry` carries the moved item's new revision; nothing else about it changes."""
+        with self._sessions.begin() as session:
+            rows = list(session.scalars(select(_Entry).where(_under(_Entry.key, entry.key))))
+            session.execute(delete(_Entry).where(_under(_Entry.key, entry.key)))
+            session.execute(delete(_Entry).where(_under(_Entry.key, key)))
+            session.flush()
+            depth = len(entry.key.split("/"))
+            for row in rows:
+                if row.key == entry.key:
+                    new_key, new_path, revision = key, path, entry.revision
+                else:
+                    # Keys and paths have the same components; casefolding can change lengths.
+                    new_key = "/".join([key, *row.key.split("/")[depth:]])
+                    new_path = "/".join([path, *row.path.split("/")[depth:]])
+                    revision = row.revision
+                session.add(
+                    _Entry(
+                        key=new_key,
+                        path=new_path,
+                        node_id=row.node_id,
+                        kind=row.kind,
+                        revision=revision,
+                        sha256=row.sha256,
+                        size=row.size,
+                        mtime_ns=row.mtime_ns,
+                        file_id=row.file_id,
+                    )
+                )
+
     def remove_entries(self, key: str, *, subtree: bool) -> None:
         with self._sessions.begin() as session:
             condition = _under(_Entry.key, key) if subtree else _Entry.key == key

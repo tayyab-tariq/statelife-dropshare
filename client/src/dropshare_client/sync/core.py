@@ -5,6 +5,7 @@ hash what changed → reconcile → check for a mass delete → execute → repo
 SyncEngine runs this on its own thread; tests call it directly.
 """
 
+import dataclasses
 import logging
 import threading
 import uuid
@@ -277,23 +278,16 @@ class SyncCore:
         remote: dict[str, RemoteItem] = {}
         base: dict[str, Entry] = {}
         deferred: set[str] = set()
-        for root in paths.outermost(dirty):
-            scan = self._scanner.scan(root)
-            local.update(scan.items)
-            deferred |= scan.deferred
-            for key in scan.still_writing:
-                result.retry[key] = STILL_WRITING_DELAY
-            for key in scan.unreadable:
-                result.retry[key] = self._backoff(key)
-            self._index.clear_problems(root)
-            problems = dict(scan.problems)
-            remote.update(tree.items_under(root, problems))
-            for problem in problems.values():
-                self._index.set_problem(problem)
-            base.update(self._index.entries_under(root))
+        roots = paths.outermost(dirty)
+        while roots:
+            for root in roots:
+                self._collect(root, tree, local, remote, base, deferred, result)
+            roots = self._moved_out_of_view(roots, dirty, tree, remote, base)
+            dirty = dirty | roots
         self._scanner.require_root()  # a vanished root must never read as "all deleted"
 
         self._hash_changed(local, base, deferred, result)
+        self._identify_new(local, base)
         plan = reconcile(local.keys() | remote.keys() | base.keys(), local, remote, base, deferred)
         if (
             plan.deletes
@@ -307,6 +301,55 @@ class SyncCore:
         self._execute(plan, tree, result)
         result.again = result.again or plan.again
         return result
+
+    def _collect(
+        self,
+        root: str,
+        tree: RemoteTree,
+        local: dict[str, LocalItem],
+        remote: dict[str, RemoteItem],
+        base: dict[str, Entry],
+        deferred: set[str],
+        result: CycleResult,
+    ) -> None:
+        """Snapshot `root` and everything below it: on disk, on the server and in the index."""
+        scan = self._scanner.scan(root)
+        local.update(scan.items)
+        deferred |= scan.deferred
+        for key in scan.still_writing:
+            result.retry[key] = STILL_WRITING_DELAY
+        for key in scan.unreadable:
+            result.retry[key] = self._backoff(key)
+        self._index.clear_problems(root)
+        problems = dict(scan.problems)
+        remote.update(tree.items_under(root, problems))
+        for problem in problems.values():
+            self._index.set_problem(problem)
+        base.update(self._index.entries_under(root))
+
+    @staticmethod
+    def _moved_out_of_view(
+        roots: set[str],
+        looked_at: set[str],
+        tree: RemoteTree,
+        remote: dict[str, RemoteItem],
+        base: dict[str, Entry],
+    ) -> set[str]:
+        """Where synced items that left the paths looked at are on the server now. Without
+        them this cycle would read those items as deleted there, and a move would become a
+        delete plus a new copy (audit B1). Empty once everything is in view."""
+        here = {item.node.node_id for item in remote.values()}
+        found: set[str] = set()
+        for entry in base.values():
+            if entry.node_id in here:
+                continue
+            path = tree.path_of(entry.node_id)
+            if path is None:
+                continue  # gone from the server
+            key = paths.key_of(path)
+            if not any(paths.is_within(key, seen) for seen in looked_at | roots):
+                found.add(key)
+        return paths.outermost(found)
 
     def _hash_changed(
         self,
@@ -330,6 +373,15 @@ class SyncCore:
                 deferred.add(key)
                 result.retry[key] = self._backoff(key)
 
+    def _identify_new(self, local: dict[str, LocalItem], base: dict[str, Entry]) -> None:
+        """File IDs for move detection (FR-SYNC-10), only where they can matter: items that
+        are new here (a moved item looks new at its new path) and entries saved without one.
+        A full stat per item would be slow on Windows with a large folder (NFR-PERF-03)."""
+        for key, item in local.items():
+            entry = base.get(key)
+            if item.file_id is None and (entry is None or entry.file_id is None):
+                local[key] = dataclasses.replace(item, file_id=self._scanner.file_id(item.path))
+
     def _deletes_approved(self, plan: Plan) -> bool:
         return bool(self._approved_deletes) and _delete_keys(plan) <= self._approved_deletes
 
@@ -351,44 +403,10 @@ class SyncCore:
             if self._stop.is_set():
                 raise SyncStoppedError()
             self._progress(len(plan.actions) - done)
-            try:
-                created = executor.run(action)
-            except _FATAL:
-                raise
-            except TransferCancelledError as exc:
-                raise SyncStoppedError() from exc
-            except RetryLaterError as exc:
-                result.again = True
-                result.retry[action.key] = 0.0
-                if exc.key:
-                    result.retry[exc.key] = 0.0
-                continue
-            except CantSyncError as exc:
-                self._cant_sync(action.key, action.path, exc.reason)
-                continue
-            except UnsafePathError as exc:
-                self._cant_sync(paths.key_of(exc.path), exc.path, exc.reason)
-                continue
-            except (
-                LocalChangedError,
-                FileChangingError,
-                SourceChangedError,
-                RemoteContentChangedError,
-            ) as exc:
-                logger.info(
-                    "%s changed while syncing (%s); planning it again",
-                    action.path,
-                    type(exc).__name__,
-                )
-                result.again = True
-                result.retry[action.key] = STILL_WRITING_DELAY
-                continue
-            except ApiError as exc:
-                self._api_failed(action, exc, tree, result)
-                continue
-            except (ContentMismatchError, OSError) as exc:
-                logger.warning("%s of %s failed: %s", action.op, action.path, exc)
-                result.retry[action.key] = self._backoff(action.key)
+            done_ok, created = self._run(executor, action, tree, result)
+            if not done_ok:
+                if action.op in (Op.MOVE_LOCAL, Op.MOVE_REMOTE):
+                    self._hold_move_together(action, result)
                 continue
             self._attempts.pop(action.key, None)
             if created is not None:
@@ -396,6 +414,62 @@ class SyncCore:
             if action.op != Op.RECORD:
                 result.changed_anything = True
         self._progress(0)
+
+    def _run(
+        self, executor: Executor, action: Action, tree: RemoteTree, result: CycleResult
+    ) -> tuple[bool, str | None]:
+        """(done, key of an item the step created). A failure that isn't fatal is recorded
+        in `result` (what to retry and when) and reported as not done."""
+        try:
+            return True, executor.run(action)
+        except _FATAL:
+            raise
+        except TransferCancelledError as exc:
+            raise SyncStoppedError() from exc
+        except RetryLaterError as exc:
+            result.again = True
+            result.retry[action.key] = 0.0
+            if exc.key:
+                result.retry[exc.key] = 0.0
+        except CantSyncError as exc:
+            self._cant_sync(action.key, action.path, exc.reason)
+        except UnsafePathError as exc:
+            self._cant_sync(paths.key_of(exc.path), exc.path, exc.reason)
+        except (
+            LocalChangedError,
+            FileChangingError,
+            SourceChangedError,
+            RemoteContentChangedError,
+        ) as exc:
+            logger.info(
+                "%s changed while syncing (%s); planning it again",
+                action.path,
+                type(exc).__name__,
+            )
+            result.again = True
+            result.retry[action.key] = STILL_WRITING_DELAY
+        except ApiError as exc:
+            self._api_failed(action, exc, tree, result)
+        except (ContentMismatchError, OSError) as exc:
+            logger.warning("%s of %s failed: %s", action.op, action.path, exc)
+            result.retry[action.key] = self._backoff(action.key)
+        return False, None
+
+    def _hold_move_together(self, action: Action, result: CycleResult) -> None:
+        """A move that didn't happen is retried as one: its old key, its target and where it
+        is on disk get the same delay. Looked at apart, the old key would read as deleted on
+        the side the item left, and the move would become a delete plus a new copy (audit
+        B1). Without a delay of its own (can't sync), it backs off."""
+        keys = {action.key, paths.key_of(action.path)}
+        if action.base is not None:
+            keys.add(action.base.key)
+        if action.local is not None:
+            keys.add(paths.key_of(action.local.path))
+        delay = result.retry.get(action.key)
+        if delay is None:
+            delay = self._backoff(action.key)
+        for key in keys:
+            result.retry[key] = delay
 
     def _api_failed(
         self, action: Action, exc: ApiError, tree: RemoteTree, result: CycleResult
