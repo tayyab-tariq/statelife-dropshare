@@ -20,6 +20,12 @@ def test_text_on_brand_fills_meets_wcag_aa(dark: bool) -> None:
 
 
 @pytest.mark.parametrize("dark", [False, True])
+def test_text_on_the_danger_fill_meets_wcag_aa(dark: bool) -> None:
+    t = theme.tokens_for(dark)
+    assert theme.contrast_ratio(theme.on_danger(t), t.danger) >= 4.5
+
+
+@pytest.mark.parametrize("dark", [False, True])
 def test_body_secondary_and_error_text_meet_wcag_aa(dark: bool) -> None:
     t = theme.tokens_for(dark)
     for text in (t.text_primary, t.text_secondary, t.danger):
@@ -73,3 +79,53 @@ def test_sign_in_dialog_has_one_primary_action(
     sign_in = find_by_name(dialog, QPushButton, "Sign in")
     assert isinstance(sign_in, QPushButton) and sign_in.isDefault()
     assert find_by_name(dialog, QLineEdit, "Username or email")
+
+
+def test_every_icon_the_app_names_exists_and_has_its_licence() -> None:
+    """Icons are files; a typo in a name would show nothing (visual-design.md §5)."""
+    named = {"folder", "document", "arrow_up", "arrow_clockwise", *theme._FILE_ICONS.values()}
+    for name in named:
+        assert (theme._ICON_DIR / f"{name}.svg").is_file(), name
+    assert (theme._ICON_DIR / "LICENSE").read_text().startswith("MIT License")
+
+
+@pytest.mark.parametrize(
+    ("name", "folder", "expected"),
+    [
+        ("Claims", True, "folder"),
+        ("Q3 summary.PDF", False, "document_pdf"),
+        ("budget.xlsx", False, "document_table"),
+        ("photo.jpeg", False, "image"),
+        ("backup.zip", False, "folder_zip"),
+        ("notes.txt", False, "document"),
+        ("README", False, "document"),
+    ],
+)
+def test_file_icons_follow_the_extension(
+    qapp: QApplication, monkeypatch: pytest.MonkeyPatch, name: str, folder: bool, expected: str
+) -> None:
+    asked: list[str] = []
+    monkeypatch.setattr(theme, "icon", lambda icon_name, *a, **k: asked.append(icon_name))
+
+    theme.file_icon(name, folder=folder)
+
+    assert asked == [expected]
+
+
+def test_icons_are_tinted_with_the_theme_colour(qapp: QApplication) -> None:
+    colour = theme.current_tokens().text_secondary
+    pixmap = theme.icon("folder").pixmap(16, 16)
+
+    image = pixmap.toImage()
+    painted = [
+        image.pixelColor(x, y)
+        for x in range(image.width())
+        for y in range(image.height())
+        if image.pixelColor(x, y).alpha() >= 128  # anti-aliased edges are fainter
+    ]
+
+    assert painted
+    for c in painted:  # premultiplied alpha can shift a channel by a step or two
+        assert abs(c.red() - colour.red()) <= 2
+        assert abs(c.green() - colour.green()) <= 2
+        assert abs(c.blue() - colour.blue()) <= 2
