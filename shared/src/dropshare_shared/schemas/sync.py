@@ -25,6 +25,9 @@ class ChangeType(StrEnum):
     TRASHED = "trashed"
     # Renamed and/or moved to another parent. Descendants move with it and get no rows.
     MOVED = "moved"
+    # Moved to another namespace (a shared folder, or out of one): gone from this one, not
+    # trashed. The destination namespace has a CREATED row for it and each item below it.
+    REMOVED = "removed"
 
 
 class ChangesQuery(BaseModel):
@@ -52,6 +55,7 @@ class ChangeOut(BaseModel):
     revision: int
     modified_at: datetime
     modified_by_user_id: uuid.UUID
+    mount_namespace_id: uuid.UUID | None = None  # set on a mount (NodeOut.mount_namespace_id)
 
 
 class ChangesMeta(BaseModel):

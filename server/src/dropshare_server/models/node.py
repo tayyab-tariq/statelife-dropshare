@@ -43,3 +43,11 @@ class Node(Base):
     # folder among live items" without partial indexes (database.md §5). Set only by
     # repositories.nodes.
     live_key: Mapped[str | None] = mapped_column(String(64), unique=True)
+    # Set on a mount: a folder in the user's own namespace that shows this shared namespace
+    # (OQ-31). Its contents live in that namespace, under its root node.
+    mount_namespace_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("namespaces.id"), index=True
+    )
+    # sha256(namespace/mount_namespace) while a live mount, NULL otherwise: each user mounts a
+    # shared folder at most once (database.md §5). Set only by repositories.nodes.
+    mount_key: Mapped[str | None] = mapped_column(String(64), unique=True)

@@ -57,6 +57,9 @@ class NodeOut(BaseModel):
     created_at: datetime
     modified_at: datetime
     modified_by_user_id: uuid.UUID
+    # Set on a mount: this folder shows that shared namespace, whose root holds its contents
+    # (OQ-31). Absent from servers from before sharing.
+    mount_namespace_id: uuid.UUID | None = None
 
 
 class FolderCreateIn(BaseModel):

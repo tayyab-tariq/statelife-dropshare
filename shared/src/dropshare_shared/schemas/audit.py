@@ -22,6 +22,16 @@ class AuditAction(StrEnum):
     NODE_TRASHED = "node.trashed"
     NODE_RENAMED = "node.renamed"
     NODE_MOVED = "node.moved"
+    SHARE_CREATED = "share.created"
+    SHARE_CHANGED = "share.changed"
+    SHARE_REMOVED = "share.removed"
+    SHARE_ACCEPTED = "share.accepted"
+    SHARE_LEFT = "share.left"
+    GROUP_CREATED = "group.created"
+    GROUP_DELETED = "group.deleted"
+    GROUP_MEMBER_ADDED = "group.member_added"
+    GROUP_MEMBER_REMOVED = "group.member_removed"
+    GROUP_LISTED = "group.listed"
     ACCESS_DENIED = "access.denied"
 
 
