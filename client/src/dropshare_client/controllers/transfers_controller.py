@@ -11,7 +11,17 @@ from PySide6.QtCore import QObject, QTimer, Signal
 
 from dropshare_client.controllers import messages
 from dropshare_client.controllers.sync_controller import SyncController, SyncStatus
-from dropshare_client.sync.transfers import TransferEvent, TransferStatus
+from dropshare_client.sync.transfers import Direction, TransferEvent, TransferStatus
+
+# The UI shows these; re-exported so ui/ needn't import the sync engine (architecture §1).
+__all__ = [
+    "FINISHED_KEPT",
+    "Direction",
+    "TransferBook",
+    "TransferEvent",
+    "TransferStatus",
+    "TransfersController",
+]
 
 FINISHED_KEPT = 50  # FR-CLIENT-08: the 50 most recent completed or failed transfers
 _FLUSH_MS = 250
@@ -42,6 +52,21 @@ class TransferBook:
     def clear(self) -> None:
         self._open.clear()
         self._finished.clear()
+
+    def latest_by_key(self) -> dict[str, TransferEvent]:
+        """The newest event of every file: one lookup table per update, not a scan per row."""
+        found: dict[str, TransferEvent] = {}
+        for event in reversed(self._finished):  # oldest first, so newer ones win
+            found[event.key] = event
+        found.update(self._open)
+        return found
+
+    def latest(self, key: str) -> TransferEvent | None:
+        """The newest event for `key`: still open, or among the recent finished."""
+        open_event = self._open.get(key)
+        if open_event is not None:
+            return open_event
+        return next((e for e in self._finished if e.key == key), None)
 
     def rows(self) -> list[TransferEvent]:
         """Active first, then waiting, then queued; then finished, newest first."""
@@ -80,6 +105,12 @@ class TransfersController(QObject):
 
     def rows(self) -> list[TransferEvent]:
         return self._book.rows()
+
+    def latest(self, key: str) -> TransferEvent | None:
+        return self._book.latest(key)
+
+    def latest_by_key(self) -> dict[str, TransferEvent]:
+        return self._book.latest_by_key()
 
     def retry(self, key: str) -> None:
         self._sync.retry(key)

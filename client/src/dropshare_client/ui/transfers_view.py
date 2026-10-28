@@ -20,12 +20,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from dropshare_client.controllers.transfers_controller import TransfersController
-from dropshare_client.sync.transfers import TransferStatus
+from dropshare_client.controllers.transfers_controller import TransfersController, TransferStatus
 from dropshare_client.ui import theme
 from dropshare_client.ui.transfers_model import (
     DIRECTION,
-    EVENT_ROLE,
     NAME,
     PERCENT_ROLE,
     PROGRESS,
@@ -174,8 +172,8 @@ class TransfersView(QWidget):
 
     def _update_retry(self) -> None:
         rows = self._table.selectionModel().selectedRows()
-        event = rows[0].data(EVENT_ROLE) if rows else None
-        self._retry.setEnabled(getattr(event, "status", None) in _RETRYABLE)
+        event = self._model.event_at(rows[0].row()) if rows else None
+        self._retry.setEnabled(event is not None and event.status in _RETRYABLE)
 
     def _retry_selected(self) -> None:
         key = self._selected_key()

@@ -207,3 +207,23 @@ def test_signing_out_clears_the_list(
     client.sync.stop()
 
     qtbot.waitUntil(lambda: table.model().rowCount() == 0)
+
+
+def test_new_transfers_dont_move_the_selection(
+    qtbot: QtBot, make_client: MakeClient, make_shell: MakeShell, tmp_path: Path
+) -> None:
+    """Rows are updated by key, not reset (audit S18)."""
+    client, shell = _signed_in(qtbot, make_client, make_shell, tmp_path / "Sync")
+    listener = client.engines.last.listener
+    table = shell.transfers_view.findChild(QTableView, "transferTable")
+    assert table is not None
+    listener.transfer(_event("b.txt", TransferStatus.QUEUED))
+    listener.transfer(_event("c.txt", TransferStatus.QUEUED))
+    qtbot.waitUntil(lambda: table.model().rowCount() == 2)
+    table.selectRow(1)
+
+    listener.transfer(_event("a.txt", TransferStatus.ACTIVE, 10))  # sorts first
+
+    qtbot.waitUntil(lambda: table.model().rowCount() == 3)
+    [selected] = table.selectionModel().selectedRows()
+    assert table.model().index(selected.row(), 0).data() == "c.txt"

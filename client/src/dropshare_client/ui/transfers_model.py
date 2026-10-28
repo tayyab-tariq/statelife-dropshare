@@ -2,8 +2,13 @@
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPersistentModelIndex, Qt
 
-from dropshare_client.sync.transfers import Direction, TransferEvent, TransferStatus
+from dropshare_client.controllers.transfers_controller import (
+    Direction,
+    TransferEvent,
+    TransferStatus,
+)
 from dropshare_client.ui.format import size_text
+from dropshare_client.ui.keyed_rows import update_rows
 
 type _Index = QModelIndex | QPersistentModelIndex
 
@@ -38,17 +43,9 @@ class TransfersModel(QAbstractTableModel):
         self._rows: list[TransferEvent] = []
 
     def set_rows(self, rows: list[TransferEvent]) -> None:
-        """Same files in the same order: only changed rows repaint. Otherwise the list is
-        replaced; the view keeps its selection by key."""
-        if [r.key for r in rows] == [r.key for r in self._rows]:
-            old, self._rows = self._rows, rows
-            for row, (before, after) in enumerate(zip(old, rows, strict=True)):
-                if before != after:
-                    self.dataChanged.emit(self.index(row, 0), self.index(row, len(_HEADERS) - 1))
-            return
-        self.beginResetModel()
-        self._rows = rows
-        self.endResetModel()
+        """Brought up to date file by file (by key): the current row and scroll position
+        stay put while transfers start and finish around them."""
+        update_rows(self, self._rows, rows, lambda event: event.key)
 
     def event_at(self, row: int) -> TransferEvent | None:
         return self._rows[row] if 0 <= row < len(self._rows) else None
