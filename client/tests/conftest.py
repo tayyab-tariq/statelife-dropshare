@@ -13,6 +13,7 @@ from pytestqt.qtbot import QtBot
 from dropshare_client.controllers.session_controller import SessionController
 from dropshare_client.controllers.sync_controller import SyncController
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
+from dropshare_client.controllers.transfers_controller import TransfersController
 from dropshare_client.platform.macos.recycle_bin import MacTrash
 from dropshare_client.services.api_client import ApiClient
 from dropshare_client.services.auth import AuthService, Device
@@ -94,6 +95,7 @@ def make_client(
         made.append(api)
         auth = AuthService(api, tokens, Device(name="Test PC", os="Windows 11"))
         engines = FakeEngines(tmp_path / "app-data" / "index.db")
+        sync = SyncController(config, engines, engines.forget)
         return Client(
             server=server,
             credentials=credentials,
@@ -108,7 +110,8 @@ def make_client(
                 tmp_path / "StateLife DropShare",
                 tmp_path / "app-data",
             ),
-            sync=SyncController(config, engines, engines.forget),
+            sync=sync,
+            transfers=TransfersController(sync),
             engines=engines,
             trash=trash,
             app_data=tmp_path / "app-data",
@@ -129,7 +132,13 @@ def make_shell(qtbot: QtBot) -> Iterator[MakeShell]:
 
     def make(client: Client, *, tray_available: bool = True) -> AppShell:
         clients.append(client)
-        shell = AppShell(client.session, client.folders, client.sync, tray_available=tray_available)
+        shell = AppShell(
+            client.session,
+            client.folders,
+            client.sync,
+            client.transfers,
+            tray_available=tray_available,
+        )
         qtbot.addWidget(shell.window)
         qtbot.addWidget(shell.sign_in_dialog)
         shells.append(shell)
@@ -140,7 +149,7 @@ def make_shell(qtbot: QtBot) -> Iterator[MakeShell]:
         shell.tray.hide()
     # pytest-qt has deleted the widgets by now: silence what still arrives for them.
     for client in clients:
-        for controller in (client.sync, client.session, client.folders):
+        for controller in (client.sync, client.transfers, client.session, client.folders):
             controller.blockSignals(True)
         client.sync.shutdown()
     QThreadPool.globalInstance().waitForDone(5000)

@@ -123,6 +123,7 @@ def test_tray_menu_and_states(qtbot: QtBot) -> None:
     texts = [action.text() for action in tray._menu.actions() if not action.isSeparator()]
 
     assert texts == [
+        "Signed out",  # the status line (FR-CLIENT-01, FR-CLIENT-08)
         "Open sync folder",
         "Open DropShare",
         "Recent activity",
@@ -144,6 +145,11 @@ def test_tray_menu_and_states(qtbot: QtBot) -> None:
     assert tray.resume.isVisible() and not tray.pause.isVisible()
     tray.set_state(TrayState.OFFLINE, "retrying")
     assert tray.tooltip() == "StateLife DropShare: Offline (retrying)"
+    assert not tray.status_line.isEnabled()
+    assert tray.status_line.text() == "Offline (retrying)"
+    tray.set_state(TrayState.SYNCING, "12 items", "12 items \N{MIDDLE DOT} 45%")
+    assert tray.status_line.text() == "Syncing 12 items \N{MIDDLE DOT} 45%"
+    assert tray.tooltip() == "StateLife DropShare: Syncing 12 items \N{MIDDLE DOT} 45%"
 
 
 def test_every_tray_state_has_its_own_icon() -> None:

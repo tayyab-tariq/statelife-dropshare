@@ -117,6 +117,12 @@ def items_left(count: int) -> str:
     return "1 item" if count == 1 else f"{count} items"
 
 
+def transfers_summary(count: int, percent: int) -> str:
+    """FR-CLIENT-08: "12 items · 45%"."""
+    items = "1 item" if count == 1 else f"{count} items"
+    return f"{items} \N{MIDDLE DOT} {percent}%"
+
+
 def conflicts_message(count: int) -> str:
     """Several conflicts at once, as one notification (ui.md §7)."""
     return (

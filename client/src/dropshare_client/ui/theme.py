@@ -69,7 +69,9 @@ DIALOG_WIDTH = 400  # sign-in and the dialogs that share its frame
 BRAND_STRIP_HEIGHT = 4
 LOGO_HEIGHT = 64
 HEADER_MARK_SIZE = 24
-MAIN_WINDOW_MIN_SIZE = QSize(720, 520)
+MAIN_WINDOW_MIN_SIZE = QSize(900, 600)  # visual-design.md §6, with the sidebar
+SIDEBAR_WIDTH = 220
+PROGRESS_COLUMN_WIDTH = 120  # the Transfers view's progress bars
 STATE_MAX_WIDTH = 360  # width of the messages in the loading, error and empty states
 
 
@@ -302,6 +304,36 @@ QProgressBar {{
     min-height: 6px; max-height: 6px;
 }}
 QProgressBar::chunk {{ background: {_css(t.primary)}; border-radius: 3px; }}
+
+#navList {{
+    background: {_css(t.bg_window)}; border: none; outline: none;
+    border-right: 1px solid {_css(t.border)}; padding: {s.sm}px 0;
+}}
+#navList::item {{
+    min-height: 40px; padding: 0 {s.lg}px; color: {_css(t.text_primary)};
+    border-left: 3px solid transparent;
+}}
+#navList::item:hover {{ background: {_css(hover)}; }}
+#navList::item:selected {{
+    background: {_css(t.bg_selected)}; color: {_css(t.text_primary)};
+    border-left: 3px solid {_css(t.primary)};
+}}
+#navList:focus {{ border-right: 1px solid {_css(t.primary)}; }}
+
+QTableView#fileTable, QTableView#transferTable {{
+    background: {_css(t.bg_surface)}; color: {_css(t.text_primary)};
+    border: none; gridline-color: transparent;
+    selection-background-color: {_css(t.bg_selected)}; selection-color: {_css(t.text_primary)};
+}}
+QTableView#fileTable::item, QTableView#transferTable::item {{ padding: 0 {s.sm}px; }}
+QTableView#fileTable::item:hover, QTableView#transferTable::item:hover {{
+    background: {_css(hover)};
+}}
+QHeaderView::section {{
+    background: {_css(t.bg_surface)}; color: {_css(t.text_secondary)};
+    border: none; border-bottom: 1px solid {_css(t.border)};
+    padding: {s.xs}px {s.sm}px;
+}}
 
 QScrollBar:vertical {{ background: transparent; width: {s.sm}px; margin: 0; }}
 QScrollBar:horizontal {{ background: transparent; height: {s.sm}px; margin: 0; }}

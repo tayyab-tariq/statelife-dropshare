@@ -12,6 +12,7 @@ import httpx
 from dropshare_client.controllers.session_controller import SessionController
 from dropshare_client.controllers.sync_controller import SyncController
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
+from dropshare_client.controllers.transfers_controller import TransfersController
 from dropshare_client.platform.base import VolumeInfo, VolumeKind
 from dropshare_client.platform.macos.attributes import MacFileAttributes
 from dropshare_client.services.api_client import ApiClient
@@ -315,6 +316,7 @@ class Client:
     session: SessionController
     folders: SyncFolderController
     sync: SyncController
+    transfers: TransfersController
     engines: FakeEngines
     trash: Path
     app_data: Path

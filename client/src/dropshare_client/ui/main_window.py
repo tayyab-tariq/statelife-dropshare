@@ -1,4 +1,5 @@
-"""The main window for M4: account, sync folder and status. The file browser comes later (F5)."""
+"""The main window: a header with the account actions, sections down the side (the overview
+of account and sync folder, Transfers), and the chosen section's page."""
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QCloseEvent
@@ -7,8 +8,11 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QPushButton,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -133,12 +137,27 @@ class MainWindow(QMainWindow):
             button.setProperty("variant", "subtle")
             actions.addWidget(button)
 
+        # Sections down the side (ui.md §2); the overview is the first.
+        self._nav = QListWidget()
+        self._nav.setObjectName("navList")
+        self._nav.setAccessibleName("Sections")
+        self._nav.setFixedWidth(theme.SIDEBAR_WIDTH)
+        self._pages = QStackedWidget()
+        self._nav.currentRowChanged.connect(self._pages.setCurrentIndex)
+        self.add_page("Overview", self._view)
+        self._nav.setCurrentRow(0)
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        body.addWidget(self._nav)
+        body.addWidget(self._pages, stretch=1)
+
         central = QWidget()
         outer = QVBoxLayout(central)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         outer.addWidget(header)
-        outer.addWidget(self._view, stretch=1)
+        outer.addLayout(body, stretch=1)
         self.setCentralWidget(central)
 
         self._open_folder.clicked.connect(self.open_folder_requested)
@@ -151,6 +170,18 @@ class MainWindow(QMainWindow):
     @property
     def view(self) -> StatefulView:
         return self._view
+
+    def add_page(self, title: str, page: QWidget) -> None:
+        """A section in the sidebar, shown when chosen there."""
+        self._nav.addItem(QListWidgetItem(title))
+        self._pages.addWidget(page)
+
+    def show_page(self, title: str) -> None:
+        for row in range(self._nav.count()):
+            if self._nav.item(row).text() == title:
+                self._nav.setCurrentRow(row)
+                return
+        raise KeyError(title)
 
     def set_hide_on_close(self, hide: bool) -> None:
         """Without a system tray there is nothing to hide into: closing then quits."""

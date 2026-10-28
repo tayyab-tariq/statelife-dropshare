@@ -19,6 +19,7 @@ from dropshare_client import platform
 from dropshare_client.controllers.session_controller import SessionController
 from dropshare_client.controllers.sync_controller import SyncController
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
+from dropshare_client.controllers.transfers_controller import TransfersController
 from dropshare_client.platform.base import Paths
 from dropshare_client.services.api_client import ApiClient
 from dropshare_client.services.auth import AuthService, this_device
@@ -181,6 +182,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         session,
         folders,
         sync,
+        TransfersController(sync),
         background=args.background,
         tray_available=QSystemTrayIcon.isSystemTrayAvailable(),
     )

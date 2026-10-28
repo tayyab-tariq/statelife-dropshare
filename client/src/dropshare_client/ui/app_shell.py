@@ -12,6 +12,7 @@ from dropshare_client.controllers import messages
 from dropshare_client.controllers.session_controller import SessionController
 from dropshare_client.controllers.sync_controller import SyncController, SyncStatus
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
+from dropshare_client.controllers.transfers_controller import TransfersController
 from dropshare_client.ui.change_password_dialog import ChangePasswordDialog
 from dropshare_client.ui.main_window import MainWindow
 from dropshare_client.ui.mass_delete_dialog import MassDeleteDialog
@@ -19,6 +20,7 @@ from dropshare_client.ui.sign_in_dialog import SignInDialog
 from dropshare_client.ui.sign_out_dialog import SignOutDialog
 from dropshare_client.ui.sync_folder_dialog import SyncFolderDialog
 from dropshare_client.ui.theme import TrayState
+from dropshare_client.ui.transfers_view import TransfersView
 from dropshare_client.ui.tray import Tray
 from dropshare_shared.schemas.users import UserOut
 
@@ -48,6 +50,7 @@ class AppShell(QObject):
         session: SessionController,
         folders: SyncFolderController,
         sync: SyncController,
+        transfers: TransfersController,
         *,
         background: bool = False,
         tray_available: bool = True,
@@ -61,9 +64,13 @@ class AppShell(QObject):
         self._tray_available = tray_available
         self._user: UserOut | None = None
         self._connection = TrayState.SIGNED_OUT  # what the server side says
+        self._detail = ""
+        self._transfers = transfers
         self._paused = False
         self.window = MainWindow()
         self.window.set_hide_on_close(tray_available)
+        self.transfers_view = TransfersView(transfers)
+        self.window.add_page("Transfers", self.transfers_view)
         self.tray = Tray()
         self.sign_in_dialog = SignInDialog(session)
         self.password_dialog: ChangePasswordDialog | None = None
@@ -95,6 +102,9 @@ class AppShell(QObject):
         sync.session_expired.connect(self._needs_sign_in)
         sync.folder_rejected.connect(self._folder_rejected)
         sync.start_failed.connect(self._sync_start_failed)
+        transfers.summary_changed.connect(
+            lambda _: self._set_connection(self._connection, self._detail)
+        )
 
         self.window.open_folder_requested.connect(self.open_sync_folder)
         self.window.choose_folder_requested.connect(self._choose_folder)
@@ -385,10 +395,13 @@ class AppShell(QObject):
     def _set_connection(self, state: TrayState, detail: str = "") -> None:
         """Show the connection state, unless syncing is paused while connected: signed out,
         errors and offline always win, so the tray never hides a problem behind "Paused"."""
-        self._connection = state
+        self._connection, self._detail = state, detail
         shown = state
         if self._paused and state in (TrayState.UP_TO_DATE, TrayState.SYNCING):
             shown = TrayState.PAUSED
-        self.tray.set_state(shown, detail or ("paused" if self._paused and shown != state else ""))
+        summary = self._transfers.summary if shown is TrayState.SYNCING else ""
+        self.tray.set_state(
+            shown, detail or ("paused" if self._paused and shown != state else ""), summary
+        )
         if self._user is not None:
             self.window.set_status(f"{shown.value}: {detail}" if detail else shown.value)
