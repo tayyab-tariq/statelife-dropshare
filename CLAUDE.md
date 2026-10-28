@@ -149,11 +149,13 @@ docs/requirements.md            # source of truth (see §0)
 - UI talks only to controllers; controllers talk to services. No `httpx` or index access from `ui/`.
 - Every data-driven view handles loading, error (with retry), empty, and populated states.
 - OS-specific code only in `platform/`.
+- Signals carrying byte counts or sizes use `Signal(object)`; `Signal(int)` wraps past 2 GB.
 
 **Sync** (full spec: `sync-engine` skill)
 
 - Never lose data: conflicts create copies, remote deletes go to the Recycle Bin, index updates only after the operation succeeds.
 - Downloads go to a temp file, are hash-verified, then `os.replace`d into place.
+- Never `rmtree` a folder that may hold a user's file; cleanup removes only what it verifies it created.
 
 **Security:** HTTPS only; Argon2id; refresh tokens only in Credential Manager on the client and only hashed on the server; secrets never in code, logs, or audit details.
 
