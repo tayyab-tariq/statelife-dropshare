@@ -1,6 +1,6 @@
 """Server test fixtures.
 
-Tests that use `db_settings` or `db_session` run against the DROPSHARE_TEST schema (TEST_DB_* in
+Tests that use `db_settings` or `db_session` run against the test schema or database (TEST_DB_* in
 server/.env), migrated to head once per session and emptied before each test. Without those
 settings they are skipped.
 """
@@ -8,6 +8,7 @@ settings they are skipped.
 import hashlib
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from alembic import command
@@ -31,6 +32,7 @@ from dropshare_shared.schemas.users import UserRole
 
 ALEMBIC_INI = Path(__file__).resolve().parents[1] / "alembic.ini"
 TEST_TOKEN_SECRET = "test-only-token-secret-0123456789abcdef"
+_DEFAULT_PORTS = {"oracle": 1521, "postgresql": 5432}
 
 
 class _TestDatabaseSettings(BaseSettings):
@@ -38,9 +40,10 @@ class _TestDatabaseSettings(BaseSettings):
         env_prefix="TEST_DB_", env_file=ENV_FILE, extra="ignore", hide_input_in_errors=True
     )
 
+    dialect: Literal["oracle", "postgresql"] = "oracle"
     host: str = Field(min_length=1)
-    port: int = 1521
-    service_name: str = Field(min_length=1)
+    port: int | None = None
+    name: str = Field(min_length=1)
     user: str = Field(min_length=1)
     password: SecretStr = Field(min_length=1)
 
@@ -61,9 +64,10 @@ def test_database() -> Settings:
         pytest.skip("TEST_DB_* settings missing (see server/.env.example)")
     settings = _settings(
         Path("unused"),
+        db_dialect=db.dialect,
         db_host=db.host,
         db_port=db.port,
-        db_service_name=db.service_name,
+        db_name=db.name,
         db_user=db.user,
         db_password=db.password,
     )
@@ -147,14 +151,16 @@ def cli(
 ) -> Callable[..., tuple[int, str, str]]:
     """Run the admin CLI against the test schema as OS user `it-admin`; returns (code, out, err)."""
     values = {
+        "DB_DIALECT": db_settings.db_dialect,
         "DB_HOST": db_settings.db_host,
-        "DB_PORT": str(db_settings.db_port),
-        "DB_SERVICE_NAME": db_settings.db_service_name,
+        "DB_NAME": db_settings.db_name,
         "DB_USER": db_settings.db_user,
         "DB_PASSWORD": db_settings.db_password.get_secret_value(),
         "TOKEN_SECRET": TEST_TOKEN_SECRET,
         "STORAGE_LOCAL_ROOT": str(db_settings.storage_local_root),
     }
+    # Always explicit: an unset DB_PORT would fall back to the developer's server/.env.
+    values["DB_PORT"] = str(db_settings.db_port or _DEFAULT_PORTS[db_settings.db_dialect])
     for name, value in values.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setattr("getpass.getuser", lambda: "it-admin")
@@ -322,7 +328,7 @@ def offline_settings(storage_root: Path) -> Settings:
         storage_root,
         db_host="127.0.0.1",
         db_port=1,
-        db_service_name="none",
+        db_name="none",
         db_user="none",
         db_password="none",
     )

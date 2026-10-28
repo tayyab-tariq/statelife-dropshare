@@ -24,9 +24,13 @@ class DatabaseSettings(BaseSettings):
         env_file=ENV_FILE, extra="ignore", frozen=True, hide_input_in_errors=True
     )
 
+    # Oracle 19c is the target (D3); PostgreSQL is a temporary local-dev option (requirements §15).
+    db_dialect: Literal["oracle", "postgresql"] = "oracle"
     db_host: str = Field(min_length=1)
-    db_port: int = Field(default=1521, ge=1, le=65535)
-    db_service_name: str = Field(min_length=1)
+    # Unset means the driver default: 1521 for Oracle, 5432 for PostgreSQL.
+    db_port: int | None = Field(default=None, ge=1, le=65535)
+    # Oracle: the PDB service name. PostgreSQL: the database name.
+    db_name: str = Field(min_length=1)
     db_user: str = Field(min_length=1)
     db_password: SecretStr = Field(min_length=1)
     db_pool_size: int = Field(default=5, ge=1)
