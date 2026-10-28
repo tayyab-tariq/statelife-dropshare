@@ -12,6 +12,7 @@ from sync_fakes import FakeFileServer, FakeRecycleBin, InodeIdentity, NoAttribut
 from dropshare_client.services.errors import SessionExpiredError
 from dropshare_client.store.index import Index
 from dropshare_client.sync.engine import SyncEngine, SyncProblem, SyncState
+from dropshare_client.sync.transfers import TransferEvent
 
 TIMEOUT = 10.0
 
@@ -23,6 +24,7 @@ class Listener:
         self.confirmations: list[tuple[int, int]] = []
         self.expired = threading.Event()
         self.pending: list[int] = []
+        self.transfers: list[TransferEvent] = []
         self._changed = threading.Condition()
 
     def state_changed(self, state: SyncState, problem: SyncProblem | None) -> None:
@@ -43,6 +45,9 @@ class Listener:
 
     def progress(self, pending: int) -> None:
         self.pending.append(pending)
+
+    def transfer(self, event: TransferEvent) -> None:
+        self.transfers.append(event)
 
     @property
     def state(self) -> SyncState | None:
@@ -330,3 +335,25 @@ def test_a_local_rename_whose_request_fails_once_is_retried_as_a_rename(
     assert server.calls.count("move") == 2  # the 503, then the retry
     assert server.trashed() == [] and "upload" not in server.calls
     assert {node.id for node in server.nodes.values()} == ids
+
+
+def test_retry_now_tries_a_failed_upload_again_without_waiting(
+    engine: SyncEngine, root: Path, server: FakeFileServer, listener: Listener
+) -> None:
+    """The Transfers view's Retry (FR-CLIENT-08): a file listed as can't sync is planned
+    again at once."""
+    from dropshare_client.services.errors import ApiError
+    from dropshare_client.sync.transfers import TransferStatus
+    from dropshare_shared.errors import ErrorCode
+
+    server.fail("upload", ApiError(409, ErrorCode.QUOTA_EXCEEDED, "Over quota"))
+    _write(root, "big.bin", b"big")
+    engine.start()
+    eventually(lambda: any(e.status is TransferStatus.FAILED for e in listener.transfers))
+    listener.wait_for(lambda: listener.state == SyncState.UP_TO_DATE)
+    assert server.tree() == {}
+
+    engine.retry_now("big.bin")
+
+    eventually(lambda: server.tree() == {"big.bin": b"big"})
+    assert listener.transfers[-1].status is TransferStatus.DONE

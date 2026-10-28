@@ -48,6 +48,7 @@ from dropshare_client.sync.reconciler import (
 from dropshare_client.sync.remote_tree import RemoteItem, RemoteTree, TreeDelta, from_node
 from dropshare_client.sync.scanner import STABLE_AFTER_NS, LocalItem, Scanner
 from dropshare_client.sync.server import FileServer
+from dropshare_client.sync.transfers import Direction, TransferEvent, TransferReporter
 from dropshare_shared.errors import ErrorCode
 from dropshare_shared.schemas.nodes import NamespaceKind
 
@@ -80,6 +81,12 @@ _PROBLEM_REASONS: dict[str, str] = {
     ErrorCode.FORBIDDEN: "You don't have permission to change this item.",
 }
 # Passed through to the engine: they stop the whole cycle, not just one item.
+# Why a transfer waits (FR-CLIENT-08); it continues on its own.
+_OFFLINE = "Waiting for the connection."
+_STOPPED = "Paused."
+_IN_USE = "Open in another program. It syncs once it's closed."
+_TRY_AGAIN = "Will try again shortly."
+
 _FATAL = (
     OfflineError,
     SessionExpiredError,
@@ -118,6 +125,7 @@ class SyncCore:
         max_path: int | None = None,
         crash_point: Callable[[str], None] = no_crash,
         progress: Callable[[int], None] = lambda _: None,
+        transfer: Callable[[TransferEvent], None] = lambda _: None,
     ) -> None:
         self._index = index
         self._server = server
@@ -128,6 +136,7 @@ class SyncCore:
         self._stop = stop
         self._crash_point = crash_point
         self._progress = progress
+        self._transfers = TransferReporter(transfer)
         self._scanner = Scanner(
             root, file_identity, stable_after_ns=stable_after_ns, max_path=max_path
         )
@@ -398,7 +407,17 @@ class SyncCore:
             cursor=lambda: self._require_connected()[0].cursor,
             stop=self._stop,
             crash_point=self._crash_point,
+            transfers=self._transfers,
         )
+        for action in plan.actions:  # FR-CLIENT-08: what this cycle will send and fetch
+            if action.op == Op.UPLOAD and action.local is not None:
+                self._transfers.queued(
+                    action.key, action.local.path, Direction.UPLOAD, action.local.size
+                )
+            elif action.op == Op.DOWNLOAD and action.remote is not None:
+                self._transfers.queued(
+                    action.key, action.remote.path, Direction.DOWNLOAD, action.remote.node.size
+                )
         for done, action in enumerate(plan.actions):
             if self._stop.is_set():
                 raise SyncStoppedError()
@@ -422,9 +441,14 @@ class SyncCore:
         in `result` (what to retry and when) and reported as not done."""
         try:
             return True, executor.run(action)
+        except OfflineError:
+            self._transfers.waiting(action.key, _OFFLINE)
+            raise
         except _FATAL:
+            self._transfers.waiting(action.key, _STOPPED)
             raise
         except TransferCancelledError as exc:
+            self._transfers.waiting(action.key, _STOPPED)
             raise SyncStoppedError() from exc
         except RetryLaterError as exc:
             result.again = True
@@ -450,9 +474,15 @@ class SyncCore:
             result.retry[action.key] = STILL_WRITING_DELAY
         except ApiError as exc:
             self._api_failed(action, exc, tree, result)
+        except PermissionError as exc:  # open in another program (FR-SYNC-06)
+            logger.info("%s of %s waits: %s", action.op, action.path, exc)
+            result.retry[action.key] = self._backoff(action.key)
+            self._transfers.waiting(action.key, _IN_USE)
         except (ContentMismatchError, OSError) as exc:
             logger.warning("%s of %s failed: %s", action.op, action.path, exc)
             result.retry[action.key] = self._backoff(action.key)
+        # Unless it was listed as can't sync (failed), it is tried again on its own.
+        self._transfers.waiting(action.key, _TRY_AGAIN)
         return False, None
 
     def _hold_move_together(self, action: Action, result: CycleResult) -> None:
@@ -498,6 +528,7 @@ class SyncCore:
         """Listed for the user (FR-SYNC-07), not retried until the item changes."""
         logger.info("Can't sync %s: %s", path, reason)
         self._index.set_problem(Problem(key, path, reason))
+        self._transfers.failed(key, reason)
         self._log.activity("cant_sync", path, reason)
 
     def _backoff(self, key: str) -> float:

@@ -248,6 +248,9 @@ class FakeEngine:
         self.index.close()
         return True
 
+    def retry_now(self, key: str) -> None:
+        self.calls.append(f"retry {key}")
+
     def pause(self) -> None:
         self.calls.append("pause")
         self.paused = True

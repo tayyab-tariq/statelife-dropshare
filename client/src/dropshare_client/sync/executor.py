@@ -16,6 +16,7 @@ import unicodedata
 import uuid
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Protocol
 
@@ -38,6 +39,7 @@ from dropshare_client.sync.reconciler import Action, Op
 from dropshare_client.sync.remote_tree import RemoteTree, TreeDelta, from_node
 from dropshare_client.sync.scanner import LocalItem, Scanner
 from dropshare_client.sync.server import FileServer
+from dropshare_client.sync.transfers import Direction, TransferReporter
 from dropshare_shared.errors import ErrorCode
 from dropshare_shared.schemas.error_details import NameConflictDetails
 from dropshare_shared.schemas.nodes import NodeKind, NodeOut
@@ -76,6 +78,7 @@ class Executor:
         cursor: Callable[[], int],
         stop: threading.Event,
         crash_point: Callable[[str], None] = no_crash,
+        transfers: TransferReporter | None = None,
     ) -> None:
         self._scanner = scanner
         self._index = index
@@ -88,6 +91,7 @@ class Executor:
         self._cursor = cursor
         self._stop = stop
         self._crash_point = crash_point
+        self._transfers = transfers or TransferReporter(lambda _: None)
 
     def run(self, action: Action) -> str | None:
         """Carry out `action`. Returns the key of an item the step created that the next
@@ -224,11 +228,14 @@ class Executor:
         else:
             target = NewFile(self._remote_parent(action.key), _nfc(paths.name_of(local.path)))
         source = SourceFile(self._disk(local.path), local.sha256, local.size, local.mtime_ns)
+        self._transfers.started(action.key, local.path, Direction.UPLOAD, local.size)
         # Kept when no answer came: the upload may have completed (SyncCore.recover).
         with self._journaled(
             "upload", action.key, {"sha256": local.sha256}, unsure=(OfflineError,)
         ) as journal:
-            node = self._server.upload(source, target, self._stop)
+            node = self._server.upload(
+                source, target, self._stop, partial(self._transfers.progress, action.key)
+            )
         self._crash_point("upload.completed")
         remembered = self._remember(node)
         self._index.put_entry(
@@ -245,6 +252,7 @@ class Executor:
             )
         )
         self._index.finish(journal)
+        self._transfers.finished(action.key)
         self._log.activity("uploaded", local.path)
 
     def _download(self, action: Action) -> None:
@@ -261,7 +269,15 @@ class Executor:
             raise CantSyncError(_TOO_LONG)
         # Named by node only: a newer version replaces a stale partial download.
         part = self._temp_dir() / f"{node.node_id}.part"
-        self._server.download(node.node_id, node.sha256, node.size, part, self._stop)
+        self._transfers.started(action.key, path, Direction.DOWNLOAD, node.size)
+        self._server.download(
+            node.node_id,
+            node.sha256,
+            node.size,
+            part,
+            self._stop,
+            partial(self._transfers.progress, action.key),
+        )
         self._crash_point("download.fetched")
         target = self._disk(path)
         with self._journaled("download", action.key, {"sha256": node.sha256}) as journal:
@@ -285,6 +301,7 @@ class Executor:
             )
         )
         self._index.finish(journal)
+        self._transfers.finished(action.key)
         self._log.activity("downloaded", path)
 
     # --- renames and moves (FR-SYNC-10) ---------------------------------------------------

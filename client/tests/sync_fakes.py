@@ -33,6 +33,7 @@ from dropshare_client.store.index import Index
 from dropshare_client.sync.core import CycleResult, SyncCore
 from dropshare_client.sync.executor import no_crash
 from dropshare_client.sync.paths import key_of, outermost
+from dropshare_client.sync.transfers import TransferEvent
 from dropshare_shared.errors import ErrorCode
 from dropshare_shared.naming import InvalidNameError, normalize_name, validate_name
 from dropshare_shared.schemas.nodes import (
@@ -590,6 +591,7 @@ class Device:
         crash_point: Callable[[str], None] = no_crash,
         recycle_bin: RecycleBin | None = None,
         file_identity: FileIdentity | None = None,
+        transfer: Callable[[TransferEvent], None] = lambda _: None,
     ) -> SyncCore:
         """A fresh engine over the same folder and index, as after the app restarts."""
         self.core = SyncCore(
@@ -605,6 +607,7 @@ class Device:
             stable_after_ns=0,
             max_path=self.max_path,
             crash_point=crash_point,
+            transfer=transfer,
         )
         return self.core
 

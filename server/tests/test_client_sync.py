@@ -22,6 +22,7 @@ from dropshare_client.services.tokens import TokenStore
 from dropshare_client.store.index import Index
 from dropshare_client.sync.core import CycleResult, SyncCore
 from dropshare_client.sync.engine import SyncEngine, SyncProblem, SyncState
+from dropshare_client.sync.transfers import TransferEvent
 from dropshare_shared.schemas.auth import TokenPairOut
 
 
@@ -325,6 +326,9 @@ class _States:
         return None
 
     def progress(self, pending: int) -> None:
+        return None
+
+    def transfer(self, event: TransferEvent) -> None:
         return None
 
 
