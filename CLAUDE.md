@@ -22,9 +22,9 @@ This file holds only what matters on every task. Detailed conventions live in sk
 
 - **Language:** Python 3.12 everywhere. uv workspace with three packages.
 - **Desktop client (`client/`):** PySide6 (Qt 6), httpx (HTTP), watchdog (file watching), keyring (Windows Credential Manager), SQLAlchemy 2.0 + SQLite (local sync index).
-- **Backend (`server/`):** FastAPI, uvicorn, SQLAlchemy 2.0 ORM, Alembic, python-oracledb, pydantic-settings, argon2-cffi, PyJWT.
+- **Backend (`server/`):** FastAPI, uvicorn, SQLAlchemy 2.0 ORM, Alembic, python-oracledb, psycopg 3 (local PostgreSQL), pydantic-settings, argon2-cffi, PyJWT.
 - **Shared (`shared/`):** Pydantic v2 request/response models, enums, error codes, name-validation rules. Imported by client and server.
-- **Database:** Oracle 19c now, swappable later. Only through SQLAlchemy (see `api-endpoint` skill → `references/database.md`). Connection and schema setup: `docs/oracle-setup.md`.
+- **Database:** Oracle 19c is the target. Local dev/test may run on PostgreSQL via `DB_DIALECT=postgresql` for now (requirements OQ-25); code must keep working on both. Only through SQLAlchemy (see `api-endpoint` skill → `references/database.md`). Setup: `docs/oracle-setup.md` or `docs/postgres-setup.md`.
 - **File storage:** `StorageBackend` interface. Local disk in dev; production backend decided at deployment (requirements OQ-2).
 - **Platforms:** development happens on **macOS**. The server deploys to **Linux** (NFR-COMPAT-06). The desktop client targets **Windows**: it runs on the Mac via a development-grade `platform/macos/` layer, and Windows behaviour is verified on a separate Windows machine (NFR-COMPAT-07).
 - **Tooling:** ruff (lint + format), mypy (`--strict`), pytest, pytest-qt. Packaging: PyInstaller (one-folder), Inno Setup, Authenticode signing.

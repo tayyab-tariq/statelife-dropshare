@@ -279,7 +279,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _database_error(exc: SQLAlchemyError) -> int:
     _err(
         f"The database couldn't complete the command ({type(exc).__name__}). "
-        "Check the DB_* settings and docs/oracle-setup.md."
+        "Check the DB_* settings and docs/oracle-setup.md (or docs/postgres-setup.md)."
     )
     return 3
 

@@ -16,7 +16,8 @@ Goal: correct on Oracle 19c today, and swappable to another database later (requ
 
 ## 1. Engine and sessions
 
-- Driver: `python-oracledb` in **thin mode** (no Oracle Instant Client needed). Build the URL from separate settings (`DB_HOST`, `DB_PORT`, `DB_SERVICE_NAME`, `DB_USER`, `DB_PASSWORD`) with `sqlalchemy.engine.URL.create("oracle+oracledb", username=..., password=..., host=..., port=..., query={"service_name": ...})` so special characters in passwords need no manual escaping. Never hard-code credentials.
+- Driver: `python-oracledb` in **thin mode** (no Oracle Instant Client needed). Build the URL from separate settings (`DB_DIALECT`, `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`) with `sqlalchemy.engine.URL.create("oracle+oracledb", username=..., password=..., host=..., port=..., query={"service_name": ...})` so special characters in passwords need no manual escaping. Never hard-code credentials.
+- `DB_DIALECT=postgresql` switches to `postgresql+psycopg` with `DB_NAME` as the database, for local dev/test only (requirements OQ-25; `docs/postgres-setup.md`). Oracle stays the target: keep every Oracle rule below even when you only run tests on PostgreSQL.
 - Connect to the **PDB service name**, never the CDB root. Setup and troubleshooting: `docs/oracle-setup.md`.
 - Production uses two accounts: a schema owner (runs migrations) and a runtime app user with only DML grants (and only `SELECT, INSERT` on `audit_events`, FR-AUDIT-03). The app user sets `CURRENT_SCHEMA` to the owner on connect (SQLAlchemy `connect` event). Models never hard-code a schema name. Dev and test use a single account each.
 - `create_engine(url, pool_pre_ping=True, pool_size=..., max_overflow=..., pool_recycle=1800)`; pool sizes from settings.

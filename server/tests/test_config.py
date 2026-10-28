@@ -2,8 +2,9 @@ import pytest
 from pydantic import ValidationError
 
 from dropshare_server.core.config import DatabaseSettings, Settings
+from dropshare_server.core.db import database_url
 
-_REQUIRED = ("DB_HOST", "DB_SERVICE_NAME", "DB_USER", "DB_PASSWORD", "STORAGE_LOCAL_ROOT")
+_REQUIRED = ("DB_HOST", "DB_NAME", "DB_USER", "DB_PASSWORD", "STORAGE_LOCAL_ROOT")
 
 
 def test_missing_required_settings_refuse_to_load(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -16,7 +17,7 @@ def test_missing_required_settings_refuse_to_load(monkeypatch: pytest.MonkeyPatc
     missing = {error["loc"][0] for error in caught.value.errors()}
     assert missing == {
         "db_host",
-        "db_service_name",
+        "db_name",
         "db_user",
         "db_password",
         "storage_local_root",
@@ -50,7 +51,7 @@ def test_database_settings_need_only_database_values(monkeypatch: pytest.MonkeyP
     # Alembic uses these: it must not require the token secret or storage settings.
     for name in ("TOKEN_SECRET", "STORAGE_LOCAL_ROOT"):
         monkeypatch.delenv(name, raising=False)
-    for name, value in (("DB_HOST", "h"), ("DB_SERVICE_NAME", "s"), ("DB_USER", "u")):
+    for name, value in (("DB_HOST", "h"), ("DB_NAME", "s"), ("DB_USER", "u")):
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("DB_PASSWORD", "p")
 
@@ -74,7 +75,7 @@ def test_secrets_are_never_shown_in_repr() -> None:
     settings = Settings.model_validate(
         {
             "db_host": "h",
-            "db_service_name": "s",
+            "db_name": "s",
             "db_user": "u",
             "db_password": "super-secret",
             "storage_local_root": "storage",
@@ -84,3 +85,28 @@ def test_secrets_are_never_shown_in_repr() -> None:
 
     assert "super-secret" not in repr(settings)
     assert "token-secret" not in repr(settings)
+
+
+def _database(**values: object) -> DatabaseSettings:
+    return DatabaseSettings.model_validate(
+        {"db_host": "h", "db_name": "n", "db_user": "u", "db_password": "p", **values}
+    )
+
+
+def test_database_dialect_defaults_to_oracle() -> None:
+    assert DatabaseSettings.model_fields["db_dialect"].default == "oracle"
+
+
+def test_oracle_dialect_connects_to_the_service_name() -> None:
+    url = database_url(_database(db_dialect="oracle", db_port=1521))
+
+    assert url.drivername == "oracle+oracledb"
+    assert (url.query["service_name"], url.port) == ("n", 1521)
+
+
+def test_postgresql_dialect_connects_to_the_named_database() -> None:
+    url = database_url(_database(db_dialect="postgresql", db_port=5433))
+
+    assert url.drivername == "postgresql+psycopg"
+    assert (url.database, url.port) == ("n", 5433)
+    assert "service_name" not in url.query
