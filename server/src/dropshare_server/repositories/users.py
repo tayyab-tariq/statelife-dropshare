@@ -1,9 +1,10 @@
 import uuid
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from dropshare_server.models import User
+from dropshare_shared.schemas.users import UserStatus
 
 
 def add(session: Session, user: User) -> None:
@@ -58,3 +59,24 @@ def email_taken(session: Session, email_normalized: str) -> bool:
 
 def list_all(session: Session) -> list[User]:
     return list(session.scalars(select(User).order_by(User.username_normalized, User.id)))
+
+
+def search_active(session: Session, login_prefix: str, name_prefix: str, limit: int) -> list[User]:
+    """Active users whose username or email starts with `login_prefix` (normalized), or whose
+    display name starts with `name_prefix` (lower-cased); both LIKE-escaped with a backslash.
+    The display name has no normalized column, so LOWER() scans: fine at our user counts."""
+    return list(
+        session.scalars(
+            select(User)
+            .where(
+                User.status == UserStatus.ACTIVE,
+                or_(
+                    User.username_normalized.like(f"{login_prefix}%", escape="\\"),
+                    User.email_normalized.like(f"{login_prefix}%", escape="\\"),
+                    func.lower(User.display_name).like(f"{name_prefix}%", escape="\\"),
+                ),
+            )
+            .order_by(User.display_name, User.id)
+            .limit(limit)
+        )
+    )
