@@ -52,7 +52,7 @@ class Settings(DatabaseSettings):
     lockout_minutes: int = Field(default=15, ge=1)
 
     # Clients below this version get 426 UPGRADE_REQUIRED (FR-UPD-04).
-    min_client_version: str = "0.1.0"
+    min_client_version: str = "0.2.0"  # 0.2.0: sharing (OQ-34)
     default_quota_bytes: int = Field(default=50 * _GIB, ge=0)  # NFR-SCALE-03
 
     # Files and transfers (FR-XFER-01, NFR-SCALE-01, requirements §7.2).

@@ -69,8 +69,8 @@ class Computer:
         self.api = ApiClient(
             "http://testserver",
             tokens,
-            client_version="0.1.0",
-            user_agent="DropShare/0.1.0 (test)",
+            client_version="0.2.0",
+            user_agent="DropShare/0.2.0 (test)",
             transport=httpx.MockTransport(forward),
         )
         self.files = RemoteFiles(self.api)
