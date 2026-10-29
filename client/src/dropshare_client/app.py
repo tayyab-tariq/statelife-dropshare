@@ -19,6 +19,8 @@ from dropshare_client import platform
 from dropshare_client.controllers.browser_controller import BrowserController
 from dropshare_client.controllers.file_actions_controller import FileActionsController
 from dropshare_client.controllers.session_controller import SessionController
+from dropshare_client.controllers.share_controller import ShareController
+from dropshare_client.controllers.shared_controller import SharedController
 from dropshare_client.controllers.sync_controller import SyncController
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
 from dropshare_client.controllers.transfers_controller import TransfersController
@@ -30,6 +32,7 @@ from dropshare_client.services.config import ConfigStore
 from dropshare_client.services.files import RemoteFiles
 from dropshare_client.services.importer import Importer
 from dropshare_client.services.local_files import LocalFiles
+from dropshare_client.services.sharing import Sharing
 from dropshare_client.services.tokens import TokenStore
 from dropshare_client.single_instance import SingleInstance, instance_name
 from dropshare_client.sync import binding
@@ -112,6 +115,11 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--background", action="store_true", help="Start in the tray (used at Windows sign-in)"
     )
     parser.add_argument(
+        "link",
+        nargs="?",
+        help="A statelife-dropshare:// link to open (passed by Windows when one is clicked)",
+    )
+    parser.add_argument(
         "--profile",
         help="Development only: run a separate client with its own data and sign-in (OQ-13)",
     )
@@ -144,7 +152,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         app_data / "instance.lock",
         before_waking=platform.allow_foreground_handover,
     )
-    if not instance.claim():
+    if not instance.claim(args.link):
         logger.info("Already running; asked the running instance to show its window")
         return 0
 
@@ -163,6 +171,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         system.volumes, config, system.paths.default_sync_root(), app_data
     )
     files = RemoteFiles(api)
+    sharing = Sharing(api, files)
     index_path = app_data / "index.db"
 
     def make_engine(
@@ -198,11 +207,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         UploadController(
             config, lambda root: Importer(root, system.recycle_bin), sync, auth.current_user
         ),
+        share=ShareController(sharing),
+        shared=SharedController(sharing),
         background=args.background,
         tray_available=QSystemTrayIcon.isSystemTrayAvailable(),
     )
     instance.activated.connect(shell.open_app)
+    instance.link_received.connect(shell.open_link)
     shell.start()
+    if args.link:
+        shell.open_link(args.link)
 
     logger.info(
         "Client %s started%s", client_version, f" (profile {args.profile})" if args.profile else ""

@@ -190,6 +190,10 @@ class MainWindow(QMainWindow):
                 return
         raise KeyError(title)
 
+    def current_page_title(self) -> str:
+        item = self._nav.currentItem()
+        return "" if item is None else item.text()
+
     def set_hide_on_close(self, hide: bool) -> None:
         """Without a system tray there is nothing to hide into: closing then quits."""
         self._hide_on_close = hide

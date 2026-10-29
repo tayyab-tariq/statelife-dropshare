@@ -243,6 +243,7 @@ def test_the_menu_key_lists_every_action(
         "Move to Recycle Bin…",
         "Show in folder",
         "Save a copy to…",
+        "Share…",
         "New folder…",
         "Upload files…",
         "Upload a folder…",

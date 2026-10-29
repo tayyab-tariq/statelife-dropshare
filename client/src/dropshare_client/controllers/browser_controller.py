@@ -41,6 +41,25 @@ class Files(Protocol):
         self, folder_id: uuid.UUID, page: int, limit: int = ...
     ) -> ListResponse[NodeOut]: ...
 
+    def get_node(self, node_id: uuid.UUID) -> NodeOut: ...
+
+
+_MAX_DEPTH = 256  # folders above a linked item; more means something is wrong
+
+
+@dataclass(frozen=True)
+class _Personal:
+    namespace_id: uuid.UUID
+    root_id: uuid.UUID
+
+
+@dataclass(frozen=True)
+class _Linked:
+    crumbs: list["Crumb"]
+    reveal: uuid.UUID | None
+    personal: _Personal
+    shared_file: bool = False
+
 
 class SyncState(StrEnum):
     """The browser's sync column, in words (never by colour alone)."""
@@ -68,6 +87,7 @@ class BrowserRow:
     state: SyncState
     modified_by_me: bool
     synced_hash: str | None = None  # the content last synced, for the state
+    shared: bool = False  # a shared folder, or in one (FR-FILE-01 sharing state)
 
     @property
     def is_folder(self) -> bool:
@@ -102,6 +122,8 @@ class BrowserController(QObject):
     states_changed = Signal(list)  # row numbers whose sync state changed
     failed = Signal(str)
     notice = Signal(str)  # something the user should know, not an error (folder trashed)
+    reveal = Signal(object)  # select this node's row (a link opened "at that item")
+    shared_file_linked = Signal(object)  # a link to a file shared on its own: Shared with me
 
     def __init__(
         self,
@@ -118,6 +140,8 @@ class BrowserController(QObject):
         self._user_id: uuid.UUID | None = None
         self._crumbs: list[Crumb] = []
         self._folder: Synced | None = None  # the folder shown, on this computer
+        self._personal: _Personal | None = None  # the user's own namespace and root folder
+        self._reveal: uuid.UUID | None = None  # an item to select once its folder is shown
         self._rows: list[BrowserRow] = []
         self._total = 0
         self._busy = False
@@ -141,7 +165,7 @@ class BrowserController(QObject):
     def current_folder(self) -> Item | None:
         """The folder shown, for New folder and uploads; None while it isn't on this
         computer. The top of My files is the sync folder itself (path "")."""
-        if len(self._crumbs) == 1:
+        if len(self._crumbs) == 1 and self._is_personal_root(self._crumbs[0].node_id):
             return Item("", self._crumbs[0].node_id)
         if self._folder is None or not self._crumbs:
             return None
@@ -180,6 +204,66 @@ class BrowserController(QObject):
         if row.is_folder and row.node.name is not None:
             self._go([*self._crumbs, Crumb(row.node.id, row.node.name)])
 
+    def open_node(self, node_id: uuid.UUID) -> None:
+        """Open what a link points at (FR-SHARE-07): a folder, or the folder a file is in.
+        Without access, or once it's gone, the server answers 404 either way; the user is
+        told, and stays where they are."""
+        self._generation += 1
+        generation = self._generation
+        self._busy = True
+        self.loading.emit(True)
+        self._worker.submit(
+            lambda: self._path_to(node_id),
+            lambda crumbs: self._linked(generation, crumbs),
+            lambda exc: self._link_failed(generation, exc),
+        )
+
+    def _path_to(self, node_id: uuid.UUID) -> "_Linked":
+        """On the pool: the crumbs from the item's top folder down to the folder to show, and
+        the item to select there (a file). A file shared on its own has no folder the user
+        may open: it is shown in Shared with me instead."""
+        node = self._files.get_node(node_id)
+        personal = self._personal_root()
+        reveal = None
+        if node.kind != NodeKind.FOLDER and node.parent_id is not None:
+            reveal = node.id
+            try:
+                node = self._files.get_node(node.parent_id)
+            except ApiError as exc:
+                if exc.code == ErrorCode.NOT_FOUND:
+                    return _Linked([], reveal, personal, shared_file=True)
+                raise
+        crumbs: list[Crumb] = []
+        for _ in range(_MAX_DEPTH):
+            if node.parent_id is None:
+                mine = node.id == personal.root_id
+                crumbs.append(Crumb(node.id, messages.MY_FILES if mine else messages.SHARED_FOLDER))
+                return _Linked(list(reversed(crumbs)), reveal, personal)
+            crumbs.append(Crumb(node.id, node.name or ""))
+            node = self._files.get_node(node.parent_id)
+        raise LookupError("folder too deep")
+
+    def _linked(self, generation: int, linked: "_Linked") -> None:
+        if generation != self._generation:
+            return
+        self._busy = False
+        self._personal = linked.personal
+        if linked.shared_file:
+            self.shared_file_linked.emit(linked.reveal)
+            return
+        self._reveal = linked.reveal
+        self._go(linked.crumbs)
+
+    def _link_failed(self, generation: int, exc: Exception) -> None:
+        if generation != self._generation:
+            return
+        self._busy = False
+        if isinstance(exc, ApiError) and exc.code == ErrorCode.NOT_FOUND:
+            self.notice.emit(messages.LINK_UNAVAILABLE)
+            return
+        logger.info("Couldn't open the link: %s", exc)
+        self.notice.emit(messages.message_for(exc))
+
     def open_crumb(self, index: int) -> None:
         if 0 <= index < len(self._crumbs) - 1:
             self._go(self._crumbs[: index + 1])
@@ -213,17 +297,23 @@ class BrowserController(QObject):
         if crumbs:
             self._load(page=1, replace_rows=True)
 
-    def _personal_root(self) -> uuid.UUID:
+    def _personal_root(self) -> "_Personal":
         for namespace in self._files.namespaces():
             if namespace.kind == NamespaceKind.PERSONAL:
-                return namespace.root_node_id
+                return _Personal(namespace.id, namespace.root_node_id)
         raise LookupError("no personal folder")
 
-    def _root_found(self, generation: int, root: uuid.UUID) -> None:
+    def _is_personal_root(self, node_id: uuid.UUID) -> bool:
+        """Only the user's own root is the sync folder itself; a shared folder's root opened
+        from a link isn't (B2: new items there must go into the shared folder)."""
+        return self._personal is not None and self._personal.root_id == node_id
+
+    def _root_found(self, generation: int, personal: "_Personal") -> None:
         if generation != self._generation:
             return
         self._busy = False
-        self._go([Crumb(root, messages.MY_FILES)])
+        self._personal = personal
+        self._go([Crumb(personal.root_id, messages.MY_FILES)])
 
     def _load(self, *, page: int, replace_rows: bool, pages: int = 1) -> None:
         self._generation += 1
@@ -266,6 +356,9 @@ class BrowserController(QObject):
         if replace_rows:
             self._rows = new
             self.loaded.emit()
+            if self._reveal is not None:
+                self.reveal.emit(self._reveal)
+                self._reveal = None
         else:
             first = len(self._rows)
             self._rows.extend(new)
@@ -304,6 +397,8 @@ class BrowserController(QObject):
             SyncState.NOT_SYNCED,
             node.modified_by_user_id == self._user_id,
             entry.sha256 if entry is not None else None,
+            node.mount_namespace_id is not None
+            or (self._personal is not None and node.namespace_id != self._personal.namespace_id),
         )
         return replace(row, state=_state(row, latest.get(key)))
 

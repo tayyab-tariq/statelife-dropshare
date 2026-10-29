@@ -276,3 +276,59 @@ def mass_delete_message(here: int, on_server: int) -> str:
             "(to your DropShare trash)."
         )
     return " ".join(parts) + " Delete them, or pause syncing to check first?"
+
+
+# --- sharing (FR-SHARE-01 … FR-SHARE-07) ------------------------------------------------------
+
+
+def group_size(count: int) -> str:
+    return "1 person" if count == 1 else f"{count} people"
+
+
+def shared_with(name: str) -> str:
+    return f"Shared with {name}."
+
+
+def role_changed(name: str) -> str:
+    return f"Changed what {name} can do."
+
+
+def access_removed(name: str) -> str:
+    return f"{name} no longer has access."
+
+
+LINK_COPIED = "Link copied. Only people with access can open it."
+ADDED_TO_DROPSHARE = "Added to your DropShare. It syncs in a moment."
+LEFT_SHARED_FOLDER = "Removed from your DropShare. Others still have it."
+NEW_VERSION_UPLOADED = "New version uploaded."
+TRANSFER_CANCELLED = "Cancelled. Nothing was changed."
+
+
+def saving_copy(name: str) -> str:
+    return f"Saving a copy of “{name}”…"
+
+
+def uploading_version(name: str) -> str:
+    return f"Uploading a new version of “{name}”…"
+
+
+def leave_folder(name: str) -> str:
+    return (
+        f"“{name}” is removed from your DropShare and from your computers. Files you changed "
+        "and haven't uploaded yet are kept in your own folder. You can add it again from here."
+    )
+
+
+COPY_EXISTS_THERE = "There's already a file with that name there. Choose another name."
+# FR-SHARE-07 has two messages, but the server answers 404 for both cases alike.
+LINK_UNAVAILABLE = (
+    "You don't have access to this item, or it is no longer available. Ask the owner to "
+    "share it with you."
+)
+SHARED_FOLDER = "Shared folder"
+
+
+def new_shares(names: list[str]) -> str:
+    if len(names) == 1:
+        return f"“{names[0]}” was shared with you."
+    return f"{len(names)} items were shared with you."

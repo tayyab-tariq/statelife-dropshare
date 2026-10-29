@@ -74,6 +74,7 @@ MAIN_WINDOW_MIN_SIZE = QSize(900, 600)  # visual-design.md §6, with the sidebar
 SIDEBAR_WIDTH = 220
 PROGRESS_COLUMN_WIDTH = 120  # the Transfers view's progress bars
 TOOLBAR_ICON_SIZE = 20  # visual-design.md §5: 16 in tables and menus, 20 in toolbars
+SHARE_RESULTS_HEIGHT = 160  # the Share dialog's search results: about five rows
 STATE_MAX_WIDTH = 360  # width of the messages in the loading, error and empty states
 
 

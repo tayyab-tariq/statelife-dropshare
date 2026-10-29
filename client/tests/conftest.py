@@ -13,6 +13,8 @@ from pytestqt.qtbot import QtBot
 from dropshare_client.controllers.browser_controller import BrowserController
 from dropshare_client.controllers.file_actions_controller import FileActionsController
 from dropshare_client.controllers.session_controller import SessionController
+from dropshare_client.controllers.share_controller import ShareController
+from dropshare_client.controllers.shared_controller import SharedController
 from dropshare_client.controllers.sync_controller import SyncController
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
 from dropshare_client.controllers.transfers_controller import TransfersController
@@ -24,6 +26,7 @@ from dropshare_client.services.config import ConfigStore
 from dropshare_client.services.files import RemoteFiles
 from dropshare_client.services.importer import Importer
 from dropshare_client.services.local_files import LocalFiles
+from dropshare_client.services.sharing import Sharing
 from dropshare_client.services.tokens import TokenStore
 from dropshare_client.ui.app_shell import AppShell
 
@@ -96,8 +99,8 @@ def make_client(
         api = ApiClient(
             config.config.server_url,
             tokens,
-            client_version="0.1.0",
-            user_agent="DropShare/0.1.0 (test)",
+            client_version="0.2.0",
+            user_agent="DropShare/0.2.0 (test)",
             transport=httpx.MockTransport(server.handle),
         )
         made.append(api)
@@ -106,6 +109,7 @@ def make_client(
         sync = SyncController(config, engines, engines.forget)
         transfers = TransfersController(sync)
         revealed: list[Path] = []
+        sharing = Sharing(api, RemoteFiles(api))
         return Client(
             server=server,
             credentials=credentials,
@@ -135,6 +139,8 @@ def make_client(
             uploads=UploadController(
                 config, lambda root: Importer(root, MacTrash(trash)), sync, auth.current_user
             ),
+            share=ShareController(sharing),
+            shared=SharedController(sharing),
             engines=engines,
             trash=trash,
             app_data=tmp_path / "app-data",
@@ -163,6 +169,8 @@ def make_shell(qtbot: QtBot) -> Iterator[MakeShell]:
             client.browser,
             client.file_actions,
             client.uploads,
+            share=client.share,
+            shared=client.shared,
             tray_available=tray_available,
         )
         qtbot.addWidget(shell.window)

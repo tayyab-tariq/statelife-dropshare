@@ -11,7 +11,7 @@ Shift+F10 opens the menu with every action, Upload included. Dragging onto a fol
 from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import QModelIndex, QPoint, QSize, Qt, QTimer
+from PySide6.QtCore import QModelIndex, QPoint, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QAccessible,
     QAccessibleEvent,
@@ -100,6 +100,8 @@ class _FileTable(QTableView):
 
 
 class BrowserView(QWidget):
+    share_requested = Signal(object, str)  # node ID, name: the shell opens the Share dialog
+
     def __init__(
         self,
         controller: BrowserController,
@@ -195,6 +197,8 @@ class BrowserView(QWidget):
         self._recycle_action.setShortcuts(deletes)
         self._show_action = self._action(self._table, "&Show in folder", self._show_in_folder)
         self._copy_action = self._action(self._table, "Save a &copy to…", self._ask_save_copy)
+        self._share_action = self._action(self._table, "S&hare…", self._share_current)
+        self._share_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
         upload_menu = QMenu(self._upload)
         upload_menu.addAction(self._upload_files_action)
         upload_menu.addAction(self._upload_folder_action)
@@ -229,6 +233,7 @@ class BrowserView(QWidget):
         controller.loaded.connect(self._show_rows)
         controller.failed.connect(self._failed)
         controller.notice.connect(self._announce)
+        controller.reveal.connect(self._select_node)
         self._show_location()
 
     @property
@@ -296,6 +301,8 @@ class BrowserView(QWidget):
         folder_here = self._controller.current_folder is not None
         item_reason = "" if here or not rows else messages.NOT_HERE_YET
         self._open_action.setEnabled(single and rows[0].is_folder)
+        # On the server, not the disk: an item not synced here yet can be shared too.
+        self._share_action.setEnabled(single and rows[0].is_known_kind)
         for action, allowed in (
             (self._rename_action, single and here),
             (self._show_action, single and here),
@@ -333,6 +340,7 @@ class BrowserView(QWidget):
         menu.addSeparator()
         menu.addAction(self._show_action)
         menu.addAction(self._copy_action)
+        menu.addAction(self._share_action)
         menu.addSeparator()
         for action in (
             self._new_folder_action,
@@ -348,6 +356,21 @@ class BrowserView(QWidget):
         menu.popup(self._table.viewport().mapToGlobal(position))
 
     # --- the actions (FR-FILE-03/04/05) ------------------------------------------------------
+
+    def _select_node(self, node_id: object) -> None:
+        """A link opened at this item: select it and bring it into view."""
+        for row in range(self._model.rowCount()):
+            found = self._model.row_at(row)
+            if found is not None and found.node.id == node_id:
+                self._table.selectRow(row)
+                self._table.scrollTo(self._model.index(row, 0))
+                self._table.setFocus()
+                return
+
+    def _share_current(self) -> None:
+        rows = self._selected()
+        if len(rows) == 1 and self._share_action.isEnabled():
+            self.share_requested.emit(rows[0].node.id, rows[0].node.name or "")
 
     def _ask_new_folder(self) -> None:
         folder = self._controller.current_folder

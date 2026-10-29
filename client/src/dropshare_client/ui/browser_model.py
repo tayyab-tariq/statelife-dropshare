@@ -26,8 +26,10 @@ type _Index = QModelIndex | QPersistentModelIndex
 NAME, MODIFIED, MODIFIED_BY, SIZE, SHARING, SYNC = range(6)
 _HEADERS = ("Name", "Modified", "Modified by", "Size", "Sharing", "Sync")
 ROW_ROLE = Qt.ItemDataRole.UserRole + 1  # the BrowserRow
-# Sharing arrives with roadmap M8; until then everything in My files is the user's alone.
+# "Shared": a shared folder, or anything in one. A file the user shared on its own still shows
+# "Only you": the server's node listing doesn't say so yet (a contract field, later).
 _NOT_SHARED = "Only you"
+_SHARED = "Shared"
 # Rows dragged within the browser: "node id<TAB>local path" per line. Only honoured when the
 # drag started in this view (BrowserView checks the source).
 PATHS_MIME = "application/x-dropshare-items"
@@ -186,7 +188,7 @@ class BrowserModel(QAbstractTableModel):
             # The kind in words as well as by icon (never by the picture alone).
             return "Folder" if row.is_folder else messages.size_text(node.size_bytes)
         if column == SHARING:
-            return _NOT_SHARED
+            return _SHARED if row.shared else _NOT_SHARED
         return row.state.value
 
     def _loaded(self) -> None:

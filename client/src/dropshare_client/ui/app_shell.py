@@ -2,6 +2,8 @@
 tray, and syncing while signed in (FR-AUTH-01/02/04/05, FR-SYNC-01/05/08, FR-CLIENT-01).
 Reacts to controller signals only."""
 
+import logging
+import uuid
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QTimer, QUrl
@@ -12,6 +14,8 @@ from dropshare_client.controllers import messages
 from dropshare_client.controllers.browser_controller import BrowserController
 from dropshare_client.controllers.file_actions_controller import FileActionsController
 from dropshare_client.controllers.session_controller import SessionController
+from dropshare_client.controllers.share_controller import ShareController, node_of
+from dropshare_client.controllers.shared_controller import SharedController
 from dropshare_client.controllers.sync_controller import SyncController, SyncStatus
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
 from dropshare_client.controllers.transfers_controller import TransfersController
@@ -20,6 +24,7 @@ from dropshare_client.ui.browser_view import BrowserView
 from dropshare_client.ui.change_password_dialog import ChangePasswordDialog
 from dropshare_client.ui.main_window import OVERVIEW, MainWindow
 from dropshare_client.ui.mass_delete_dialog import MassDeleteDialog
+from dropshare_client.ui.share_dialog import ShareDialog
 from dropshare_client.ui.shared_view import SharedWithMeView
 from dropshare_client.ui.sign_in_dialog import SignInDialog
 from dropshare_client.ui.sign_out_dialog import SignOutDialog
@@ -28,6 +33,8 @@ from dropshare_client.ui.theme import TrayState
 from dropshare_client.ui.transfers_view import TransfersView
 from dropshare_client.ui.tray import Tray
 from dropshare_shared.schemas.users import UserOut
+
+logger = logging.getLogger(__name__)
 
 _OFFLINE_RETRY_MS = 30_000
 _SIGN_OUT_RETRY_MS = 500  # the session was busy (e.g. an automatic resume): try again shortly
@@ -60,6 +67,8 @@ class AppShell(QObject):
         file_actions: FileActionsController,
         uploads: UploadController,
         *,
+        share: ShareController,
+        shared: SharedController,
         background: bool = False,
         tray_available: bool = True,
     ) -> None:
@@ -81,7 +90,11 @@ class AppShell(QObject):
         self._uploads = uploads
         self.browser_view = BrowserView(browser, file_actions, uploads)
         self.window.add_page(messages.MY_FILES, self.browser_view, 0)
-        self.window.add_page("Shared with me", SharedWithMeView(), 1)
+        self._shared = shared
+        self.shared_view = SharedWithMeView(shared)
+        self.window.add_page("Shared with me", self.shared_view, 1)
+        self.share_dialog = ShareDialog(share, self.window)
+        self._pending_link: uuid.UUID | None = None  # opened once signed in
         self.transfers_view = TransfersView(transfers)
         self.window.add_page("Transfers", self.transfers_view, 2)
         self.window.show_page(messages.MY_FILES)
@@ -134,6 +147,11 @@ class AppShell(QObject):
         self.tray.pause_toggled.connect(self._pause_toggled)
         self.tray.quit_requested.connect(self.quit)
         self.sign_in_dialog.rejected.connect(self._sign_in_cancelled)
+        self.browser_view.share_requested.connect(self.share_dialog.open_for)
+        browser.shared_file_linked.connect(self._show_shared_item)
+        shared.new_shares.connect(
+            lambda names: self._notify("Shared with you", messages.new_shares(names))
+        )
 
     def start(self) -> None:
         if self._tray_available:
@@ -155,6 +173,25 @@ class AppShell(QObject):
             self._show_sign_in(None)
         else:
             self.window.bring_to_front()
+
+    def open_link(self, link: str) -> None:
+        """A `statelife-dropshare://` link (FR-SHARE-07), from the command line or another
+        start of the app. Anything that isn't exactly such a link is ignored."""
+        node_id = node_of(link)
+        if node_id is None:
+            logger.warning("Ignored a link that isn't a DropShare link")
+            return
+        self.open_app()
+        if self._user is None:
+            self._pending_link = node_id  # after signing in
+            return
+        self.window.show_page(messages.MY_FILES)
+        self._browser.open_node(node_id)
+
+    def _show_shared_item(self, node_id: uuid.UUID) -> None:
+        """A link to a file shared on its own: it lives in Shared with me (FR-SHARE-03/07)."""
+        self.window.show_page("Shared with me")
+        self.shared_view.select(node_id)
 
     def open_sync_folder(self) -> None:
         folder = self._folders.current_folder
@@ -194,6 +231,10 @@ class AppShell(QObject):
         else:
             self.window.show_page(messages.MY_FILES)
             self._sync.start(user)
+        self._shared.start()
+        if self._pending_link is not None:
+            node_id, self._pending_link = self._pending_link, None
+            self._browser.open_node(node_id)
 
     def _password_changed(self) -> None:
         if self.password_dialog is not None:
@@ -273,6 +314,8 @@ class AppShell(QObject):
     def _signed_out(self, note: str) -> None:
         self._user = None
         self._browser.clear()
+        self._shared.clear()
+        self.share_dialog.hide()
         self._uploads.set_user(None)
         # The index says whose files the folder holds; it goes only when the folder went.
         self._sync.stop(forget=self._folders.current_folder is None)
