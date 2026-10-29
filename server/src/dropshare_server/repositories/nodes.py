@@ -13,11 +13,16 @@ from sqlalchemy.orm import Session
 from dropshare_server.models import FileVersion, Node
 
 _LIVE_KEY_CONSTRAINT = "uq_nodes_live_key"
+_MOUNT_KEY_CONSTRAINT = "uq_nodes_mount_key"
 _IN_LIST_LIMIT = 1000  # Oracle ORA-01795
 
 
 class LiveNameTakenError(Exception):
     """Another live item in the folder has the same normalized name (raced past the check)."""
+
+
+class MountTakenError(Exception):
+    """The user already has this shared folder (another request added it meanwhile)."""
 
 
 def live_key(
@@ -48,6 +53,8 @@ def add(session: Session, node: Node) -> None:
     except IntegrityError as exc:
         if _LIVE_KEY_CONSTRAINT in str(exc.orig).lower():
             raise LiveNameTakenError from exc
+        if _MOUNT_KEY_CONSTRAINT in str(exc.orig).lower():
+            raise MountTakenError from exc
         raise
 
 

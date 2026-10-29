@@ -257,26 +257,56 @@ def test_moving_into_a_shared_folder_keeps_ids_and_moves_the_bytes_to_the_owner(
     assert f'"to_namespace_id": "{mount["mount_namespace_id"]}"' in (event.details or "")
 
 
-def test_moving_out_of_a_shared_folder_charges_the_one_who_takes_it(
+def test_only_the_owner_moves_items_out_of_a_shared_folder(
     api: TestClient,
     shared_with_bob: tuple[Account, Account, Json, Json],
     root_of: RootOf,
     upload_file: UploadFile,
     session_factory: sessionmaker[Session],
 ) -> None:
+    """OQ-35: an editor can't take the owner's files into their own DropShare."""
     alice, bob, team, _mount = shared_with_bob
     file = _ok(upload_file(alice, b"budget", parent_id=team["id"], name="budget.txt"))
+    out = {"if_revision": 1, "parent_id": root_of(bob)}
+
+    refused = api.patch(f"/api/v1/nodes/{file['id']}", json=out, headers=_auth(bob))
+    owner = api.patch(
+        f"/api/v1/nodes/{file['id']}",
+        json={"if_revision": 1, "parent_id": root_of(alice)},
+        headers=_auth(alice),
+    )
+
+    assert (refused.status_code, refused.json()["error"]["code"]) == (403, "FORBIDDEN")
+    assert owner.status_code == 200
+    assert _used(session_factory) == {"alice": 6, "bob": 0}
+
+
+def test_file_shares_end_when_a_file_moves_to_another_owner(
+    api: TestClient,
+    shared_with_bob: tuple[Account, Account, Json, Json],
+    sign_in: SignIn,
+    root_of: RootOf,
+    upload_file: UploadFile,
+    audit_events: AuditEvents,
+) -> None:
+    """Bob shares his own file with Carol, then moves it into Alice's folder: Alice now owns
+    it and manages its sharing, so Bob's grant doesn't carry over."""
+    _alice, bob, _team, mount = shared_with_bob
+    carol = sign_in("carol")
+    file = _ok(upload_file(bob, b"notes", parent_id=root_of(bob), name="notes.txt"))
+    _share(api, bob, file["id"], "viewer", carol)
 
     _ok(
         api.patch(
             f"/api/v1/nodes/{file['id']}",
-            json={"if_revision": 1, "parent_id": root_of(bob)},
+            json={"if_revision": 1, "parent_id": mount["id"]},
             headers=_auth(bob),
         )
     )
 
-    assert _used(session_factory) == {"alice": 0, "bob": 6}
-    assert api.get(f"/api/v1/nodes/{file['id']}", headers=_auth(alice)).status_code == 404
+    assert api.get(f"/api/v1/nodes/{file['id']}", headers=_auth(carol)).status_code == 404
+    [removed] = audit_events(AuditAction.SHARE_REMOVED)
+    assert '"reason": "moved_to_another_owner"' in (removed.details or "")
 
 
 def test_a_move_the_new_owner_has_no_room_for_is_refused(

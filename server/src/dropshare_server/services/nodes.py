@@ -277,6 +277,16 @@ def _move_between_namespaces(
     against the new owner's (FR-SHARE-06). Shared folders can't hold one another, so a mount,
     or a folder holding one, never goes into a shared folder."""
     source, destination = node.namespace_id, parent.namespace_id
+    old = namespace_repository.get(session, source)
+    if old is None:
+        raise RuntimeError(f"Namespace {source} is missing")
+    if old.kind == NamespaceKind.SHARED and old.owner_user_id != user_id:
+        # OQ-35: what's in someone else's shared folder stays theirs; editors copy it instead.
+        raise AppError(
+            403,
+            ErrorCode.FORBIDDEN,
+            "Only the owner can move items out of a shared folder. Copy them instead.",
+        )
     live_ids = set(node_repository.lock_live_descendant_ids(session, node.id))
     target = namespace_repository.get(session, destination)
     if target is None:
@@ -290,12 +300,11 @@ def _move_between_namespaces(
             "A shared folder can't be moved into another shared folder.",
         )
     descendants = node_repository.subtree(session, node.id)
-    old = namespace_repository.get(session, source)
-    if old is None:
-        raise RuntimeError(f"Namespace {source} is missing")
     if old.owner_user_id != target.owner_user_id:
         size = sum(n.size_bytes for n in (node, *descendants) if n.kind == NodeKind.FILE)
         _transfer_quota(session, old.owner_user_id, target.owner_user_id, size)
+        # The new owner manages sharing now: grants the old owner made don't carry over.
+        _end_file_shares(session, ctx, [node, *descendants])
 
     now = datetime.now(UTC)
     old_parent_id = node.parent_id
@@ -326,6 +335,26 @@ def _move_between_namespaces(
     return to_out(node)
 
 
+def _end_file_shares(session: Session, ctx: CallContext, nodes: list[Node]) -> None:
+    for node in nodes:
+        if node.kind != NodeKind.FILE:
+            continue
+        for share in sharing_repository.file_members(session, node.id):
+            grantee = (
+                {"grantee_type": "user", "grantee_id": str(share.user_id)}
+                if share.user_id is not None
+                else {"grantee_type": "group", "grantee_id": str(share.group_id)}
+            )
+            sharing_repository.remove(session, share)
+            audit_service.record(
+                session,
+                ctx,
+                AuditAction.SHARE_REMOVED,
+                target=node_target(node),
+                details={**grantee, "reason": "moved_to_another_owner"},
+            )
+
+
 def _transfer_quota(
     session: Session, from_user_id: uuid.UUID, to_user_id: uuid.UUID, size: int
 ) -> None:
@@ -354,6 +383,7 @@ def trash_node(
     node_id: uuid.UUID,
     if_revision: int,
     if_cursor: int | None = None,
+    if_mount_cursor: int | None = None,
 ) -> None:
     """Move an item and everything inside it to the owner's trash (FR-TRASH-01).
 
@@ -376,11 +406,17 @@ def trash_node(
 
     descendant_ids = node_repository.lock_live_descendant_ids(session, node.id)
     mounts = node_repository.mounts_among(session, [node.id, *descendant_ids])
-    own_shared = _own_shared_contents(session, user_id, mounts)
+    own_shared = _own_shared_contents(session, user_id, node, mounts)
     if if_cursor is not None and change_repository.any_after(
         session, node.namespace_id, if_cursor, descendant_ids
     ):
         raise revision_conflict(node.revision)
+    for mount, contents in own_shared:  # OQ-36: an edit the client hasn't seen wins here too
+        assert mount.mount_namespace_id is not None  # noqa: S101 - a mount
+        if if_mount_cursor is not None and change_repository.any_after(
+            session, mount.mount_namespace_id, if_mount_cursor, contents
+        ):
+            raise revision_conflict(node.revision)
     now = datetime.now(UTC)
     node.revision += 1
     node_repository.trash(session, node, descendant_ids, user_id, now)
@@ -395,7 +431,10 @@ def trash_node(
         target=node_target(node),
         details={"kind": node.kind.value, "descendants": len(descendant_ids)},
     )
+    own = {mount.id for mount, _ in own_shared}
     for mount in mounts:  # deleting someone else's shared folder from your tree is leaving it
+        if mount.id in own:
+            continue
         audit_service.record(
             session,
             ctx,
@@ -406,17 +445,25 @@ def trash_node(
 
 
 def _own_shared_contents(
-    session: Session, user_id: uuid.UUID, mounts: list[Node]
+    session: Session, user_id: uuid.UUID, node: Node, mounts: list[Node]
 ) -> list[tuple[Node, list[uuid.UUID]]]:
     """For each of the user's own shared folders among `mounts`: the live items inside it,
     which go to the trash with it. Refused while anyone else has access: the owner's mount is
-    the shared folder itself for them, so in v1 the owner removes everyone's access first."""
+    the shared folder itself for them, so in v1 the owner removes everyone's access first.
+    Also refused inside a folder being deleted: the shared folder is deleted on its own, so
+    its journal can be checked for edits the client hasn't seen (OQ-36)."""
     found = []
     for mount in mounts:
         assert mount.mount_namespace_id is not None  # noqa: S101 - mounts_among's filter
         namespace = namespace_repository.get(session, mount.mount_namespace_id)
         if namespace is None or namespace.owner_user_id != user_id:
             continue  # someone else's folder: deleting the mount is leaving it
+        if mount.id != node.id:
+            raise AppError(
+                409,
+                ErrorCode.SHARE_NOT_ALLOWED,
+                f"This folder holds your shared folder '{mount.name}'. Delete that first.",
+            )
         if sharing_repository.namespace_members(session, namespace.id):
             raise AppError(
                 409,

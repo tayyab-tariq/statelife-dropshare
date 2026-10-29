@@ -20,7 +20,7 @@ from dropshare_server.repositories import namespaces as namespace_repository
 from dropshare_server.repositories import nodes as node_repository
 from dropshare_server.repositories import sharing as sharing_repository
 from dropshare_server.repositories import users as user_repository
-from dropshare_server.repositories.nodes import LiveNameTakenError
+from dropshare_server.repositories.nodes import LiveNameTakenError, MountTakenError
 from dropshare_server.repositories.sharing import Share
 from dropshare_server.services import access
 from dropshare_server.services import audit as audit_service
@@ -71,9 +71,12 @@ class _Target:
         return self.node.kind == NodeKind.FILE
 
 
-def _target(session: Session, user_id: uuid.UUID, node_id: uuid.UUID) -> _Target:
+def _target(
+    session: Session, user_id: uuid.UUID, node_id: uuid.UUID, *, reading: bool = False
+) -> _Target:
     """The item behind `node_id`: a mount stands for its shared folder; a folder inside a
-    shared folder is managed on that folder, so it is refused here."""
+    shared folder is managed on that folder: refused for changes, and, when `reading`, that
+    folder's sharing is what is shown."""
     node = access.require_node(session, user_id, node_id, follow_mount=True, file_share=True)
     namespace = namespace_repository.get(session, node.namespace_id)
     if namespace is None:
@@ -88,6 +91,9 @@ def _target(session: Session, user_id: uuid.UUID, node_id: uuid.UUID) -> _Target
             return _Target(node, namespace, role, shared=True)
         raise _not_allowed("Your DropShare folder itself can't be shared; share a folder in it.")
     if namespace.kind == NamespaceKind.SHARED:
+        root = node_repository.get_root(session, namespace.id)
+        if reading and root is not None:
+            return _Target(root, namespace, role, shared=True)
         raise _not_allowed(
             "This folder is inside a shared folder; manage access on the shared folder itself."
         )
@@ -156,8 +162,9 @@ def _audit_target(session: Session, target: _Target) -> AuditTarget:
 
 
 def get_sharing(session: Session, user_id: uuid.UUID, node_id: uuid.UUID) -> SharingOut:
-    """Everyone with access, for anyone who has access (FR-SHARE-04)."""
-    target = _target(session, user_id, node_id)
+    """Everyone with access, for anyone who has access (FR-SHARE-04). For a folder inside a
+    shared folder, the shared folder's (its `node_id` says which)."""
+    target = _target(session, user_id, node_id, reading=True)
     owner = _user(session, target.namespace.owner_user_id)
     return SharingOut(
         node_id=target.node.id,
@@ -494,6 +501,11 @@ def mount(session: Session, ctx: CallContext, user_id: uuid.UUID, body: MountIn)
             node_repository.add(session, node)
         except LiveNameTakenError:
             continue  # another request took this name meanwhile: try the next number
+        except MountTakenError:  # added from another device at the same moment
+            raced = node_repository.live_mount(session, personal.id, namespace.id)
+            if raced is None:
+                raise
+            return node_service.to_out(raced)
         change_service.record(session, node, ChangeType.CREATED, user_id, now)
         audit_service.record(
             session,

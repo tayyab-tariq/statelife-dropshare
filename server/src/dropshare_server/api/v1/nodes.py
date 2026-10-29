@@ -67,6 +67,7 @@ def trash_node(
         node_id,
         query.if_revision,
         query.if_cursor,
+        query.if_mount_cursor,
     )
     return Response(status_code=204)
 

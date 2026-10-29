@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
 from dropshare_server.models import AuditEvent, Node, User
+from dropshare_server.repositories import nodes as node_repository
 from dropshare_server.services import groups as group_service
 from dropshare_server.services.context import cli_context
 from dropshare_shared.schemas.audit import AuditAction
@@ -484,9 +485,12 @@ def test_the_owner_deletes_a_shared_folder_only_once_nobody_else_has_access(
     refused = api.delete(f"/api/v1/nodes/{mount['id']}", params=params, headers=_auth(alice))
     [member] = _members(api, alice, mount["id"])
     _ok(api.delete(f"/api/v1/members/{member['id']}", headers=_auth(alice)), 204)
-    deleted = api.delete(f"/api/v1/nodes/{projects['id']}", params=params, headers=_auth(alice))
+    # The folder holding it isn't deleted with it: the shared folder goes on its own (OQ-36).
+    holder = api.delete(f"/api/v1/nodes/{projects['id']}", params=params, headers=_auth(alice))
+    deleted = api.delete(f"/api/v1/nodes/{mount['id']}", params=params, headers=_auth(alice))
 
     assert refused.json()["error"]["code"] == "SHARE_NOT_ALLOWED"
+    assert holder.json()["error"]["code"] == "SHARE_NOT_ALLOWED"
     assert deleted.status_code == 204
     with session_factory() as session:
         trashed = session.get(Node, plan["id"])
@@ -517,3 +521,81 @@ def test_every_sharing_action_is_audited(
     created = sharing[0]
     assert (created.target_id, created.target_name) == (folder["id"], "Budget")
     assert '"role": "editor"' in (created.details or "")
+
+
+def test_an_edit_the_deleting_device_hasnt_seen_keeps_the_owners_folder(
+    api: TestClient,
+    sign_in: SignIn,
+    budget: tuple[Account, Json, Json],
+    root_of: RootOf,
+    upload_file: UploadFile,
+) -> None:
+    """OQ-36: the shared folder's own journal is checked too, as `if_cursor` checks a folder's."""
+    alice, _folder, plan = budget
+    bob = sign_in("bob")
+    namespace = _shared_with(api, budget, bob)
+    [projects] = _items(_children(api, alice, root_of(alice)))
+    [mount] = _items(_children(api, alice, projects["id"]))
+    [member] = _members(api, alice, mount["id"])
+    _ok(api.delete(f"/api/v1/members/{member['id']}", headers=_auth(alice)), 204)
+    seen = int(str(_changes(api, alice, namespace)[-1]["cursor"]))
+    _ok(upload_file(alice, b"plan v2", node_id=plan["id"], base_revision=1))  # another device
+
+    stale = api.delete(
+        f"/api/v1/nodes/{mount['id']}",
+        params={"if_revision": 1, "if_mount_cursor": seen},
+        headers=_auth(alice),
+    )
+    current = api.delete(
+        f"/api/v1/nodes/{mount['id']}",
+        params={"if_revision": 1, "if_mount_cursor": seen + 1},
+        headers=_auth(alice),
+    )
+
+    assert stale.json()["error"]["code"] == "REVISION_CONFLICT"
+    assert current.status_code == 204
+
+
+def test_a_folder_inside_a_shared_folder_shows_the_shared_folders_access(
+    api: TestClient, sign_in: SignIn, budget: tuple[Account, Json, Json]
+) -> None:
+    alice, folder, _ = budget
+    bob = sign_in("bob")
+    _shared_with(api, budget, bob, "viewer")
+    q1 = next(c for c in _items(_children(api, alice, folder["id"])) if c["name"] == "Q1")
+
+    sharing = _ok(api.get(f"/api/v1/nodes/{q1['id']}/members", headers=_auth(bob)))
+
+    assert sharing["node_id"] == folder["id"]
+    assert [m["name"] for m in _members(api, alice, q1["id"])] == ["Bob"]
+
+
+def test_a_shared_folder_added_twice_at_once_gives_the_same_mount(
+    api: TestClient,
+    sign_in: SignIn,
+    budget: tuple[Account, Json, Json],
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Two devices adding it at the same moment: the database's unique key decides."""
+    bob = sign_in("bob")
+    namespace = _shared_with(api, budget, bob)
+    first = _ok(_mount(api, bob, namespace), 201)
+    with session_factory() as session:
+        node = session.get(Node, first["id"])
+        assert node is not None
+        twin = Node(
+            namespace_id=node.namespace_id,
+            parent_id=node.parent_id,
+            name="Budget (2)",
+            name_normalized="budget (2)",
+            kind=node.kind,
+            size_bytes=0,
+            revision=1,
+            created_at=node.created_at,
+            created_by_user_id=node.created_by_user_id,
+            modified_at=node.modified_at,
+            modified_by_user_id=node.modified_by_user_id,
+            mount_namespace_id=node.mount_namespace_id,
+        )
+        with pytest.raises(node_repository.MountTakenError):
+            node_repository.add(session, twin)

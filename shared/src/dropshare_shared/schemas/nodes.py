@@ -96,3 +96,6 @@ class NodeDeleteQuery(BaseModel):
 
     if_revision: int = Field(ge=1)
     if_cursor: int | None = Field(default=None, ge=0)
+    # Deleting your own shared folder (its mount): the cursor of the shared folder's journal you
+    # read up to. Refused if anything inside changed after it, as `if_cursor` (OQ-36).
+    if_mount_cursor: int | None = Field(default=None, ge=0)
