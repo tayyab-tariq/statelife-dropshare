@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from dropshare_client.platform.base import FileIdentity
+from dropshare_client.services.sync_folder import is_link
 from dropshare_client.store.records import Problem
 from dropshare_client.sync import paths
 from dropshare_client.sync.errors import (
@@ -145,7 +146,7 @@ class Scanner:
             path = paths.join(path, found[0])
             if len(found) > 1:
                 raise UnsafePathError(path, _SAME_NAME)
-            if index < len(parts) - 1 and _is_link(self.disk_path(path)):
+            if index < len(parts) - 1 and is_link(self.disk_path(path)):
                 raise UnsafePathError(path, _LINKS_NOT_SYNCED)
         return path
 
@@ -197,7 +198,7 @@ class Scanner:
         key = paths.key_of(_nfc(path))
         if key in result.problems:
             return False
-        if stat.S_ISLNK(info.st_mode) or _is_link(self.disk_path(path)):
+        if stat.S_ISLNK(info.st_mode) or is_link(self.disk_path(path)):
             result.refuse(key, path, _LINKS_NOT_SYNCED)
             return False
         problem = paths.name_problem(name)
@@ -248,11 +249,3 @@ class Scanner:
 def _nfc(text: str) -> str:
     """macOS can hand back decomposed (NFD) names; the server and the keys use NFC."""
     return unicodedata.normalize("NFC", text)
-
-
-def _is_link(path: Path) -> bool:
-    """Symlinks and NTFS junctions both lead out of the sync folder."""
-    try:
-        return path.is_symlink() or path.is_junction()
-    except OSError:
-        return False

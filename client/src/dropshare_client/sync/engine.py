@@ -27,6 +27,7 @@ from dropshare_client.sync.core import NoPersonalFolderError, SyncCore
 from dropshare_client.sync.errors import SyncRootMissingError, SyncStoppedError
 from dropshare_client.sync.scanner import STABLE_AFTER_NS
 from dropshare_client.sync.server import FileServer
+from dropshare_client.sync.transfers import TransferEvent
 from dropshare_client.sync.watcher import Watcher
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,11 @@ class SyncListener(Protocol):
         """Items still to do in this cycle (FR-CLIENT-01 "Syncing (n items)"); 0 when done."""
         ...
 
+    def transfer(self, event: TransferEvent) -> None:
+        """An upload or download was queued, moved bytes (at most ~4 times a second), or
+        ended (FR-CLIENT-08). Called on the engine's thread."""
+        ...
+
 
 def _jitter(delay: float) -> float:
     return delay + random.uniform(0, delay / 4)  # noqa: S311 - spreading retries, not security
@@ -122,6 +128,7 @@ class SyncEngine:
             stable_after_ns=stable_after_ns,
             max_path=max_path,
             progress=listener.progress,
+            transfer=listener.transfer,
         )
         self._watcher = Watcher(root, self.local_changed) if watch else None
         self._watcher_lock = threading.Lock()  # started by the engine thread, stopped by stop()
@@ -210,6 +217,14 @@ class SyncEngine:
             self._lock.notify_all()
         if not approved:
             self.pause()
+
+    def retry_now(self, key: str) -> None:
+        """Look at `key` again in the next cycle, without waiting for its backoff: the
+        Transfers view's Retry (FR-CLIENT-08). An item listed as can't sync is planned
+        again too."""
+        with self._lock:
+            self._retry[key] = time.monotonic()
+            self._lock.notify_all()
 
     def local_changed(self, path: str) -> None:
         """A watcher hint. Synced after SETTLE_SECONDS without further events."""

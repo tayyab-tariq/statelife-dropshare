@@ -7,6 +7,7 @@ finishes the job (tests/sync/test_crash_recovery.py). `crash_point` lets tests s
 """
 
 import contextlib
+import dataclasses
 import logging
 import os
 import stat
@@ -15,11 +16,13 @@ import unicodedata
 import uuid
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime
+from functools import partial
 from pathlib import Path
 from typing import Protocol
 
 from pydantic import ValidationError
 
+from dropshare_client.platform import rename_no_replace
 from dropshare_client.platform.base import FileAttributes, RecycleBin
 from dropshare_client.services.errors import ApiError, OfflineError
 from dropshare_client.services.files import NewFile, NewVersion, SourceFile
@@ -36,6 +39,7 @@ from dropshare_client.sync.reconciler import Action, Op
 from dropshare_client.sync.remote_tree import RemoteTree, TreeDelta, from_node
 from dropshare_client.sync.scanner import LocalItem, Scanner
 from dropshare_client.sync.server import FileServer
+from dropshare_client.sync.transfers import Direction, TransferReporter
 from dropshare_shared.errors import ErrorCode
 from dropshare_shared.schemas.error_details import NameConflictDetails
 from dropshare_shared.schemas.nodes import NodeKind, NodeOut
@@ -71,9 +75,11 @@ class Executor:
         log: ActivityLog,
         *,
         display_name: str,
-        cursor: Callable[[], int],
+        cursor: Callable[[uuid.UUID], int],  # a namespace's cursor
         stop: threading.Event,
         crash_point: Callable[[str], None] = no_crash,
+        transfers: TransferReporter | None = None,
+        view_only: Callable[[uuid.UUID], bool] = lambda _: False,  # by namespace
     ) -> None:
         self._scanner = scanner
         self._index = index
@@ -86,6 +92,8 @@ class Executor:
         self._cursor = cursor
         self._stop = stop
         self._crash_point = crash_point
+        self._transfers = transfers or TransferReporter(lambda _: None)
+        self._view_only = view_only
 
     def run(self, action: Action) -> str | None:
         """Carry out `action`. Returns the key of an item the step created that the next
@@ -100,6 +108,8 @@ class Executor:
             Op.RECORD: self._record,
             Op.DELETE_LOCAL: self._delete_local,
             Op.DELETE_REMOTE: self._delete_remote,
+            Op.MOVE_LOCAL: self._move_local,
+            Op.MOVE_REMOTE: self._move_remote,
         }
         handlers[action.op](action)
         return None
@@ -171,7 +181,15 @@ class Executor:
                 raise LocalChangedError(action.key) from None
             path = self._scanner.resolve(action.key) or path  # created meanwhile: link it
         self._crash_point("make_local_folder.created")
-        self._index.put_entry(_entry(action.key, path, remote.node, disk.stat().st_mtime_ns))
+        self._index.put_entry(
+            _entry(
+                action.key,
+                path,
+                remote.node,
+                disk.stat().st_mtime_ns,
+                self._scanner.file_id(path),
+            )
+        )
 
     def _make_remote_folder(self, action: Action) -> None:
         local = _required(action.local)
@@ -184,7 +202,9 @@ class Executor:
             node = self._existing_folder(exc)  # a retry, or made elsewhere too
         self._crash_point("make_remote_folder.created")
         remembered = self._remember(node)
-        self._index.put_entry(_entry(action.key, local.path, remembered, local.mtime_ns))
+        self._index.put_entry(
+            _entry(action.key, local.path, remembered, local.mtime_ns, local.file_id)
+        )
         self._log.activity("folder_added", local.path)
 
     def _existing_folder(self, exc: ApiError) -> NodeOut:
@@ -210,11 +230,14 @@ class Executor:
         else:
             target = NewFile(self._remote_parent(action.key), _nfc(paths.name_of(local.path)))
         source = SourceFile(self._disk(local.path), local.sha256, local.size, local.mtime_ns)
+        self._transfers.started(action.key, local.path, Direction.UPLOAD, local.size)
         # Kept when no answer came: the upload may have completed (SyncCore.recover).
         with self._journaled(
             "upload", action.key, {"sha256": local.sha256}, unsure=(OfflineError,)
         ) as journal:
-            node = self._server.upload(source, target, self._stop)
+            node = self._server.upload(
+                source, target, self._stop, partial(self._transfers.progress, action.key)
+            )
         self._crash_point("upload.completed")
         remembered = self._remember(node)
         self._index.put_entry(
@@ -231,6 +254,7 @@ class Executor:
             )
         )
         self._index.finish(journal)
+        self._transfers.finished(action.key)
         self._log.activity("uploaded", local.path)
 
     def _download(self, action: Action) -> None:
@@ -247,15 +271,27 @@ class Executor:
             raise CantSyncError(_TOO_LONG)
         # Named by node only: a newer version replaces a stale partial download.
         part = self._temp_dir() / f"{node.node_id}.part"
-        self._server.download(node.node_id, node.sha256, node.size, part, self._stop)
+        self._transfers.started(action.key, path, Direction.DOWNLOAD, node.size)
+        self._server.download(
+            node.node_id,
+            node.sha256,
+            node.size,
+            part,
+            self._stop,
+            partial(self._transfers.progress, action.key),
+        )
         self._crash_point("download.fetched")
         target = self._disk(path)
         with self._journaled("download", action.key, {"sha256": node.sha256}) as journal:
             self._expect(target, action.local)
+            if action.local is not None:  # Windows won't replace a read-only file
+                self._attributes.set_read_only(target, False)
             part.replace(target)  # PermissionError while the file is open elsewhere: retried
         self._crash_point("download.replaced")
         modified_ns = int(node.modified_at.timestamp() * 1_000_000_000)
         os.utime(target, ns=(modified_ns, modified_ns))
+        if self._view_only(node.namespace_id):  # FR-SHARE-05: after the time, which needs write
+            self._attributes.set_read_only(target, True)
         info = target.stat()
         self._index.put_entry(
             Entry(
@@ -271,7 +307,81 @@ class Executor:
             )
         )
         self._index.finish(journal)
+        self._transfers.finished(action.key)
         self._log.activity("downloaded", path)
+
+    # --- renames and moves (FR-SYNC-10) ---------------------------------------------------
+
+    def _move_remote(self, action: Action) -> None:
+        """Renamed or moved here: one PATCH, so the node keeps its ID and history. Everything
+        inside a folder moves with it. A crash or lost answer is safe: the next cycle finds the
+        item moved on both sides to the same place and only records it."""
+        local, node = _required(action.local), _required(action.remote).node
+        entry = _required(action.base)
+        parent_id = self._remote_parent(action.key)
+        name = _nfc(paths.name_of(local.path))
+        new_parent = parent_id if parent_id != node.parent_id else None
+        new_name = name if name != node.name else None
+        if new_parent is None and new_name is None:
+            # Already where it is here (the server's spelling matches): only the base moves.
+            self._index.move_entries(entry, action.key, local.path)
+            return
+        with self._journaled(
+            "move_remote", action.key, {"from": entry.key}, unsure=(OfflineError,)
+        ) as journal:
+            moved = self._server.move(
+                node.node_id, node.revision, parent_id=new_parent, name=new_name
+            )
+        self._crash_point("move_remote.done")
+        remembered = self._remember(moved)
+        self._index.move_entries(
+            dataclasses.replace(entry, revision=remembered.revision), action.key, local.path
+        )
+        self._index.finish(journal)
+        self._match_read_only(action.key, remembered)
+        self._log.activity("moved_on_server", local.path, entry.path)
+
+    def _move_local(self, action: Action) -> None:
+        """Renamed or moved on the server: the same here, never over an existing item. A
+        local edit to the item stays and uploads once its base has moved too."""
+        local, remote, entry = (
+            _required(action.local),
+            _required(action.remote),
+            _required(action.base),
+        )
+        folder = local.kind == NodeKind.FOLDER
+        target_path = paths.join(self._local_parent(action.key), paths.name_of(remote.path))
+        if self._scanner.too_long(target_path, folder=folder):
+            raise CantSyncError(_TOO_LONG)
+        unchanged = folder or remote.node.sha256 == entry.sha256
+        moved = dataclasses.replace(
+            entry, revision=remote.node.revision if unchanged else entry.revision
+        )
+        if target_path == local.path:  # already in place (moved the same way on both sides)
+            self._index.move_entries(moved, action.key, target_path)
+            return
+        source, target = self._disk(local.path), self._disk(target_path)
+        if folder:
+            if not source.is_dir() or source.is_symlink():
+                raise LocalChangedError(action.key)
+        else:
+            self._expect(source, local)
+        with self._journaled("move_local", action.key, {"from": local.path}) as journal:
+            try:
+                rename_no_replace(source, target)
+            except FileExistsError:
+                raise LocalChangedError(action.key) from None
+            except PermissionError:
+                # Windows reports a folder that appeared at a file's target as access
+                # denied, not as "exists": that is a change to plan again, not a lock.
+                if os.path.lexists(target):
+                    raise LocalChangedError(action.key) from None
+                raise
+        self._crash_point("move_local.done")
+        self._index.move_entries(moved, action.key, target_path)
+        self._index.finish(journal)
+        self._match_read_only(action.key, remote.node)
+        self._log.activity("moved_here", target_path, entry.path)
 
     # --- index only ----------------------------------------------------------------------
 
@@ -318,7 +428,13 @@ class Executor:
         (FR-CONF-03)."""
         node = _required(action.remote).node
         try:
-            self._server.trash(node.node_id, node.revision, self._cursor())
+            mount = node.mount_namespace_id  # its own journal is checked too (OQ-36)
+            self._server.trash(
+                node.node_id,
+                node.revision,
+                self._cursor(node.namespace_id),
+                None if mount is None else self._cursor(mount),
+            )
         except ApiError as exc:
             if exc.code != ErrorCode.NOT_FOUND:
                 raise  # REVISION_CONFLICT: changed there, so the edit wins (SyncCore replans)
@@ -329,6 +445,16 @@ class Executor:
         self._index.save_remote([], delta.removed)
         self._index.remove_entries(action.key, subtree=True)
         self._log.activity("deleted_on_server", action.path)
+
+    def _match_read_only(self, key: str, node: RemoteNode) -> None:
+        """A move can take files into or out of a view-only shared folder: mark them to match
+        where they are now (FR-SHARE-05). A mount's files stay in their own shared folder."""
+        if node.mount_namespace_id is not None:
+            return
+        read_only = self._view_only(node.namespace_id)
+        for item in self._scanner.scan(key).items.values():
+            if item.kind == NodeKind.FILE:
+                self._attributes.set_read_only(self._disk(item.path), read_only)
 
     def _to_recycle_bin(self, key: str, path: str) -> None:
         disk = self._disk(path)
@@ -426,7 +552,7 @@ class Executor:
         return self._scanner.disk_path(path)
 
 
-def _entry(key: str, path: str, node: RemoteNode, mtime_ns: int) -> Entry:
+def _entry(key: str, path: str, node: RemoteNode, mtime_ns: int, file_id: str | None) -> Entry:
     return Entry(
         key=key,
         path=path,
@@ -436,7 +562,7 @@ def _entry(key: str, path: str, node: RemoteNode, mtime_ns: int) -> Entry:
         sha256=node.sha256,
         size=node.size if node.kind == NodeKind.FILE else 0,
         mtime_ns=mtime_ns,
-        file_id=None,
+        file_id=file_id,
     )
 
 

@@ -6,7 +6,7 @@ from collections.abc import Collection, Sequence
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from dropshare_server.models import Change
+from dropshare_server.models import Change, Node
 
 
 def add(session: Session, change: Change) -> None:
@@ -14,15 +14,24 @@ def add(session: Session, change: Change) -> None:
     session.flush()
 
 
-def list_after(session: Session, namespace_id: uuid.UUID, cursor: int, limit: int) -> list[Change]:
-    return list(
-        session.scalars(
-            select(Change)
-            .where(Change.namespace_id == namespace_id, Change.seq > cursor)
-            .order_by(Change.seq)
-            .limit(limit)
-        )
+def add_all(session: Session, changes: Sequence[Change]) -> None:
+    session.add_all(changes)
+    session.flush()
+
+
+def list_after(
+    session: Session, namespace_id: uuid.UUID, cursor: int, limit: int
+) -> list[tuple[Change, uuid.UUID | None]]:
+    """Journal rows after `cursor`, each with its node's `mount_namespace_id`: a node is a
+    mount from creation to purge, so the current value is the value at the change."""
+    rows = session.execute(
+        select(Change, Node.mount_namespace_id)
+        .join(Node, Node.id == Change.node_id)
+        .where(Change.namespace_id == namespace_id, Change.seq > cursor)
+        .order_by(Change.seq)
+        .limit(limit)
     )
+    return [(change, mount) for change, mount in rows]
 
 
 _IN_LIST_LIMIT = 1000  # Oracle ORA-01795

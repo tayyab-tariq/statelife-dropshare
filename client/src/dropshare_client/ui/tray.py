@@ -22,6 +22,10 @@ class Tray(QObject):
         self._icon = QSystemTrayIcon()
         self._menu = QMenu()
         self._menu.setToolTipsVisible(True)
+        # First line: the state in words, with the transfer summary while syncing.
+        self.status_line = self._menu.addAction("")
+        self.status_line.setEnabled(False)
+        self._menu.addSeparator()
         self.open_folder = self._action("Open sync folder", self.open_folder_requested.emit)
         self.open_app = self._action("Open DropShare", self.open_app_requested.emit)
         # Activity and Settings arrive with roadmap F5; listed now so the menu doesn't change.
@@ -36,6 +40,7 @@ class Tray(QObject):
         self._icon.messageClicked.connect(self.open_app_requested.emit)
         self.state = TrayState.SIGNED_OUT
         self._detail = ""
+        self._summary = ""
         self._paused = False
         # Redraw when the theme or contrast setting changes while running.
         hints = QGuiApplication.styleHints()
@@ -59,9 +64,11 @@ class Tray(QObject):
     def hide(self) -> None:
         self._icon.hide()
 
-    def set_state(self, state: TrayState, detail: str = "") -> None:
-        """Icon and tooltip; the tooltip always says the state in words."""
-        self.state, self._detail = state, detail
+    def set_state(self, state: TrayState, detail: str = "", summary: str = "") -> None:
+        """Icon, tooltip and the menu's status line; they always say the state in words.
+        `summary` is the transfers' ("12 items · 45%", FR-CLIENT-08), shown instead of
+        `detail` when given."""
+        self.state, self._detail, self._summary = state, detail, summary
         self._refresh()
 
     def set_paused(self, paused: bool) -> None:
@@ -78,10 +85,13 @@ class Tray(QObject):
 
     def _refresh(self) -> None:
         self._icon.setIcon(status_icon(self.state))
-        tooltip = f"StateLife DropShare: {self.state.value}"
-        if self._detail:
-            tooltip = f"{tooltip} ({self._detail})"
-        self._icon.setToolTip(tooltip[:_TOOLTIP_MAX])
+        status = self.state.value
+        if self._summary:
+            status = f"{status} {self._summary}"
+        elif self._detail:
+            status = f"{status} ({self._detail})"
+        self.status_line.setText(status)
+        self._icon.setToolTip(f"StateLife DropShare: {status}"[:_TOOLTIP_MAX])
         signed_in = self.state is not TrayState.SIGNED_OUT
         self.open_folder.setEnabled(signed_in)
         self.pause.setVisible(not self._paused)

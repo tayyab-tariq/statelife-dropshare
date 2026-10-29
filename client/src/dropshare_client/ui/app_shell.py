@@ -2,6 +2,8 @@
 tray, and syncing while signed in (FR-AUTH-01/02/04/05, FR-SYNC-01/05/08, FR-CLIENT-01).
 Reacts to controller signals only."""
 
+import logging
+import uuid
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QTimer, QUrl
@@ -9,18 +11,30 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QApplication, QDialog
 
 from dropshare_client.controllers import messages
+from dropshare_client.controllers.browser_controller import BrowserController
+from dropshare_client.controllers.file_actions_controller import FileActionsController
 from dropshare_client.controllers.session_controller import SessionController
+from dropshare_client.controllers.share_controller import ShareController, node_of
+from dropshare_client.controllers.shared_controller import SharedController
 from dropshare_client.controllers.sync_controller import SyncController, SyncStatus
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
+from dropshare_client.controllers.transfers_controller import TransfersController
+from dropshare_client.controllers.upload_controller import UploadController
+from dropshare_client.ui.browser_view import BrowserView
 from dropshare_client.ui.change_password_dialog import ChangePasswordDialog
-from dropshare_client.ui.main_window import MainWindow
+from dropshare_client.ui.main_window import OVERVIEW, MainWindow
 from dropshare_client.ui.mass_delete_dialog import MassDeleteDialog
+from dropshare_client.ui.share_dialog import ShareDialog
+from dropshare_client.ui.shared_view import SharedWithMeView
 from dropshare_client.ui.sign_in_dialog import SignInDialog
 from dropshare_client.ui.sign_out_dialog import SignOutDialog
 from dropshare_client.ui.sync_folder_dialog import SyncFolderDialog
 from dropshare_client.ui.theme import TrayState
+from dropshare_client.ui.transfers_view import TransfersView
 from dropshare_client.ui.tray import Tray
 from dropshare_shared.schemas.users import UserOut
+
+logger = logging.getLogger(__name__)
 
 _OFFLINE_RETRY_MS = 30_000
 _SIGN_OUT_RETRY_MS = 500  # the session was busy (e.g. an automatic resume): try again shortly
@@ -48,7 +62,13 @@ class AppShell(QObject):
         session: SessionController,
         folders: SyncFolderController,
         sync: SyncController,
+        transfers: TransfersController,
+        browser: BrowserController,
+        file_actions: FileActionsController,
+        uploads: UploadController,
         *,
+        share: ShareController,
+        shared: SharedController,
         background: bool = False,
         tray_available: bool = True,
     ) -> None:
@@ -61,9 +81,23 @@ class AppShell(QObject):
         self._tray_available = tray_available
         self._user: UserOut | None = None
         self._connection = TrayState.SIGNED_OUT  # what the server side says
+        self._detail = ""
+        self._transfers = transfers
+        self._browser = browser
         self._paused = False
         self.window = MainWindow()
         self.window.set_hide_on_close(tray_available)
+        self._uploads = uploads
+        self.browser_view = BrowserView(browser, file_actions, uploads)
+        self.window.add_page(messages.MY_FILES, self.browser_view, 0)
+        self._shared = shared
+        self.shared_view = SharedWithMeView(shared)
+        self.window.add_page("Shared with me", self.shared_view, 1)
+        self.share_dialog = ShareDialog(share, self.window)
+        self._pending_link: uuid.UUID | None = None  # opened once signed in
+        self.transfers_view = TransfersView(transfers)
+        self.window.add_page("Transfers", self.transfers_view, 2)
+        self.window.show_page(messages.MY_FILES)
         self.tray = Tray()
         self.sign_in_dialog = SignInDialog(session)
         self.password_dialog: ChangePasswordDialog | None = None
@@ -95,6 +129,9 @@ class AppShell(QObject):
         sync.session_expired.connect(self._needs_sign_in)
         sync.folder_rejected.connect(self._folder_rejected)
         sync.start_failed.connect(self._sync_start_failed)
+        transfers.summary_changed.connect(
+            lambda _: self._set_connection(self._connection, self._detail)
+        )
 
         self.window.open_folder_requested.connect(self.open_sync_folder)
         self.window.choose_folder_requested.connect(self._choose_folder)
@@ -110,6 +147,11 @@ class AppShell(QObject):
         self.tray.pause_toggled.connect(self._pause_toggled)
         self.tray.quit_requested.connect(self.quit)
         self.sign_in_dialog.rejected.connect(self._sign_in_cancelled)
+        self.browser_view.share_requested.connect(self.share_dialog.open_for)
+        browser.shared_file_linked.connect(self._show_shared_item)
+        shared.new_shares.connect(
+            lambda names: self._notify("Shared with you", messages.new_shares(names))
+        )
 
     def start(self) -> None:
         if self._tray_available:
@@ -132,6 +174,25 @@ class AppShell(QObject):
         else:
             self.window.bring_to_front()
 
+    def open_link(self, link: str) -> None:
+        """A `statelife-dropshare://` link (FR-SHARE-07), from the command line or another
+        start of the app. Anything that isn't exactly such a link is ignored."""
+        node_id = node_of(link)
+        if node_id is None:
+            logger.warning("Ignored a link that isn't a DropShare link")
+            return
+        self.open_app()
+        if self._user is None:
+            self._pending_link = node_id  # after signing in
+            return
+        self.window.show_page(messages.MY_FILES)
+        self._browser.open_node(node_id)
+
+    def _show_shared_item(self, node_id: uuid.UUID) -> None:
+        """A link to a file shared on its own: it lives in Shared with me (FR-SHARE-03/07)."""
+        self.window.show_page("Shared with me")
+        self.shared_view.select(node_id)
+
     def open_sync_folder(self) -> None:
         folder = self._folders.current_folder
         if folder is not None:
@@ -148,13 +209,15 @@ class AppShell(QObject):
     def _resume(self) -> None:
         self._offline_retry.stop()
         if self.window.view.current_state() != "error":  # automatic retries don't flicker
-            self.window.show_loading("Signing in…")
+            self.window.show_loading("Signing in…", switch_page=self._user is None)
         if not self._session.resume():
             self._offline_retry.start()  # busy with something else: try again later
 
     def _signed_in(self, user: UserOut) -> None:
         self._user = user
         self.sign_in_dialog.done_signing_in()
+        self._browser.start(user.id)
+        self._uploads.set_user(user)
         if self._folders.current_folder is None:
             self._set_connection(TrayState.PAUSED, _NO_FOLDER)
         elif not self._sync.running:
@@ -163,9 +226,15 @@ class AppShell(QObject):
         if not self._background:
             self.window.bring_to_front()
         if self._folders.current_folder is None:
+            self.window.show_page(OVERVIEW)  # its empty state asks for a folder
             self._choose_folder()
         else:
+            self.window.show_page(messages.MY_FILES)
             self._sync.start(user)
+        self._shared.start()
+        if self._pending_link is not None:
+            node_id, self._pending_link = self._pending_link, None
+            self._browser.open_node(node_id)
 
     def _password_changed(self) -> None:
         if self.password_dialog is not None:
@@ -214,7 +283,7 @@ class AppShell(QObject):
 
     def _offline(self, message: str) -> None:
         self._set_connection(TrayState.OFFLINE)
-        self.window.show_error(message)
+        self.window.show_error(message, switch_page=self._user is None)
         self._offline_retry.start()
 
     def _upgrade_required(self, message: str) -> None:
@@ -244,6 +313,10 @@ class AppShell(QObject):
 
     def _signed_out(self, note: str) -> None:
         self._user = None
+        self._browser.clear()
+        self._shared.clear()
+        self.share_dialog.hide()
+        self._uploads.set_user(None)
         # The index says whose files the folder holds; it goes only when the folder went.
         self._sync.stop(forget=self._folders.current_folder is None)
         self._close_dialogs()
@@ -331,6 +404,8 @@ class AppShell(QObject):
             case SyncStatus.PAUSED | SyncStatus.STOPPED:
                 pass  # pause is shown by the shell's own flag; stopping follows sign-out
             case known:
+                if known is SyncStatus.UP_TO_DATE and self._connection is TrayState.SYNCING:
+                    self._browser.refresh()  # a round of syncing ended: show what changed
                 self._set_connection(_TRAY_STATE[known], message)
 
     def _sync_start_failed(self, message: str) -> None:
@@ -385,10 +460,13 @@ class AppShell(QObject):
     def _set_connection(self, state: TrayState, detail: str = "") -> None:
         """Show the connection state, unless syncing is paused while connected: signed out,
         errors and offline always win, so the tray never hides a problem behind "Paused"."""
-        self._connection = state
+        self._connection, self._detail = state, detail
         shown = state
         if self._paused and state in (TrayState.UP_TO_DATE, TrayState.SYNCING):
             shown = TrayState.PAUSED
-        self.tray.set_state(shown, detail or ("paused" if self._paused and shown != state else ""))
+        summary = self._transfers.summary if shown is TrayState.SYNCING else ""
+        self.tray.set_state(
+            shown, detail or ("paused" if self._paused and shown != state else ""), summary
+        )
         if self._user is not None:
             self.window.set_status(f"{shown.value}: {detail}" if detail else shown.value)

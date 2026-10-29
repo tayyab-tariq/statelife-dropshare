@@ -79,6 +79,7 @@ class FakeTransfers:
         self.chunk_size = CHUNK
         self.extra_bytes = b""  # sent after the content (a misbehaving server)
         self.params: list[str] = []
+        self.bodies: list[object] = []
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(f"{request.method} {request.url.path}")
@@ -125,6 +126,9 @@ class FakeTransfers:
                 return httpx.Response(204)
             case "GET", ["nodes", _, "content"]:
                 return self._content(request)
+            case "PATCH", ["nodes", _]:
+                self.bodies.append(json.loads(request.content))
+                return httpx.Response(200, json={"data": _node(b"moved", 2)})
         return _error(404, "NOT_FOUND")
 
     def _upload(self, upload_id: str) -> dict[str, object]:
@@ -371,3 +375,52 @@ def test_trash_sends_the_cursor(files: RemoteFiles, fake: FakeTransfers) -> None
         files.trash(NODE_ID, 3, 41)
 
     assert fake.params == ["if_revision=3&if_cursor=41"]
+
+
+def test_move_sends_only_what_changes_with_the_base_revision(
+    files: RemoteFiles, fake: FakeTransfers
+) -> None:
+    files.move(NODE_ID, 3, name="new.txt")
+    files.move(NODE_ID, 4, parent_id=PARENT_ID)
+
+    assert fake.requests == [f"PATCH /api/v1/nodes/{NODE_ID}"] * 2
+    assert fake.bodies == [
+        {"if_revision": 3, "name": "new.txt"},
+        {"if_revision": 4, "parent_id": str(PARENT_ID)},
+    ]
+
+
+def test_upload_progress_rises_to_the_file_size_and_counts_what_was_already_sent(
+    files: RemoteFiles, fake: FakeTransfers, tmp_path: Path
+) -> None:
+    source = _source(tmp_path, b"0123456789")
+    fake.drop_after = lambda r: r.url.path.endswith("/chunks/1")
+    with pytest.raises(OfflineError):
+        files.upload(source, NewFile(PARENT_ID, "doc.txt"), threading.Event())
+    fake.drop_after = lambda _: False
+    seen: list[int] = []
+
+    files.upload(source, NewFile(PARENT_ID, "doc.txt"), threading.Event(), seen.append)
+
+    assert seen == [8, 10]  # chunks 0 and 1 arrived before the answer was lost
+
+
+def test_download_progress_starts_from_the_partial_file_and_ends_at_the_size(
+    files: RemoteFiles, fake: FakeTransfers, tmp_path: Path
+) -> None:
+    fake.content = b"0123456789"
+    part = tmp_path / "x.part"
+    part.write_bytes(b"0123")
+    seen: list[int] = []
+
+    files.download(
+        NODE_ID,
+        hashlib.sha256(fake.content).hexdigest(),
+        10,
+        part,
+        threading.Event(),
+        seen.append,
+    )
+
+    assert seen[0] == 4 and seen[-1] == 10
+    assert seen == sorted(seen)

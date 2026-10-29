@@ -16,6 +16,7 @@ from dropshare_client.controllers.worker import Worker
 from dropshare_client.services.config import ConfigStore
 from dropshare_client.sync.binding import ForeignFolderError
 from dropshare_client.sync.engine import SyncListener, SyncProblem, SyncState
+from dropshare_client.sync.transfers import TransferEvent
 from dropshare_shared.schemas.users import UserOut
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,10 @@ class Engine(Protocol):
 
     def confirm_deletes(self, approved: bool) -> None: ...
 
+    def retry_now(self, key: str) -> None: ...
+
+    def local_changed(self, path: str) -> None: ...
+
 
 # (sync folder, user ID, display name, server URL, listener) -> an engine, not yet started.
 # Runs on the pool; raises ForeignFolderError if the folder holds another account's files.
@@ -89,6 +94,7 @@ class _Relay(QObject):
     deletes_reported = Signal(int, int)
     expiry_reported = Signal()
     progress_reported = Signal(int)
+    transfer_reported = Signal(object)  # TransferEvent
 
     def state_changed(self, state: SyncState, problem: SyncProblem | None) -> None:
         self.state_reported.emit(state.value, problem.value if problem else "")
@@ -105,6 +111,9 @@ class _Relay(QObject):
     def progress(self, pending: int) -> None:
         self.progress_reported.emit(pending)
 
+    def transfer(self, event: TransferEvent) -> None:
+        self.transfer_reported.emit(event)
+
 
 class SyncController(QObject):
     status_changed = Signal(str, str)  # SyncStatus value, message ("" when all is well)
@@ -113,6 +122,7 @@ class SyncController(QObject):
     session_expired = Signal(str)
     folder_rejected = Signal(str)  # the folder holds another account's files
     start_failed = Signal(str)  # syncing couldn't start; offer to try again
+    transfer_reported = Signal(object)  # TransferEvent, for the Transfers view (FR-CLIENT-08)
 
     def __init__(
         self,
@@ -179,6 +189,9 @@ class SyncController(QObject):
         relay.progress_reported.connect(
             lambda pending: self._progress_reported(generation, pending), queued
         )
+        relay.transfer_reported.connect(
+            lambda event: self._transfer_reported(generation, event), queued
+        )
         self._relay = relay
         return relay
 
@@ -229,6 +242,18 @@ class SyncController(QObject):
         self._paused = False
         if self._engine is not None:
             self._engine.resume()
+
+    def changed_here(self, paths: list[str]) -> None:
+        """The app itself changed these paths in the sync folder: look at them now rather
+        than waiting for the watcher (which may also report them; that's harmless)."""
+        if self._engine is not None:
+            for path in paths:
+                self._engine.local_changed(path)
+
+    def retry(self, key: str) -> None:
+        """Try a transfer again now: the Transfers view's Retry (FR-CLIENT-08)."""
+        if self._engine is not None:
+            self._engine.retry_now(key)
 
     def answer_deletes(self, approved: bool) -> None:
         if not approved:
@@ -308,6 +333,10 @@ class SyncController(QObject):
     def _progress_reported(self, generation: int, pending: int) -> None:
         if self._current(generation) and self._last_status[0] is SyncStatus.SYNCING:
             self._emit_status(SyncStatus.SYNCING, messages.items_left(pending))
+
+    def _transfer_reported(self, generation: int, event: TransferEvent) -> None:
+        if self._current(generation):
+            self.transfer_reported.emit(event)
 
     def _emit_status(self, status: SyncStatus, message: str) -> None:
         self._last_status = (status, message)

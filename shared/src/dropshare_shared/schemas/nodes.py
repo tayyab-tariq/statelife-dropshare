@@ -3,9 +3,9 @@
 import uuid
 from datetime import datetime
 from enum import StrEnum
-from typing import Annotated
+from typing import Annotated, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # Coarse bound on request size only; the real rules are dropshare_shared.naming (NFR-COMPAT-02),
 # applied by the server so a rejected name comes back with its NameProblem code.
@@ -57,6 +57,9 @@ class NodeOut(BaseModel):
     created_at: datetime
     modified_at: datetime
     modified_by_user_id: uuid.UUID
+    # Set on a mount: this folder shows that shared namespace, whose root holds its contents
+    # (OQ-31). Absent from servers from before sharing.
+    mount_namespace_id: uuid.UUID | None = None
 
 
 class FolderCreateIn(BaseModel):
@@ -64,6 +67,23 @@ class FolderCreateIn(BaseModel):
 
     parent_id: uuid.UUID
     name: str = Field(min_length=1, max_length=NAME_INPUT_MAX_LENGTH)
+
+
+class NodeUpdateIn(BaseModel):
+    """`PATCH /nodes/{id}`: rename (`name`), move (`parent_id`), or both, within the node's
+    namespace (FR-FILE-04, FR-SYNC-10). `if_revision` is the revision the client last saw."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    if_revision: int = Field(ge=1)
+    name: str | None = Field(default=None, min_length=1, max_length=NAME_INPUT_MAX_LENGTH)
+    parent_id: uuid.UUID | None = None
+
+    @model_validator(mode="after")
+    def _changes_something(self) -> Self:
+        if self.name is None and self.parent_id is None:
+            raise ValueError("Give a new name, a new parent, or both.")
+        return self
 
 
 class NodeDeleteQuery(BaseModel):
@@ -76,3 +96,6 @@ class NodeDeleteQuery(BaseModel):
 
     if_revision: int = Field(ge=1)
     if_cursor: int | None = Field(default=None, ge=0)
+    # Deleting your own shared folder (its mount): the cursor of the shared folder's journal you
+    # read up to. Refused if anything inside changed after it, as `if_cursor` (OQ-36).
+    if_mount_cursor: int | None = Field(default=None, ge=0)

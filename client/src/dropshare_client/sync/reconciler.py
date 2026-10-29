@@ -9,11 +9,17 @@ The rules that keep data safe live here:
   the folder is recreated where it was deleted and only the unchanged items go (FR-CONF-03).
 - Without a base (first sync, rebuilt index) nothing is ever deleted: items are linked when
   equal and kept twice when not.
+- A rename or move keeps the item's identity (FR-SYNC-10): a local one is found by file ID (or
+  by size and hash), a remote one by node ID. If both sides moved it differently, the
+  server's location wins (OQ-27). A move whose target is taken on the other side isn't paired:
+  the ordinary rules keep both items.
 """
 
 import bisect
+import unicodedata
 from collections.abc import Collection, Iterable, Mapping
-from dataclasses import dataclass
+from collections.abc import Set as AbstractSet
+from dataclasses import dataclass, field
 from enum import StrEnum
 
 from dropshare_client.store.records import Entry
@@ -39,6 +45,8 @@ class Op(StrEnum):
     RECORD = "record"  # index only: link equal items, refresh the base, or forget it
     DELETE_LOCAL = "delete_local"  # to the Recycle Bin (FR-SYNC-09)
     DELETE_REMOTE = "delete_remote"  # to the server trash
+    MOVE_LOCAL = "move_local"  # rename/move on disk to where the server has it
+    MOVE_REMOTE = "move_remote"  # rename/move on the server to where it is on disk
 
 
 # Ops that keep content on the local side / the server side below a deleted folder.
@@ -48,16 +56,21 @@ _ORDER = {
     Op.CONFLICT: 0,
     Op.MAKE_LOCAL_FOLDER: 1,
     Op.MAKE_REMOTE_FOLDER: 1,
-    Op.UPLOAD: 2,
-    Op.DOWNLOAD: 2,
-    Op.RECORD: 3,
-    Op.DELETE_LOCAL: 4,
-    Op.DELETE_REMOTE: 4,
+    Op.MOVE_LOCAL: 2,
+    Op.MOVE_REMOTE: 2,
+    Op.UPLOAD: 3,
+    Op.DOWNLOAD: 3,
+    Op.RECORD: 4,
+    Op.DELETE_LOCAL: 5,
+    Op.DELETE_REMOTE: 5,
 }
 
 
 @dataclass(frozen=True)
 class Action:
+    """For a move, `key` is where the item ends up, `local` and `remote` are the item where it
+    is on each side now, and `base` is the entry at its old key."""
+
     op: Op
     key: str
     local: LocalItem | None
@@ -112,10 +125,17 @@ def reconcile(
     """Actions for every key in `keys`. Keys at or below a `deferred` key are left alone."""
     deferred_set = set(deferred)
     ordered = sorted(set(keys))
+    moves, waiting = _find_moves(base, local, remote, deferred_set)
+    move_keys = {k for move in moves for k in move.keys}
     decisions: dict[str, Op] = {}
-    again = False
+    again = bool(waiting)
     for key in ordered:
-        if _is_deferred(key, deferred_set):
+        if _is_deferred(key, deferred_set) or _within_any(key, waiting):
+            continue
+        if _within_any(key, move_keys):
+            # Moves with its folder, or waits for the move: the next cycle compares it with
+            # the base at its new key.
+            again = again or key not in move_keys
             continue
         item = local.get(key)
         if item is not None and needs_hash(item, base.get(key)):
@@ -130,11 +150,197 @@ def reconcile(
     again = _folder_deletes(ordered, decisions, local, remote, base, deferred_set) or again
     again = _drop_below_conflicts(ordered, decisions) or again
 
-    actions = tuple(_ordered_actions(decisions, local, remote, base))
-    files = sorted(key for key, entry in base.items() if entry.kind == NodeKind.FILE)
+    for move in moves:
+        decisions[move.key] = move.op
+        again = True  # the moved item's own changes, and what's inside it, come next
+    actions = tuple(_ordered_actions(decisions, local, remote, base, moves))
+    # Files a move takes out of a deleted folder aren't deleted (FR-SYNC-08 counts).
+    moved_out = {move.base.key for move in moves}
+    files = sorted(
+        key
+        for key, entry in base.items()
+        if entry.kind == NodeKind.FILE and not _within_any(key, moved_out)
+    )
     local_deletes = sum(_files_at(a, files) for a in actions if a.op == Op.DELETE_LOCAL)
     remote_deletes = sum(_files_at(a, files) for a in actions if a.op == Op.DELETE_REMOTE)
     return Plan(actions, again, local_deletes, remote_deletes)
+
+
+@dataclass(frozen=True)
+class _Move:
+    op: Op
+    key: str  # where the item ends up
+    local_key: str  # where it is on disk now
+    local: LocalItem
+    remote: RemoteItem  # the node where the server has it now
+    base: Entry  # its entry, at the old key
+
+    @property
+    def keys(self) -> tuple[str, str, str]:
+        return self.base.key, self.key, self.local_key
+
+    def action(self) -> Action:
+        return Action(self.op, self.key, self.local, self.remote, self.base)
+
+
+@dataclass
+class _Candidates:
+    """Items new on disk (no base), by file ID and by content: where a moved item now is."""
+
+    by_id: dict[str, list[str]] = field(default_factory=dict)
+    by_content: dict[tuple[int, str], list[str]] = field(default_factory=dict)
+    claimed: set[str] = field(default_factory=set)
+
+    @classmethod
+    def of(cls, local: Mapping[str, LocalItem], base: Mapping[str, Entry]) -> "_Candidates":
+        found = cls()
+        for key, item in local.items():
+            if key in base:
+                continue
+            if item.file_id is not None:
+                found.by_id.setdefault(item.file_id, []).append(key)
+            # Empty files are all alike: their content says nothing about identity.
+            if item.kind == NodeKind.FILE and item.sha256 is not None and item.size > 0:
+                found.by_content.setdefault((item.size, item.sha256), []).append(key)
+        return found
+
+
+def _find_moves(
+    base: Mapping[str, Entry],
+    local: Mapping[str, LocalItem],
+    remote: Mapping[str, RemoteItem],
+    deferred: set[str],
+) -> tuple[list[_Move], set[str]]:
+    """Synced items now somewhere else on either side, and the old keys of moves that wait a
+    cycle (another item in the way here, or overlapping a move found first). Outermost
+    first; an item inside a moved folder follows in the next cycle, when its base has moved
+    along. A waiting key is left alone, never read as deleted (audit S1)."""
+    remote_at = {item.node.node_id: key for key, item in remote.items()}
+    candidates = _Candidates.of(local, base)
+    moves: list[_Move] = []
+    waiting: set[str] = set()
+    taken: set[str] = set()  # keys a move found so far covers
+    for key in sorted(base, key=lambda k: (paths.depth(k), k)):
+        if _is_deferred(key, deferred) or _within_any(key, taken):
+            continue
+        entry = base[key]
+        local_key = _local_location(key, entry, local, candidates)
+        remote_key = remote_at.get(entry.node_id)
+        if local_key is None or remote_key is None:
+            continue  # gone on a side: the ordinary rules decide
+        here, there = local[local_key], remote[remote_key]
+        if here.kind != entry.kind or there.node.kind != entry.kind:
+            continue
+        if remote_key != key or _renamed(there.path, entry.path):
+            decided = _server_move(key, local_key, remote_key, local, base)
+        elif local_key != key or _renamed(here.path, entry.path):
+            decided = _local_move(entry, local_key, remote, base)
+        else:
+            continue
+        if decided is None:
+            continue  # the ordinary rules keep both items
+        op, target = decided
+        if op is None or _is_deferred(target, deferred) or _within_any(target, taken):
+            waiting.add(key)
+            continue
+        if _within_any(local_key, taken):
+            waiting.add(key)
+            continue
+        candidates.claimed.add(local_key)
+        move = _Move(op, target, local_key, here, there, entry)
+        taken.update(move.keys)
+        moves.append(move)
+    return moves, waiting
+
+
+def _server_move(
+    key: str,
+    local_key: str,
+    target: str,
+    local: Mapping[str, LocalItem],
+    base: Mapping[str, Entry],
+) -> tuple[Op | None, str] | None:
+    """Moved on the server (and maybe here too: the server's location wins, OQ-27).
+    (None, target) to wait a cycle; None when the ordinary rules decide."""
+    if target != local_key and target in local and target not in base:
+        # Another item is in the way here: it becomes a conflicted copy this cycle (the
+        # ordinary rules), and the move follows in the next.
+        return None, target
+    if target != local_key and target in base and target != key:
+        return None
+    if _parent_gone(target, base, local):
+        return None  # its new folder was deleted here: FR-CONF-03 brings it back
+    return Op.MOVE_LOCAL, target
+
+
+def _local_move(
+    entry: Entry,
+    target: str,
+    remote: Mapping[str, RemoteItem],
+    base: Mapping[str, Entry],
+) -> tuple[Op | None, str] | None:
+    """Moved here only. None when the ordinary rules decide."""
+    other = remote.get(target)
+    if other is not None and other.node.node_id != entry.node_id:
+        return None  # something else has that name on the server
+    if _parent_gone(target, base, remote):
+        return None  # its new folder went to the server trash: FR-CONF-03 again
+    return Op.MOVE_REMOTE, target
+
+
+def _within_any(key: str, keys: AbstractSet[str]) -> bool:
+    """`key` is one of `keys` or below one: O(depth), whatever the number of keys."""
+    if not keys:
+        return False
+    return key in keys or any(a in keys for a in paths.ancestors(key) if a)
+
+
+def _parent_gone(key: str, base: Mapping[str, Entry], side: Mapping[str, object]) -> bool:
+    """The folder `key` would go into was synced, but is gone on `side` now. (A folder that
+    is new there is fine: it is created before moves run.)"""
+    parent = paths.parent_of(key)
+    return bool(parent) and parent in base and parent not in side
+
+
+def _local_location(
+    key: str, entry: Entry, local: Mapping[str, LocalItem], candidates: _Candidates
+) -> str | None:
+    """Where the synced item `entry` is on disk now. An item of the same kind still at its
+    key is taken to be it, edited in place: an editor that renames the original aside as a
+    backup (`report.txt~`) or a hard link elsewhere must not take its identity (audit S2).
+    Otherwise by file ID, then (files only) by identical size and content. None when it's
+    gone or ambiguous."""
+    here = local.get(key)
+    if here is not None:
+        return key if here.kind == entry.kind else None
+    # Renamed to a conflicted copy by the conflict step (FR-CONF-01), not by the user: the
+    # server's version keeps the original name, so this is never sent as a move.
+    copy_ok = paths.is_conflict_copy(paths.name_of(entry.path))
+
+    def usable(k: str) -> bool:
+        return k not in candidates.claimed and (
+            copy_ok or not paths.is_conflict_copy(paths.name_of(k))
+        )
+
+    if entry.file_id is not None:
+        found = [k for k in candidates.by_id.get(entry.file_id, []) if usable(k)]
+        if len(found) == 1:
+            return found[0]
+    if entry.kind == NodeKind.FILE and entry.sha256 is not None and entry.size > 0:
+        content = candidates.by_content.get((entry.size, entry.sha256), [])
+        found = [k for k in content if usable(k)]
+        if len(found) == 1:
+            return found[0]
+    return None
+
+
+def _renamed(path: str, base_path: str) -> bool:
+    """The name itself changed spelling (case, or anything else the key folds away)."""
+    return _nfc(paths.name_of(path)) != _nfc(paths.name_of(base_path))
+
+
+def _nfc(text: str) -> str:
+    return unicodedata.normalize("NFC", text)
 
 
 def _decide(
@@ -207,6 +413,8 @@ def _stale_base(local: LocalItem | None, remote: RemoteItem | None, base: Entry 
         return False
     if remote.node.revision != base.revision or local.path != base.path:
         return True
+    if base.file_id is None and local.file_id is not None:
+        return True  # an entry from before file IDs were kept for folders (move detection)
     return local.kind == NodeKind.FILE and (local.size, local.mtime_ns) != (
         base.size,
         base.mtime_ns,
@@ -285,6 +493,7 @@ def _ordered_actions(
     local: Mapping[str, LocalItem],
     remote: Mapping[str, RemoteItem],
     base: Mapping[str, Entry],
+    moves: Iterable[_Move],
 ) -> list[Action]:
     """Conflict renames, then folder creates and folder links (parents first, so uploads find
     the right parent), transfers, other index-only updates, and deletes last (children first)."""
@@ -298,8 +507,10 @@ def _ordered_actions(
         level = paths.depth(key)
         return rank, -level if rank == _ORDER[Op.DELETE_LOCAL] else level, key
 
+    move_actions = {move.key: move.action() for move in moves}
     return [
-        Action(decisions[key], key, local.get(key), remote.get(key), base.get(key))
+        move_actions.get(key)
+        or Action(decisions[key], key, local.get(key), remote.get(key), base.get(key))
         for key in sorted(decisions, key=order)
     ]
 

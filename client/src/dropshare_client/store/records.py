@@ -36,6 +36,8 @@ class RemoteNode:
     sha256: str | None
     revision: int
     modified_at: datetime
+    # Set on a mount: this folder shows that shared namespace (OQ-31).
+    mount_namespace_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,9 @@ class NamespaceCursor:
     namespace_id: uuid.UUID
     root_node_id: uuid.UUID
     cursor: int
+    # A shared folder's: the mount it is followed through. Another mount (the folder left and
+    # added again) means starting over; none means letting it go (sync/core._follow_mounts).
+    mount_node_id: uuid.UUID | None = None
 
 
 @dataclass(frozen=True)

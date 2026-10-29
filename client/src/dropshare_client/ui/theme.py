@@ -10,12 +10,13 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QPointF, QRectF, QSize, Qt
+from PySide6.QtCore import QObject, QPointF, QRect, QRectF, QSize, Qt
 from PySide6.QtGui import (
     QColor,
     QFont,
     QGuiApplication,
     QIcon,
+    QIconEngine,
     QPainter,
     QPalette,
     QPen,
@@ -69,7 +70,11 @@ DIALOG_WIDTH = 400  # sign-in and the dialogs that share its frame
 BRAND_STRIP_HEIGHT = 4
 LOGO_HEIGHT = 64
 HEADER_MARK_SIZE = 24
-MAIN_WINDOW_MIN_SIZE = QSize(720, 520)
+MAIN_WINDOW_MIN_SIZE = QSize(900, 600)  # visual-design.md §6, with the sidebar
+SIDEBAR_WIDTH = 220
+PROGRESS_COLUMN_WIDTH = 120  # the Transfers view's progress bars
+TOOLBAR_ICON_SIZE = 20  # visual-design.md §5: 16 in tables and menus, 20 in toolbars
+SHARE_RESULTS_HEIGHT = 160  # the Share dialog's search results: about five rows
 STATE_MAX_WIDTH = 360  # width of the messages in the loading, error and empty states
 
 
@@ -205,6 +210,13 @@ def _css(colour: QColor) -> str:
     return f"rgba({colour.red()}, {colour.green()}, {colour.blue()}, {colour.alpha()})"
 
 
+def on_danger(t: Tokens) -> QColor:
+    """Text on a danger fill ("Move to Recycle Bin"): whichever reads best on it."""
+    return max(
+        (t.on_primary, t.bg_surface, t.text_primary), key=lambda c: contrast_ratio(c, t.danger)
+    )
+
+
 def build_palette(t: Tokens) -> QPalette:
     """For what Fusion paints itself (check boxes, radio buttons, focus, text selection)."""
     roles = QPalette.ColorRole
@@ -275,6 +287,15 @@ QPushButton[variant="primary"] {{
 QPushButton[variant="primary"]:hover {{ background: {_css(t.primary_hover)}; }}
 QPushButton[variant="primary"]:pressed {{ background: {_css(t.primary_pressed)}; }}
 QPushButton[variant="primary"]:focus {{ border-color: {_css(t.text_primary)}; }}
+QPushButton[variant="danger"] {{
+    background: {_css(t.danger)}; color: {_css(on_danger(t))};
+    border-color: {_css(t.danger)}; font-weight: 600;
+}}
+QPushButton[variant="danger"]:focus {{ border-color: {_css(t.text_primary)}; }}
+QPushButton[variant="danger"]:disabled {{
+    background: {_css(t.border)}; border-color: {_css(t.border)};
+    color: {_css(t.text_disabled)};
+}}
 QPushButton[variant="primary"]:disabled {{
     background: {_css(t.border)}; border-color: {_css(t.border)};
     color: {_css(t.text_disabled)};
@@ -302,6 +323,36 @@ QProgressBar {{
     min-height: 6px; max-height: 6px;
 }}
 QProgressBar::chunk {{ background: {_css(t.primary)}; border-radius: 3px; }}
+
+#navList {{
+    background: {_css(t.bg_window)}; border: none; outline: none;
+    border-right: 1px solid {_css(t.border)}; padding: {s.sm}px 0;
+}}
+#navList::item {{
+    min-height: 40px; padding: 0 {s.lg}px; color: {_css(t.text_primary)};
+    border-left: 3px solid transparent;
+}}
+#navList::item:hover {{ background: {_css(hover)}; }}
+#navList::item:selected {{
+    background: {_css(t.bg_selected)}; color: {_css(t.text_primary)};
+    border-left: 3px solid {_css(t.primary)};
+}}
+#navList:focus {{ border: 2px solid {_css(t.primary)}; }}
+
+QTableView#fileTable, QTableView#transferTable {{
+    background: {_css(t.bg_surface)}; color: {_css(t.text_primary)};
+    border: none; gridline-color: transparent;
+    selection-background-color: {_css(t.bg_selected)}; selection-color: {_css(t.text_primary)};
+}}
+QTableView#fileTable::item, QTableView#transferTable::item {{ padding: 0 {s.sm}px; }}
+QTableView#fileTable::item:hover, QTableView#transferTable::item:hover {{
+    background: {_css(hover)};
+}}
+QHeaderView::section {{
+    background: {_css(t.bg_surface)}; color: {_css(t.text_secondary)};
+    border: none; border-bottom: 1px solid {_css(t.border)};
+    padding: {s.xs}px {s.sm}px;
+}}
 
 QScrollBar:vertical {{ background: transparent; width: {s.sm}px; margin: 0; }}
 QScrollBar:horizontal {{ background: transparent; height: {s.sm}px; margin: 0; }}
@@ -369,6 +420,92 @@ def _render_svg(name: str, width: int, height: int, ratio: float) -> QPixmap:
     painter = QPainter(pixmap)
     QSvgRenderer(str(_BRAND_DIR / name)).render(painter, QRectF(0, 0, width, height))
     painter.end()
+    return pixmap
+
+
+_ICON_DIR = Path(__file__).resolve().parent.parent / "resources" / "icons"
+_icon_cache: dict[tuple[str, str, int, float], QPixmap] = {}
+# File-type icons by extension, in one place (visual-design.md §5); anything else: document.
+_FILE_ICONS = {
+    **dict.fromkeys(("pdf",), "document_pdf"),
+    **dict.fromkeys(("xls", "xlsx", "xlsm", "csv", "ods"), "document_table"),
+    **dict.fromkeys(
+        ("png", "jpg", "jpeg", "gif", "bmp", "tif", "tiff", "heic", "webp", "svg"), "image"
+    ),
+    **dict.fromkeys(("zip", "7z", "rar", "tar", "gz", "tgz"), "folder_zip"),
+}
+
+
+class _TintedIcon(QIconEngine):
+    """Renders the SVG tinted, at exactly the scale it is shown at (125%, 175%, 250%… look as
+    sharp as 100% and 200%), and on a selected row in high contrast with the system's text
+    colour for selections. Rendered pixmaps are cached (_tinted)."""
+
+    def __init__(self, name: str, role: str) -> None:
+        super().__init__()
+        self._name, self._role = name, role
+
+    def _colour(self, mode: QIcon.Mode) -> QColor:
+        if mode == QIcon.Mode.Selected and _high_contrast():
+            return QGuiApplication.palette().color(QPalette.ColorRole.HighlightedText)
+        if mode == QIcon.Mode.Disabled:
+            return QGuiApplication.palette().color(
+                QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text
+            )
+        return _icon_colour(self._role)
+
+    def scaledPixmap(  # noqa: N802 - Qt API
+        self, size: QSize, mode: QIcon.Mode, state: QIcon.State, scale: float
+    ) -> QPixmap:
+        side = min(size.width(), size.height())
+        return _tinted(self._name, self._colour(mode), side, max(scale, 1.0))
+
+    def pixmap(self, size: QSize, mode: QIcon.Mode, state: QIcon.State) -> QPixmap:
+        return self.scaledPixmap(size, mode, state, 1.0)
+
+    def paint(self, painter: QPainter, rect: QRect, mode: QIcon.Mode, state: QIcon.State) -> None:
+        ratio = painter.device().devicePixelRatioF() if painter.device() else 1.0
+        painter.drawPixmap(rect, self.scaledPixmap(rect.size(), mode, state, ratio))
+
+    def clone(self) -> "_TintedIcon":
+        return _TintedIcon(self._name, self._role)
+
+
+def icon(name: str, *, role: str = "secondary") -> QIcon:
+    """One of resources/icons, tinted for the current theme: `role` "secondary" (text
+    secondary) or "primary" (brand). In high contrast it takes the system's text colour, so
+    the user's contrast theme wins (visual-design.md §1). Any size; the widget picks it."""
+    return QIcon(_TintedIcon(name, role))
+
+
+def file_icon(name: str, *, folder: bool) -> QIcon:
+    if folder:
+        return icon("folder")
+    extension = name.rpartition(".")[2].casefold() if "." in name else ""
+    return icon(_FILE_ICONS.get(extension, "document"))
+
+
+def _icon_colour(role: str) -> QColor:
+    if _high_contrast():
+        return QGuiApplication.palette().color(QPalette.ColorRole.Text)
+    t = current_tokens()
+    return t.primary if role == "primary" else t.text_secondary
+
+
+def _tinted(name: str, colour: QColor, size: int, ratio: float) -> QPixmap:
+    key = (name, colour.name(QColor.NameFormat.HexArgb), size, ratio)
+    cached = _icon_cache.get(key)
+    if cached is not None:
+        return cached
+    pixmap = QPixmap(round(size * ratio), round(size * ratio))
+    pixmap.setDevicePixelRatio(ratio)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    QSvgRenderer(str(_ICON_DIR / f"{name}.svg")).render(painter, QRectF(0, 0, size, size))
+    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+    painter.fillRect(QRectF(0, 0, size, size), colour)
+    painter.end()
+    _icon_cache[key] = pixmap
     return pixmap
 
 

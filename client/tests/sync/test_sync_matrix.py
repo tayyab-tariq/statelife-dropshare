@@ -268,12 +268,16 @@ def test_a_cycle_for_a_folder_looks_inside_it(device: Device, server: FakeFileSe
     assert server.trashed() == []
 
 
-def test_case_only_folder_rename_deletes_nothing(device: Device, server: FakeFileServer) -> None:
+def test_case_only_folder_rename_is_sent_as_a_rename(
+    device: Device, server: FakeFileServer
+) -> None:
     device.write("Proj/a.txt", A)
     device.sync()
+    folder_id = next(n.id for n in server.nodes.values() if n.name == "Proj")
     (device.root / "Proj").rename(device.root / "PROJ")
 
     device.sync(local=["Proj", "PROJ"])
 
     assert server.trashed() == []
-    assert server.tree() == {"Proj": None, "Proj/a.txt": A}
+    assert server.tree() == {"PROJ": None, "PROJ/a.txt": A}
+    assert server.nodes[folder_id].name == "PROJ"

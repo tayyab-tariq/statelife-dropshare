@@ -140,7 +140,7 @@ def api(db_settings: Settings) -> Iterator[TestClient]:
     with TestClient(
         create_app(db_settings),
         raise_server_exceptions=False,
-        headers={"X-Client-Version": "0.1.0"},
+        headers={"X-Client-Version": "0.2.0"},
     ) as client:
         yield client
 

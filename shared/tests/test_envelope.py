@@ -80,3 +80,18 @@ def test_user_role_accepts_roles_from_a_newer_server() -> None:
     )
 
     assert user.role == "auditor"
+
+
+def test_a_user_from_a_server_that_doesnt_send_usage_reads_as_none_used() -> None:
+    user = UserOut.model_validate(
+        {
+            "id": str(uuid.uuid4()),
+            "username": "a",
+            "email": "a@example.com",
+            "display_name": "A",
+            "role": "user",
+            "quota_bytes": 10,
+        }
+    )
+
+    assert user.used_bytes == 0

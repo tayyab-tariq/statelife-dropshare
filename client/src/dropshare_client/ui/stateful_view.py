@@ -80,11 +80,11 @@ class StatefulView(QStackedWidget):
         self._loading_timer.setInterval(_LOADING_DELAY_MS)
         self._loading_timer.timeout.connect(lambda: self.setCurrentWidget(self._loading))
 
-    def show_loading(self, message: str = "Loading…") -> None:
-        """Keeps showing loaded content while refreshing; otherwise shows a spinner after a
-        short delay."""
+    def show_loading(self, message: str = "Loading…", *, keep_content: bool = True) -> None:
+        """Keeps showing loaded content while refreshing (`keep_content`); otherwise, as
+        when going somewhere new, shows a spinner after a short delay."""
         self._loading_label.setText(message)
-        if self.currentWidget() is not self._content:
+        if not keep_content or self.currentWidget() is not self._content:
             self.setCurrentWidget(self._blank)
             self._loading_timer.start()
 
@@ -97,10 +97,13 @@ class StatefulView(QStackedWidget):
             QAccessibleEvent(self._error_label, QAccessible.Event.Alert)
         )
 
-    def show_empty(self, message: str, action_text: str) -> None:
+    def show_empty(self, message: str, action_text: str = "") -> None:
+        """With `action_text`, the button for the next thing to do; without, just the text
+        (when there is nothing the user can do here)."""
         self._loading_timer.stop()
         self._empty_label.setText(message)
         self._empty_button.setText(action_text)
+        self._empty_button.setVisible(bool(action_text))
         self.setCurrentWidget(self._empty)
 
     def show_content(self) -> None:

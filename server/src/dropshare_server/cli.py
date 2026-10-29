@@ -19,6 +19,7 @@ from dropshare_server.core.config import Settings
 from dropshare_server.core.db import create_db_engine, create_session_factory
 from dropshare_server.core.errors import AppError
 from dropshare_server.services import audit as audit_service
+from dropshare_server.services import groups as group_service
 from dropshare_server.services import uploads as upload_service
 from dropshare_server.services import users as user_service
 from dropshare_server.services.audit import AuditTarget
@@ -97,6 +98,56 @@ def _list_users(
             f"{user.username:<24} {user.email:<32} {user.role:<6} {status.value:<9} "
             f"{user.quota_bytes / _GIB:g}"
         )
+    return 0
+
+
+def _create_group(
+    args: argparse.Namespace, sessions: sessionmaker[Session], _: Settings, ctx: CallContext
+) -> int:
+    with sessions.begin() as session:
+        group_service.create_group(session, ctx, args.group_name)
+    _out(f"Created group '{args.group_name.strip()}'.")
+    return 0
+
+
+def _delete_group(
+    args: argparse.Namespace, sessions: sessionmaker[Session], _: Settings, ctx: CallContext
+) -> int:
+    with sessions.begin() as session:
+        group_service.delete_group(session, ctx, args.group_name)
+    _out(f"Deleted group '{args.group_name}'; access shared with it was removed.")
+    return 0
+
+
+def _add_group_member(
+    args: argparse.Namespace, sessions: sessionmaker[Session], _: Settings, ctx: CallContext
+) -> int:
+    with sessions.begin() as session:
+        group_service.add_member(session, ctx, args.group_name, args.username)
+    _out(f"Added '{args.username}' to '{args.group_name}'.")
+    return 0
+
+
+def _remove_group_member(
+    args: argparse.Namespace, sessions: sessionmaker[Session], _: Settings, ctx: CallContext
+) -> int:
+    with sessions.begin() as session:
+        group_service.remove_member(session, ctx, args.group_name, args.username)
+    _out(
+        f"Removed '{args.username}' from '{args.group_name}'; access through the group ends "
+        "at their next sync."
+    )
+    return 0
+
+
+def _list_groups(
+    _args: argparse.Namespace, sessions: sessionmaker[Session], _: Settings, ctx: CallContext
+) -> int:
+    with sessions.begin() as session:
+        groups = group_service.list_groups(session, ctx)
+    _out(f"{'GROUP':<40} MEMBERS")
+    for group in groups:
+        _out(f"{group.name:<40} {group.member_count}")
     return 0
 
 
@@ -199,6 +250,38 @@ def _build_parser() -> argparse.ArgumentParser:
         handler=_list_users, audit_action=AuditAction.USER_LISTED
     )
 
+    group_commands = groups.add_parser("groups", help="Manage groups for sharing").add_subparsers(
+        dest="command", required=True
+    )
+    for name, handler, action, help_text in (
+        ("create", _create_group, AuditAction.GROUP_CREATED, "Create a group"),
+        (
+            "delete",
+            _delete_group,
+            AuditAction.GROUP_DELETED,
+            "Delete a group; access shared with it ends",
+        ),
+    ):
+        command = group_commands.add_parser(name, help=help_text)
+        command.add_argument("group_name", metavar="GROUP")
+        command.set_defaults(handler=handler, audit_action=action)
+    for name, handler, action, help_text in (
+        ("add-member", _add_group_member, AuditAction.GROUP_MEMBER_ADDED, "Add a user to a group"),
+        (
+            "remove-member",
+            _remove_group_member,
+            AuditAction.GROUP_MEMBER_REMOVED,
+            "Remove a user from a group",
+        ),
+    ):
+        command = group_commands.add_parser(name, help=help_text)
+        command.add_argument("group_name", metavar="GROUP")
+        command.add_argument("username")
+        command.set_defaults(handler=handler, audit_action=action)
+    group_commands.add_parser("list", help="List groups and their member counts").set_defaults(
+        handler=_list_groups, audit_action=AuditAction.GROUP_LISTED
+    )
+
     audit = groups.add_parser("audit", help="Audit log").add_subparsers(
         dest="command", required=True
     )
@@ -230,12 +313,18 @@ def _record_failure(
     if args.audit_action is None:
         return
     username: str | None = getattr(args, "username", None)
+    group_name: str | None = getattr(args, "group_name", None)
+    target = None
+    if group_name:
+        target = AuditTarget(type="group", id=group_name, name=group_name)
+    elif username:
+        target = AuditTarget(type="user", id=username, name=username)
     audit_service.record_now(
         sessions,
         ctx,
         args.audit_action,
         AuditOutcome.FAILURE,
-        AuditTarget(type="user", id=username, name=username) if username else None,
+        target,
         {"command": f"{args.group} {args.command}", "code": code},
     )
 
@@ -268,6 +357,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             # Two admins creating the same user at once: the database's unique index caught it.
             _record_failure(sessions, ctx, args, "NAME_CONFLICT")
             _err("That username or email is already in use.")
+            return 1
+        if "UQ_GROUPS_" in str(exc.orig).upper() or "PK_GROUP_MEMBERS" in str(exc.orig).upper():
+            _record_failure(sessions, ctx, args, "NAME_CONFLICT")
+            _err("That group or membership was just created by someone else.")
             return 1
         return _database_error(exc)
     except SQLAlchemyError as exc:

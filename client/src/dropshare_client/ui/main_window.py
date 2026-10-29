@@ -1,4 +1,6 @@
-"""The main window for M4: account, sync folder and status. The file browser comes later (F5)."""
+"""The main window: a header with the account actions, sections down the side (My files,
+Shared with me, Transfers, and the overview of account and sync folder), and the chosen
+section's page."""
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QCloseEvent
@@ -7,8 +9,11 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QPushButton,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -17,6 +22,7 @@ from dropshare_client.ui import theme
 from dropshare_client.ui.stateful_view import StatefulView
 from dropshare_shared.schemas.users import UserOut
 
+OVERVIEW = "Overview"
 _PAUSE = "&Pause syncing"
 _RESUME = "&Resume syncing"
 
@@ -133,12 +139,28 @@ class MainWindow(QMainWindow):
             button.setProperty("variant", "subtle")
             actions.addWidget(button)
 
+        # Sections down the side (ui.md §2); the overview is the first.
+        self._nav = QListWidget()
+        self._nav.setObjectName("navList")
+        self._nav.setAccessibleName("Sections")
+        self._nav.setMinimumWidth(theme.SIDEBAR_WIDTH)  # grows with larger text sizes
+        self._nav.setMaximumWidth(theme.SIDEBAR_WIDTH * 2)
+        self._pages = QStackedWidget()
+        self._nav.currentRowChanged.connect(self._pages.setCurrentIndex)
+        self.add_page(OVERVIEW, self._view)
+        self._nav.setCurrentRow(0)
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+        body.addWidget(self._nav)
+        body.addWidget(self._pages, stretch=1)
+
         central = QWidget()
         outer = QVBoxLayout(central)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         outer.addWidget(header)
-        outer.addWidget(self._view, stretch=1)
+        outer.addLayout(body, stretch=1)
         self.setCentralWidget(central)
 
         self._open_folder.clicked.connect(self.open_folder_requested)
@@ -152,14 +174,41 @@ class MainWindow(QMainWindow):
     def view(self) -> StatefulView:
         return self._view
 
+    def add_page(self, title: str, page: QWidget, position: int | None = None) -> None:
+        """A section in the sidebar, shown when chosen there; at the end by default."""
+        row = self._nav.count() if position is None else position
+        current = self._nav.currentRow()
+        self._nav.insertItem(row, QListWidgetItem(title))
+        self._pages.insertWidget(row, page)
+        if current >= 0 and row <= current:  # the same section stays shown
+            self._nav.setCurrentRow(current + 1)
+
+    def show_page(self, title: str) -> None:
+        for row in range(self._nav.count()):
+            if self._nav.item(row).text() == title:
+                self._nav.setCurrentRow(row)
+                return
+        raise KeyError(title)
+
+    def current_page_title(self) -> str:
+        item = self._nav.currentItem()
+        return "" if item is None else item.text()
+
     def set_hide_on_close(self, hide: bool) -> None:
         """Without a system tray there is nothing to hide into: closing then quits."""
         self._hide_on_close = hide
 
-    def show_loading(self, message: str) -> None:
+    def show_loading(self, message: str, *, switch_page: bool = True) -> None:
+        """App-level states (signing in, offline, syncing couldn't start) show on the overview.
+        `switch_page` opens it too: before signing in nothing else works; once signed in, a
+        passing state (offline, retrying) mustn't pull the user out of what they're doing."""
+        if switch_page:
+            self.show_page(OVERVIEW)
         self._view.show_loading(message)
 
-    def show_error(self, message: str) -> None:
+    def show_error(self, message: str, *, switch_page: bool = True) -> None:
+        if switch_page:
+            self.show_page(OVERVIEW)
         self._view.show_error(message)
 
     def show_account(self, user: UserOut, server: str, folder: str | None, status: str) -> None:

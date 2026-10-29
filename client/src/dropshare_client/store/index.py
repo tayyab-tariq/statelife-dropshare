@@ -7,6 +7,7 @@ never deletes anything (reconciler.py).
 
 import json
 import logging
+import sqlite3
 import uuid
 from collections.abc import Iterable
 from datetime import UTC, datetime
@@ -29,6 +30,7 @@ from sqlalchemy import (
     select,
 )
 from sqlalchemy.engine import URL
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from sqlalchemy.pool import ConnectionPoolEntry
 from sqlalchemy.sql.elements import ColumnElement
@@ -47,7 +49,7 @@ from dropshare_shared.schemas.nodes import NodeKind
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = "1"
+_SCHEMA_VERSION = "2"  # 2: mounts of shared folders
 _ACTIVITY_KEPT = 1000
 _SIDE_FILES = ("-wal", "-shm", "-journal")
 _JOURNAL_DATA = TypeAdapter(dict[str, str])
@@ -106,6 +108,7 @@ class _RemoteNode(_Base):
     sha256: Mapped[str | None] = mapped_column(String(64))
     revision: Mapped[int] = mapped_column(BigInteger)
     modified_at: Mapped[datetime] = mapped_column(_UtcDateTime)
+    mount_namespace_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
 
 
 class _Cursor(_Base):
@@ -113,6 +116,7 @@ class _Cursor(_Base):
     namespace_id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True)
     root_node_id: Mapped[uuid.UUID] = mapped_column(Uuid)
     cursor: Mapped[int] = mapped_column(BigInteger)
+    mount_node_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
 
 
 class _Journal(_Base):
@@ -179,6 +183,7 @@ def _remote(row: _RemoteNode) -> RemoteNode:
         sha256=row.sha256,
         revision=row.revision,
         modified_at=row.modified_at,
+        mount_namespace_id=row.mount_namespace_id,
     )
 
 
@@ -193,7 +198,41 @@ def _remote_row(node: RemoteNode) -> _RemoteNode:
         sha256=node.sha256,
         revision=node.revision,
         modified_at=node.modified_at,
+        mount_namespace_id=node.mount_namespace_id,
     )
+
+
+_READ_BATCH = 500  # well under SQLite's bound-variable limit
+
+
+def read_entries(path: Path, node_ids: Iterable[uuid.UUID]) -> dict[uuid.UUID, Entry]:
+    """The synced entries for these nodes, read from another thread than the engine's
+    (the file browser's sync column). Opens the file read-only, so it never creates,
+    migrates or locks it for writing; WAL lets it read while the engine writes. Empty when
+    there is no index (yet), or it is mid-rebuild."""
+    if not path.exists():
+        return {}
+    # The path as a proper file: URI (percent-encoded: a "#" or "%" in a user name stays part
+    # of the path), opened read-only by sqlite3 itself.
+    uri = f"{path.resolve().as_uri()}?mode=ro"
+    engine = create_engine("sqlite://", creator=lambda: sqlite3.connect(uri, uri=True))
+    wanted = list(node_ids)
+    found: dict[uuid.UUID, Entry] = {}
+    try:
+        with engine.connect() as connection:
+            for start in range(0, len(wanted), _READ_BATCH):
+                rows = connection.execute(
+                    select(_Entry).where(_Entry.node_id.in_(wanted[start : start + _READ_BATCH]))
+                )
+                for row in rows:
+                    entry = _Entry(**row._mapping)
+                    found[entry.node_id] = _entry(entry)
+    except OperationalError:
+        logger.info("The index can't be read right now; showing no sync states")
+        return {}
+    finally:
+        engine.dispose()
+    return found
 
 
 class Index:
@@ -279,6 +318,38 @@ class Index:
                 )
             )
 
+    def move_entries(self, entry: Entry, key: str, path: str) -> None:
+        """Record that `entry` (and, for a folder, everything below it) now lives at `key` /
+        `path`, in one transaction. Items below keep their own spelling below the new path.
+        `entry` carries the moved item's new revision; nothing else about it changes."""
+        with self._sessions.begin() as session:
+            rows = list(session.scalars(select(_Entry).where(_under(_Entry.key, entry.key))))
+            session.execute(delete(_Entry).where(_under(_Entry.key, entry.key)))
+            session.execute(delete(_Entry).where(_under(_Entry.key, key)))
+            session.flush()
+            depth = len(entry.key.split("/"))
+            for row in rows:
+                if row.key == entry.key:
+                    new_key, new_path, revision = key, path, entry.revision
+                else:
+                    # Keys and paths have the same components; casefolding can change lengths.
+                    new_key = "/".join([key, *row.key.split("/")[depth:]])
+                    new_path = "/".join([path, *row.path.split("/")[depth:]])
+                    revision = row.revision
+                session.add(
+                    _Entry(
+                        key=new_key,
+                        path=new_path,
+                        node_id=row.node_id,
+                        kind=row.kind,
+                        revision=revision,
+                        sha256=row.sha256,
+                        size=row.size,
+                        mtime_ns=row.mtime_ns,
+                        file_id=row.file_id,
+                    )
+                )
+
     def remove_entries(self, key: str, *, subtree: bool) -> None:
         with self._sessions.begin() as session:
             condition = _under(_Entry.key, key) if subtree else _Entry.key == key
@@ -296,15 +367,39 @@ class Index:
     def cursors(self) -> list[NamespaceCursor]:
         with self._sessions() as session:
             return [
-                NamespaceCursor(row.namespace_id, row.root_node_id, row.cursor)
+                NamespaceCursor(row.namespace_id, row.root_node_id, row.cursor, row.mount_node_id)
                 for row in session.scalars(select(_Cursor))
             ]
 
-    def start_namespace(self, namespace_id: uuid.UUID, root_node_id: uuid.UUID) -> None:
+    def start_namespace(
+        self,
+        namespace_id: uuid.UUID,
+        root_node_id: uuid.UUID,
+        mount_node_id: uuid.UUID | None = None,
+    ) -> None:
         """Follow a namespace from the start of its journal, dropping anything known of it."""
         with self._sessions.begin() as session:
             session.execute(delete(_RemoteNode).where(_RemoteNode.namespace_id == namespace_id))
-            session.merge(_Cursor(namespace_id=namespace_id, root_node_id=root_node_id, cursor=0))
+            session.merge(
+                _Cursor(
+                    namespace_id=namespace_id,
+                    root_node_id=root_node_id,
+                    cursor=0,
+                    mount_node_id=mount_node_id,
+                )
+            )
+
+    def forget_namespace(self, namespace_id: uuid.UUID) -> None:
+        """Stop following a namespace (a shared folder left or no longer accessible)."""
+        with self._sessions.begin() as session:
+            session.execute(delete(_RemoteNode).where(_RemoteNode.namespace_id == namespace_id))
+            session.execute(delete(_Cursor).where(_Cursor.namespace_id == namespace_id))
+
+    def entry_of(self, node_id: uuid.UUID) -> Entry | None:
+        """The synced entry of a node, wherever it is."""
+        with self._sessions() as session:
+            row = session.scalars(select(_Entry).where(_Entry.node_id == node_id)).first()
+            return None if row is None else _entry(row)
 
     def remote_nodes(self) -> list[RemoteNode]:
         with self._sessions() as session:
@@ -330,6 +425,7 @@ class Index:
                         namespace_id=cursor.namespace_id,
                         root_node_id=cursor.root_node_id,
                         cursor=cursor.cursor,
+                        mount_node_id=cursor.mount_node_id,
                     )
                 )
 
@@ -341,6 +437,13 @@ class Index:
             session.add(row)
             session.flush()
             return row.id
+
+    def update_journal(self, journal_id: int, data: dict[str, str]) -> None:
+        """Record what a step decided, so a retry after a crash decides the same."""
+        with self._sessions.begin() as session:
+            row = session.get(_Journal, journal_id)
+            if row is not None:
+                row.data = _JOURNAL_DATA.dump_json(data).decode()
 
     def finish(self, journal_id: int) -> None:
         with self._sessions.begin() as session:

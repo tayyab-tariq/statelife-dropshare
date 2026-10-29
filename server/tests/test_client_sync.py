@@ -22,6 +22,7 @@ from dropshare_client.services.tokens import TokenStore
 from dropshare_client.store.index import Index
 from dropshare_client.sync.core import CycleResult, SyncCore
 from dropshare_client.sync.engine import SyncEngine, SyncProblem, SyncState
+from dropshare_client.sync.transfers import TransferEvent
 from dropshare_shared.schemas.auth import TokenPairOut
 
 
@@ -68,8 +69,8 @@ class Computer:
         self.api = ApiClient(
             "http://testserver",
             tokens,
-            client_version="0.1.0",
-            user_agent="DropShare/0.1.0 (test)",
+            client_version="0.2.0",
+            user_agent="DropShare/0.2.0 (test)",
             transport=httpx.MockTransport(forward),
         )
         self.files = RemoteFiles(self.api)
@@ -327,6 +328,9 @@ class _States:
     def progress(self, pending: int) -> None:
         return None
 
+    def transfer(self, event: TransferEvent) -> None:
+        return None
+
 
 def test_a_saved_file_appears_on_the_other_computer_within_10_seconds(
     api: TestClient, signed_in: dict[str, str], tmp_path: Path
@@ -362,3 +366,53 @@ def test_a_saved_file_appears_on_the_other_computer_within_10_seconds(
     finally:
         for engine in engines:
             engine.stop()
+
+
+def test_a_renamed_folder_reaches_the_other_computer_as_one_move(
+    computers: tuple[Computer, Computer],
+) -> None:
+    """FR-SYNC-10 against the real server: same node IDs, nothing trashed, nothing re-sent."""
+    laptop, desktop = computers
+    laptop.write("Projects/2026/plan.txt", b"plan")
+    laptop.write("Projects/notes.txt", b"notes")
+    laptop.sync()
+    desktop.sync()
+    before = laptop.index.entry("projects/2026/plan.txt")
+    assert before is not None
+    laptop.sent.clear()
+
+    (laptop.root / "Projects").rename(laptop.root / "Archive")
+    laptop.sync()
+    desktop.sync()
+
+    expected = {
+        "Archive": None,
+        "Archive/2026": None,
+        "Archive/2026/plan.txt": b"plan",
+        "Archive/notes.txt": b"notes",
+    }
+    assert laptop.tree() == desktop.tree() == expected
+    assert [r.method for r in laptop.sent if r.method not in ("GET", "POST")] == ["PATCH"]
+    after = desktop.index.entry("archive/2026/plan.txt")
+    assert after is not None and after.node_id == before.node_id
+    assert desktop.bin.items() == []
+
+
+def test_a_move_whose_answer_was_lost_is_not_sent_again(
+    computers: tuple[Computer, Computer],
+) -> None:
+    laptop, desktop = computers
+    laptop.write("a.txt", b"a")
+    laptop.write("Dest/keep.txt", b"k")
+    laptop.sync()
+    laptop.lose_answer = lambda r: r.method == "PATCH"
+
+    (laptop.root / "a.txt").rename(laptop.root / "Dest" / "b.txt")
+    with pytest.raises(OfflineError):
+        laptop.sync()
+    laptop.sync()  # sees the move done on the server, and only records it
+    desktop.sync()
+
+    patches = [r for r in laptop.sent if r.method == "PATCH"]
+    assert len(patches) == 1
+    assert plain(desktop.tree()) == {"Dest": None, "Dest/b.txt": b"a", "Dest/keep.txt": b"k"}
