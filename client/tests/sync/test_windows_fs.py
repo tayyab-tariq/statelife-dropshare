@@ -21,6 +21,7 @@ pytestmark = pytest.mark.windows_only
 
 _GENERIC_READ = 0x80000000
 _OPEN_EXISTING = 3
+_FILE_ATTRIBUTE_READONLY = 0x1
 _FILE_ATTRIBUTE_HIDDEN = 0x2
 _INVALID_HANDLE = ctypes.c_void_p(-1).value
 
@@ -221,3 +222,43 @@ def _junction(link: Path, target: Path) -> None:
         check=True,
         capture_output=True,
     )
+
+
+def _attributes(path: Path) -> int:
+    if sys.platform != "win32":
+        raise RuntimeError("Windows only")
+    value: int = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+    return value
+
+
+def test_files_of_a_view_only_folder_get_the_read_only_attribute(tmp_path: Path) -> None:
+    """FR-SHARE-05: Office and Explorer then refuse to save over them; cleared again when the
+    role becomes editor."""
+    file = tmp_path / "plan.docx"
+    file.write_bytes(b"plan")
+    attributes = WindowsFileAttributes()
+
+    attributes.set_read_only(file, True)
+    marked = _attributes(file) & _FILE_ATTRIBUTE_READONLY
+    with pytest.raises(PermissionError):
+        file.write_bytes(b"edit")
+    attributes.set_read_only(file, False)
+
+    assert marked and not _attributes(file) & _FILE_ATTRIBUTE_READONLY
+    file.write_bytes(b"edit")
+
+
+def test_a_new_version_replaces_a_read_only_file(tmp_path: Path) -> None:
+    """A download clears the attribute before replacing: Windows won't replace a read-only
+    file, and the new version is marked again afterwards."""
+    file, part = tmp_path / "plan.docx", tmp_path / "plan.part"
+    file.write_bytes(b"old")
+    part.write_bytes(b"new")
+    attributes = WindowsFileAttributes()
+    attributes.set_read_only(file, True)
+
+    attributes.set_read_only(file, False)
+    part.replace(file)
+    attributes.set_read_only(file, True)
+
+    assert file.read_bytes() == b"new" and _attributes(file) & _FILE_ATTRIBUTE_READONLY

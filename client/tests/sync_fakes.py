@@ -33,6 +33,7 @@ from dropshare_client.store.index import Index
 from dropshare_client.sync.core import CycleResult, SyncCore
 from dropshare_client.sync.executor import no_crash
 from dropshare_client.sync.paths import key_of, outermost
+from dropshare_client.sync.server import FileServer
 from dropshare_client.sync.transfers import TransferEvent
 from dropshare_shared.errors import ErrorCode
 from dropshare_shared.naming import InvalidNameError, normalize_name, validate_name
@@ -267,7 +268,13 @@ class FakeFileServer:
         return node.out(self.namespace_id)
 
     @_locked
-    def trash(self, node_id: uuid.UUID, revision: int, cursor: int | None = None) -> None:
+    def trash(
+        self,
+        node_id: uuid.UUID,
+        revision: int,
+        cursor: int | None = None,
+        mount_cursor: int | None = None,
+    ) -> None:
         self._call("trash")
         node = self.nodes.get(node_id)
         if node is None:
@@ -534,8 +541,25 @@ class FakeRecycleBin:
 
 
 class NoAttributes:
+    """Records read-only marks instead of setting them, so tests can still write the files
+    (as a user who clears the attribute would)."""
+
+    def __init__(self) -> None:
+        self.read_only: dict[Path, bool] = {}
+
     def hide(self, path: Path) -> None:
         return None
+
+    def set_read_only(self, path: Path, read_only: bool) -> None:
+        self.read_only[path] = read_only
+
+    def marked(self, root: Path) -> set[str]:
+        """Paths below `root` currently marked read-only."""
+        return {
+            path.relative_to(root).as_posix()
+            for path, read_only in self.read_only.items()
+            if read_only and path.exists()
+        }
 
 
 class InodeIdentity:
@@ -574,7 +598,7 @@ class Device:
 
     _clock = time.time_ns() - 3_600_000_000_000  # an hour ago: every file is "stable"
 
-    def __init__(self, base: Path, server: FakeFileServer, *, max_path: int | None = None) -> None:
+    def __init__(self, base: Path, server: FileServer, *, max_path: int | None = None) -> None:
         self.max_path = max_path
         self.root = base / "DropShare"
         self.root.mkdir(parents=True)
@@ -583,6 +607,7 @@ class Device:
         self.server = server
         self.bin = FakeRecycleBin(base / "bin")
         self.log = Recorder()
+        self.attributes = NoAttributes()
         self.stop = threading.Event()
         self.core = self.restart()
 
@@ -600,7 +625,7 @@ class Device:
             self.server,
             recycle_bin or self.bin,
             file_identity or InodeIdentity(),
-            NoAttributes(),
+            self.attributes,
             self.log,
             display_name=DISPLAY_NAME,
             stop=self.stop,

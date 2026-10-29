@@ -22,7 +22,13 @@ class FileServer(Protocol):
 
     def create_folder(self, parent_id: uuid.UUID, name: str) -> NodeOut: ...
 
-    def trash(self, node_id: uuid.UUID, revision: int, cursor: int | None = None) -> None: ...
+    def trash(
+        self,
+        node_id: uuid.UUID,
+        revision: int,
+        cursor: int | None = None,
+        mount_cursor: int | None = None,
+    ) -> None: ...
 
     def move(
         self,

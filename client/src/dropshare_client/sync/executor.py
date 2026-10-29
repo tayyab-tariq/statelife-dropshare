@@ -75,10 +75,11 @@ class Executor:
         log: ActivityLog,
         *,
         display_name: str,
-        cursor: Callable[[], int],
+        cursor: Callable[[uuid.UUID], int],  # a namespace's cursor
         stop: threading.Event,
         crash_point: Callable[[str], None] = no_crash,
         transfers: TransferReporter | None = None,
+        view_only: Callable[[uuid.UUID], bool] = lambda _: False,  # by namespace
     ) -> None:
         self._scanner = scanner
         self._index = index
@@ -92,6 +93,7 @@ class Executor:
         self._stop = stop
         self._crash_point = crash_point
         self._transfers = transfers or TransferReporter(lambda _: None)
+        self._view_only = view_only
 
     def run(self, action: Action) -> str | None:
         """Carry out `action`. Returns the key of an item the step created that the next
@@ -282,10 +284,14 @@ class Executor:
         target = self._disk(path)
         with self._journaled("download", action.key, {"sha256": node.sha256}) as journal:
             self._expect(target, action.local)
+            if action.local is not None:  # Windows won't replace a read-only file
+                self._attributes.set_read_only(target, False)
             part.replace(target)  # PermissionError while the file is open elsewhere: retried
         self._crash_point("download.replaced")
         modified_ns = int(node.modified_at.timestamp() * 1_000_000_000)
         os.utime(target, ns=(modified_ns, modified_ns))
+        if self._view_only(node.namespace_id):  # FR-SHARE-05: after the time, which needs write
+            self._attributes.set_read_only(target, True)
         info = target.stat()
         self._index.put_entry(
             Entry(
@@ -332,6 +338,7 @@ class Executor:
             dataclasses.replace(entry, revision=remembered.revision), action.key, local.path
         )
         self._index.finish(journal)
+        self._match_read_only(action.key, remembered)
         self._log.activity("moved_on_server", local.path, entry.path)
 
     def _move_local(self, action: Action) -> None:
@@ -373,6 +380,7 @@ class Executor:
         self._crash_point("move_local.done")
         self._index.move_entries(moved, action.key, target_path)
         self._index.finish(journal)
+        self._match_read_only(action.key, remote.node)
         self._log.activity("moved_here", target_path, entry.path)
 
     # --- index only ----------------------------------------------------------------------
@@ -420,7 +428,13 @@ class Executor:
         (FR-CONF-03)."""
         node = _required(action.remote).node
         try:
-            self._server.trash(node.node_id, node.revision, self._cursor())
+            mount = node.mount_namespace_id  # its own journal is checked too (OQ-36)
+            self._server.trash(
+                node.node_id,
+                node.revision,
+                self._cursor(node.namespace_id),
+                None if mount is None else self._cursor(mount),
+            )
         except ApiError as exc:
             if exc.code != ErrorCode.NOT_FOUND:
                 raise  # REVISION_CONFLICT: changed there, so the edit wins (SyncCore replans)
@@ -431,6 +445,16 @@ class Executor:
         self._index.save_remote([], delta.removed)
         self._index.remove_entries(action.key, subtree=True)
         self._log.activity("deleted_on_server", action.path)
+
+    def _match_read_only(self, key: str, node: RemoteNode) -> None:
+        """A move can take files into or out of a view-only shared folder: mark them to match
+        where they are now (FR-SHARE-05). A mount's files stay in their own shared folder."""
+        if node.mount_namespace_id is not None:
+            return
+        read_only = self._view_only(node.namespace_id)
+        for item in self._scanner.scan(key).items.values():
+            if item.kind == NodeKind.FILE:
+                self._attributes.set_read_only(self._disk(item.path), read_only)
 
     def _to_recycle_bin(self, key: str, path: str) -> None:
         disk = self._disk(path)

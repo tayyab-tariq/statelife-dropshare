@@ -135,12 +135,21 @@ class RemoteFiles:
         body = FolderCreateIn(parent_id=parent_id, name=name).model_dump(mode="json")
         return self._api.data("POST", "/api/v1/nodes", NodeOut, json=body)
 
-    def trash(self, node_id: uuid.UUID, revision: int, cursor: int | None = None) -> None:
+    def trash(
+        self,
+        node_id: uuid.UUID,
+        revision: int,
+        cursor: int | None = None,
+        mount_cursor: int | None = None,
+    ) -> None:
         """To the owner's trash. Repeating a delete that already worked succeeds again. With
-        `cursor`, refused if anything inside changed after it (FR-CONF-03)."""
+        `cursor`, refused if anything inside changed after it (FR-CONF-03); `mount_cursor`
+        does the same inside the user's own shared folder when deleting it (OQ-36)."""
         params: dict[str, str | int] = {"if_revision": revision}
         if cursor is not None:
             params["if_cursor"] = cursor
+        if mount_cursor is not None:
+            params["if_mount_cursor"] = mount_cursor
         self._api.no_content("DELETE", f"/api/v1/nodes/{node_id}", params=params)
 
     def move(
@@ -380,6 +389,17 @@ class RemoteFiles:
                 raise
             part.unlink(missing_ok=True)  # the file got shorter: the next attempt starts over
         return digest.hexdigest()
+
+
+def file_sha256(path: Path, stop: threading.Event) -> str:
+    """Hex SHA-256 of a local file; TransferCancelledError if `stop` is set meanwhile."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while block := stream.read(_READ_SIZE):
+            if stop.is_set():
+                raise TransferCancelledError()
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def _chunk_length(size: int, chunk_size: int, index: int) -> int:

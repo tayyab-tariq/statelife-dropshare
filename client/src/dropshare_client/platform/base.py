@@ -51,6 +51,10 @@ class FileAttributes(Protocol):
         """Hide DropShare's own folder inside the sync folder from Explorer; best effort."""
         ...
 
+    def set_read_only(self, path: Path, read_only: bool) -> None:
+        """Mark a file read-only, or not (view-only shared folders, FR-SHARE-05); best effort."""
+        ...
+
 
 @dataclass(frozen=True)
 class FileId:
