@@ -24,6 +24,7 @@ from dropshare_client.controllers.shared_controller import SharedController
 from dropshare_client.controllers.sync_controller import SyncController
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
 from dropshare_client.controllers.transfers_controller import TransfersController
+from dropshare_client.controllers.trash_controller import TrashController
 from dropshare_client.controllers.upload_controller import UploadController
 from dropshare_client.platform.base import Paths
 from dropshare_client.services.api_client import ApiClient
@@ -34,6 +35,7 @@ from dropshare_client.services.importer import Importer
 from dropshare_client.services.local_files import LocalFiles
 from dropshare_client.services.sharing import Sharing
 from dropshare_client.services.tokens import TokenStore
+from dropshare_client.services.trash import Trash
 from dropshare_client.single_instance import SingleInstance, instance_name
 from dropshare_client.sync import binding
 from dropshare_client.sync.engine import SyncEngine, SyncListener
@@ -192,6 +194,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     sync = SyncController(config, make_engine, lambda: binding.forget(index_path))
     transfers = TransfersController(sync)
+    trash = TrashController(Trash(api))
     shell = AppShell(
         session,
         folders,
@@ -209,6 +212,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
         share=ShareController(sharing),
         shared=SharedController(sharing),
+        trash=trash,
         background=args.background,
         tray_available=QSystemTrayIcon.isSystemTrayAvailable(),
     )
@@ -225,6 +229,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return app.exec()
     finally:
         sync.shutdown()  # at a safe point: the journal and index are consistent
+        trash.cancel()  # a long restore or delete stops after the item in progress
         # Let running requests finish before their HTTP client goes away (architecture §2).
         if not QThreadPool.globalInstance().waitForDone(_QUIT_WAIT_MS):
             logger.warning("Quit while work was still running")

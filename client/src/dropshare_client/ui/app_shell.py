@@ -19,6 +19,7 @@ from dropshare_client.controllers.shared_controller import SharedController
 from dropshare_client.controllers.sync_controller import SyncController, SyncStatus
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
 from dropshare_client.controllers.transfers_controller import TransfersController
+from dropshare_client.controllers.trash_controller import TrashController
 from dropshare_client.controllers.upload_controller import UploadController
 from dropshare_client.ui.browser_view import BrowserView
 from dropshare_client.ui.change_password_dialog import ChangePasswordDialog
@@ -31,6 +32,7 @@ from dropshare_client.ui.sign_out_dialog import SignOutDialog
 from dropshare_client.ui.sync_folder_dialog import SyncFolderDialog
 from dropshare_client.ui.theme import TrayState
 from dropshare_client.ui.transfers_view import TransfersView
+from dropshare_client.ui.trash_view import TrashView
 from dropshare_client.ui.tray import Tray
 from dropshare_shared.schemas.users import UserOut
 
@@ -69,6 +71,7 @@ class AppShell(QObject):
         *,
         share: ShareController,
         shared: SharedController,
+        trash: TrashController,
         background: bool = False,
         tray_available: bool = True,
     ) -> None:
@@ -95,8 +98,11 @@ class AppShell(QObject):
         self.window.add_page("Shared with me", self.shared_view, 1)
         self.share_dialog = ShareDialog(share, self.window)
         self._pending_link: uuid.UUID | None = None  # opened once signed in
+        self._trash = trash
+        self.trash_view = TrashView(trash)
+        self.window.add_page(messages.TRASH, self.trash_view, 2)
         self.transfers_view = TransfersView(transfers)
-        self.window.add_page("Transfers", self.transfers_view, 2)
+        self.window.add_page("Transfers", self.transfers_view, 3)
         self.window.show_page(messages.MY_FILES)
         self.tray = Tray()
         self.sign_in_dialog = SignInDialog(session)
@@ -217,6 +223,10 @@ class AppShell(QObject):
         self._user = user
         self.sign_in_dialog.done_signing_in()
         self._browser.start(user.id)
+        # Nothing of whoever was signed in before (the session may have just expired) shows,
+        # not even for the moment the window comes up on these pages.
+        self._shared.clear()
+        self._trash.clear()
         self._uploads.set_user(user)
         if self._folders.current_folder is None:
             self._set_connection(TrayState.PAUSED, _NO_FOLDER)
@@ -264,6 +274,8 @@ class AppShell(QObject):
     def _needs_sign_in(self, message: str) -> None:
         self._user = None
         self._sync.stop()
+        self._shared.clear()
+        self._trash.clear()
         self._close_dialogs()
         self._set_connection(TrayState.SIGNED_OUT)
         self.window.hide()
@@ -315,6 +327,7 @@ class AppShell(QObject):
         self._user = None
         self._browser.clear()
         self._shared.clear()
+        self._trash.clear()
         self.share_dialog.hide()
         self._uploads.set_user(None)
         # The index says whose files the folder holds; it goes only when the folder went.

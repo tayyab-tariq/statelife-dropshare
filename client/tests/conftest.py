@@ -18,6 +18,7 @@ from dropshare_client.controllers.shared_controller import SharedController
 from dropshare_client.controllers.sync_controller import SyncController
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
 from dropshare_client.controllers.transfers_controller import TransfersController
+from dropshare_client.controllers.trash_controller import TrashController
 from dropshare_client.controllers.upload_controller import UploadController
 from dropshare_client.platform.macos.recycle_bin import MacTrash
 from dropshare_client.services.api_client import ApiClient
@@ -28,6 +29,7 @@ from dropshare_client.services.importer import Importer
 from dropshare_client.services.local_files import LocalFiles
 from dropshare_client.services.sharing import Sharing
 from dropshare_client.services.tokens import TokenStore
+from dropshare_client.services.trash import Trash
 from dropshare_client.ui.app_shell import AppShell
 
 # Headless Qt so tests run without a display (CI, SSH sessions). Visual checks on the Windows
@@ -141,6 +143,7 @@ def make_client(
             ),
             share=ShareController(sharing),
             shared=SharedController(sharing),
+            trashed=TrashController(Trash(api)),
             engines=engines,
             trash=trash,
             app_data=tmp_path / "app-data",
@@ -171,6 +174,7 @@ def make_shell(qtbot: QtBot) -> Iterator[MakeShell]:
             client.uploads,
             share=client.share,
             shared=client.shared,
+            trash=client.trashed,
             tray_available=tray_available,
         )
         qtbot.addWidget(shell.window)
