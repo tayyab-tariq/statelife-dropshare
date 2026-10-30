@@ -69,13 +69,14 @@ def record_many(
                 revision=node.revision,
                 modified_at=node.modified_at,
                 modified_by_user_id=node.modified_by_user_id,
+                mount_namespace_id=node.mount_namespace_id,
             )
             for offset, node in enumerate(nodes)
         ],
     )
 
 
-def _to_out(change: Change, mount_namespace_id: uuid.UUID | None) -> ChangeOut:
+def _to_out(change: Change) -> ChangeOut:
     return ChangeOut(
         cursor=change.seq,
         type=change.change_type,
@@ -89,7 +90,7 @@ def _to_out(change: Change, mount_namespace_id: uuid.UUID | None) -> ChangeOut:
         revision=change.revision,
         modified_at=change.modified_at,
         modified_by_user_id=change.modified_by_user_id,
-        mount_namespace_id=mount_namespace_id,
+        mount_namespace_id=change.mount_namespace_id,
     )
 
 
@@ -100,9 +101,9 @@ def list_changes(
     rows = change_repository.list_after(session, namespace_id, query.cursor, query.limit + 1)
     page = rows[: query.limit]
     return ChangesResponse(
-        data=[_to_out(change, mount) for change, mount in page],
+        data=[_to_out(change) for change in page],
         meta=ChangesMeta(
-            cursor=page[-1][0].seq if page else query.cursor, has_more=len(rows) > len(page)
+            cursor=page[-1].seq if page else query.cursor, has_more=len(rows) > len(page)
         ),
     )
 

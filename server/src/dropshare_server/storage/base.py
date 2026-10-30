@@ -4,6 +4,7 @@ import re
 import uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 
 # Generated, never derived from user input (requirements §11): blobs/ab/cd/<uuid hex>.
@@ -48,6 +49,9 @@ class StorageBackend(Protocol):
 
     def staged_upload_ids(self) -> Iterator[uuid.UUID]:
         """Uploads that have staged chunks, for the cleanup job."""
+
+    def blobs(self) -> Iterator[tuple[str, datetime]]:
+        """Every blob key with when it was written (UTC), for the gc-blobs job."""
 
     def health_check(self) -> None:
         """Raise OSError if the storage can't currently be written."""

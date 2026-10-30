@@ -1,11 +1,14 @@
 import uuid
+from collections.abc import Sequence
 from datetime import datetime
 
-from sqlalchemy import func, select
+from sqlalchemy import ColumnElement, and_, delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from dropshare_server.models import Namespace, UploadSession
 from dropshare_shared.schemas.uploads import UploadStatus
+
+_IN_LIST_LIMIT = 1000  # Oracle ORA-01795
 
 
 def add(session: Session, upload: UploadSession) -> None:
@@ -77,3 +80,56 @@ def pending_ids(session: Session, upload_ids: list[uuid.UUID]) -> set[uuid.UUID]
             )
         )
     )
+
+
+def _for_nodes(batch: Sequence[uuid.UUID]) -> ColumnElement[bool]:
+    return or_(UploadSession.node_id.in_(batch), UploadSession.parent_id.in_(batch))
+
+
+def lock_for_nodes(session: Session, node_ids: Sequence[uuid.UUID]) -> bool:
+    """Lock the uploads into or onto these nodes without waiting; False if any is locked by
+    someone else (an upload completing right now), so a purge can back off instead of
+    deadlocking with it."""
+    for start in range(0, len(node_ids), _IN_LIST_LIMIT):
+        batch = node_ids[start : start + _IN_LIST_LIMIT]
+        every = set(session.scalars(select(UploadSession.id).where(_for_nodes(batch))))
+        if not every:
+            continue
+        locked = set(
+            session.scalars(
+                select(UploadSession.id)
+                .where(UploadSession.id.in_(every))
+                .with_for_update(skip_locked=True)
+            )
+        )
+        if locked != every:
+            return False
+    return True
+
+
+def delete_for_nodes(session: Session, node_ids: Sequence[uuid.UUID]) -> None:
+    """These nodes are being purged: remove the uploads onto them and the unfinished ones into
+    them. A finished upload whose file was moved out keeps its row, without the folder, so a
+    repeated `complete` still answers with its file (NFR-REL-04). Chunks staged for a removed
+    pending upload are left to expire-uploads, which removes what no pending upload owns."""
+    for start in range(0, len(node_ids), _IN_LIST_LIMIT):
+        batch = node_ids[start : start + _IN_LIST_LIMIT]
+        session.execute(
+            delete(UploadSession)
+            .where(
+                or_(
+                    UploadSession.node_id.in_(batch),
+                    and_(
+                        UploadSession.parent_id.in_(batch),
+                        UploadSession.status != UploadStatus.COMPLETED,
+                    ),
+                )
+            )
+            .execution_options(synchronize_session=False)
+        )
+        session.execute(
+            update(UploadSession)
+            .where(UploadSession.parent_id.in_(batch))
+            .values(parent_id=None)
+            .execution_options(synchronize_session=False)
+        )

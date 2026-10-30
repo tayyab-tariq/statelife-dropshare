@@ -16,8 +16,9 @@ WAIT_MAX_NAMESPACES = 100
 
 class ChangeType(StrEnum):
     """Clients that don't know a type ask for that node (`GET /nodes/{id}`) and carry on, so
-    new types can be added. Restoring from the trash (F3) must send CREATED for the restored
-    item and for every item below it: clients dropped the whole subtree on TRASHED."""
+    new types can be added. Restoring from the trash sends CREATED for the restored item and
+    for every item below it, each with a new revision: clients dropped the whole subtree on
+    TRASHED and ignore an item at the revision it was trashed at (FR-TRASH-02)."""
 
     CREATED = "created"
     MODIFIED = "modified"

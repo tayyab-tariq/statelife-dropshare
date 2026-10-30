@@ -1,5 +1,6 @@
 import pytest
 from pydantic import ValidationError
+from pydantic_settings import SettingsConfigDict
 
 from dropshare_server.core.config import DatabaseSettings, Settings
 from dropshare_server.core.db import database_url
@@ -110,3 +111,39 @@ def test_postgresql_dialect_connects_to_the_named_database() -> None:
     assert url.drivername == "postgresql+psycopg"
     assert (url.database, url.port) == ("n", 5433)
     assert "service_name" not in url.query
+
+
+class _WithoutEnvFile(Settings):
+    """Never reads server/.env (model_validate on Settings itself would)."""
+
+    model_config = SettingsConfigDict(**{**Settings.model_config, "env_file": None})
+
+
+def _app_settings(**values: object) -> Settings:
+    return _WithoutEnvFile.model_validate(
+        {
+            "db_host": "h",
+            "db_name": "n",
+            "db_user": "app",
+            "db_password": "p",
+            "storage_local_root": "storage",
+            "token_secret": "s" * 32,
+            **values,
+        }
+    )
+
+
+def test_purge_audit_uses_its_own_account_when_one_is_set() -> None:
+    plain = _app_settings()
+    separate = _app_settings(audit_purge_db_user="purger", audit_purge_db_password="q")
+
+    assert plain.audit_purge_database() is plain
+    purge = separate.audit_purge_database()
+    assert (purge.db_user, purge.db_password.get_secret_value()) == ("purger", "q")
+    assert (purge.db_host, purge.db_name) == ("h", "n")
+    assert separate.db_user == "app"
+
+
+def test_purge_audit_account_needs_both_user_and_password() -> None:
+    with pytest.raises(ValidationError):
+        _app_settings(audit_purge_db_user="purger")

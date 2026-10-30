@@ -6,11 +6,11 @@ import uuid
 from collections.abc import Sequence
 from datetime import datetime
 
-from sqlalchemy import func, select, update
+from sqlalchemy import ColumnElement, Select, and_, delete, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
-from dropshare_server.models import FileVersion, Node
+from dropshare_server.models import FileVersion, Namespace, Node
 
 _LIVE_KEY_CONSTRAINT = "uq_nodes_live_key"
 _MOUNT_KEY_CONSTRAINT = "uq_nodes_mount_key"
@@ -342,3 +342,246 @@ def rehome(
         if node.live_key is not None:
             node.live_key = live_key(namespace_id, node.parent_id, node.name_normalized)
     session.flush()
+
+
+# --- the trash (FR-TRASH-01 … 04) --------------------------------------------------------------
+
+
+def _owned(user_id: uuid.UUID) -> Select[uuid.UUID]:
+    return select(Namespace.id).where(Namespace.owner_user_id == user_id)
+
+
+def _trash_roots_visible(user_id: uuid.UUID, editing: Sequence[uuid.UUID]) -> ColumnElement[bool]:
+    """Items the user deleted or owns in the trash, as a filter: in a namespace they own (but
+    not a mount of someone else's shared folder: that comes back from Shared with me, OQ-37),
+    or deleted by them from a shared folder they can still edit (`editing`)."""
+    owned = _owned(user_id)
+    yours = and_(
+        Node.namespace_id.in_(owned),
+        or_(Node.mount_namespace_id.is_(None), Node.mount_namespace_id.in_(owned)),
+    )
+    if editing:
+        in_editing = or_(
+            *(
+                Node.namespace_id.in_(editing[start : start + _IN_LIST_LIMIT])
+                for start in range(0, len(editing), _IN_LIST_LIMIT)
+            )
+        )
+        yours = or_(yours, and_(in_editing, Node.trashed_by_user_id == user_id))
+    return and_(Node.trash_root_id == Node.id, yours)
+
+
+def list_trash(
+    session: Session,
+    user_id: uuid.UUID,
+    editing: Sequence[uuid.UUID],
+    *,
+    offset: int,
+    limit: int,
+) -> list[Node]:
+    """The user's trash, most recently deleted first. `editing`: the shared folders'
+    namespaces where they are an editor (few: one per share)."""
+    return list(
+        session.scalars(
+            select(Node)
+            .where(_trash_roots_visible(user_id, editing))
+            .order_by(Node.trashed_at.desc(), Node.id)
+            .offset(offset)
+            .limit(limit)
+        )
+    )
+
+
+def count_trash(session: Session, user_id: uuid.UUID, editing: Sequence[uuid.UUID]) -> int:
+    return session.scalar(select(func.count()).where(_trash_roots_visible(user_id, editing))) or 0
+
+
+def trash_totals(
+    session: Session, root_ids: Sequence[uuid.UUID]
+) -> dict[uuid.UUID, tuple[int, int]]:
+    """For each item in the trash: (how many items went with it, bytes of the files among
+    them, its own included)."""
+    found: dict[uuid.UUID, tuple[int, int]] = {}
+    for start in range(0, len(root_ids), _IN_LIST_LIMIT):
+        rows = session.execute(
+            select(Node.trash_root_id, func.count(), func.coalesce(func.sum(Node.size_bytes), 0))
+            .where(Node.trash_root_id.in_(root_ids[start : start + _IN_LIST_LIMIT]))
+            .group_by(Node.trash_root_id)
+        )
+        for root_id, count, size in rows:
+            if root_id is not None:
+                found[root_id] = (int(count) - 1, int(size))
+    return found
+
+
+def owned_trash_roots(session: Session, user_id: uuid.UUID, limit: int) -> list[uuid.UUID]:
+    """Up to `limit` items in the trash of the namespaces the user owns, oldest first (emptying
+    the trash). Mounts of other people's shared folders count: they are the user's too."""
+    return list(
+        session.scalars(
+            select(Node.id)
+            .where(Node.trash_root_id == Node.id, Node.namespace_id.in_(_owned(user_id)))
+            .order_by(Node.trashed_at, Node.id)
+            .limit(limit)
+        )
+    )
+
+
+def expired_trash_roots(session: Session, before: datetime, limit: int) -> list[uuid.UUID]:
+    """Up to `limit` items deleted before `before`, oldest first (FR-TRASH-04)."""
+    return list(
+        session.scalars(
+            select(Node.id)
+            .where(Node.trash_root_id == Node.id, Node.trashed_at < before)
+            .order_by(Node.trashed_at, Node.id)
+            .limit(limit)
+        )
+    )
+
+
+def lock_trash_group(session: Session, root_id: uuid.UUID) -> list[Node]:
+    """Lock and return what went to the trash with `root_id` (the root first), parents before
+    children within each namespace. Empty if it isn't in the trash (any more)."""
+    nodes = list(
+        session.scalars(
+            select(Node)
+            .where(Node.trash_root_id == root_id)
+            .order_by(Node.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    )
+    by_id = {node.id: node for node in nodes}
+    if root_id not in by_id:
+        return []
+    depth: dict[uuid.UUID, int] = {}
+    for node in nodes:
+        chain: list[Node] = []  # up to the first node whose depth is known (iterative)
+        current: Node | None = node
+        while current is not None and current.id not in depth:
+            chain.append(current)
+            parent = by_id.get(current.parent_id) if current.parent_id is not None else None
+            current = None if current.id == root_id else parent
+        known = -1 if current is None else depth[current.id]
+        for offset, item in enumerate(reversed(chain), start=1):
+            depth[item.id] = known + offset
+    return sorted(nodes, key=lambda node: (node.id != root_id, depth[node.id]))
+
+
+def children_outside(session: Session, node_ids: Sequence[uuid.UUID]) -> list[Node]:
+    """Nodes whose parent is among `node_ids` but which aren't themselves: items deleted from
+    inside a folder before the folder was."""
+    ids = set(node_ids)
+    found: list[Node] = []
+    for start in range(0, len(node_ids), _IN_LIST_LIMIT):
+        found.extend(
+            node
+            for node in session.scalars(
+                select(Node)
+                .where(Node.parent_id.in_(node_ids[start : start + _IN_LIST_LIMIT]))
+                .with_for_update()
+            )
+            if node.id not in ids
+        )
+    return found
+
+
+def restore(session: Session, nodes: Sequence[Node], mounts: Sequence[Node]) -> None:
+    """Bring nodes back from the trash with their (already set) parents and names; raises
+    LiveNameTakenError or MountTakenError if a name or a shared folder was taken meanwhile.
+    In a savepoint, like `add`. `mounts` (among `nodes`) count as the user's mounts again."""
+    try:
+        with session.begin_nested():
+            for node in nodes:
+                node.trashed_at = node.trashed_by_user_id = node.trash_root_id = None
+                node.live_key = live_key(node.namespace_id, node.parent_id, node.name_normalized)
+            for mount in mounts:
+                assert mount.mount_namespace_id is not None  # noqa: S101 - a mount
+                mount.mount_key = mount_key(mount.namespace_id, mount.mount_namespace_id)
+            session.flush()
+    except IntegrityError as exc:
+        if _LIVE_KEY_CONSTRAINT in str(exc.orig).lower():
+            raise LiveNameTakenError from exc
+        if _MOUNT_KEY_CONSTRAINT in str(exc.orig).lower():
+            raise MountTakenError from exc
+        raise
+
+
+def versions_of(session: Session, node_ids: Sequence[uuid.UUID]) -> list[FileVersion]:
+    found: list[FileVersion] = []
+    for start in range(0, len(node_ids), _IN_LIST_LIMIT):
+        found.extend(
+            session.scalars(
+                select(FileVersion).where(
+                    FileVersion.node_id.in_(node_ids[start : start + _IN_LIST_LIMIT])
+                )
+            )
+        )
+    return found
+
+
+def delete_versions(session: Session, version_ids: Sequence[uuid.UUID]) -> None:
+    for start in range(0, len(version_ids), _IN_LIST_LIMIT):
+        session.execute(
+            delete(FileVersion)
+            .where(FileVersion.id.in_(version_ids[start : start + _IN_LIST_LIMIT]))
+            .execution_options(synchronize_session=False)
+        )
+
+
+def delete_nodes(session: Session, nodes: Sequence[Node]) -> None:
+    """Delete nodes whose versions, shares and uploads are already gone. Their parent links are
+    cleared first, so the rows can go in any order (no ON DELETE CASCADE, database.md)."""
+    session.flush()
+    node_ids = [node.id for node in nodes]
+    for start in range(0, len(node_ids), _IN_LIST_LIMIT):
+        session.execute(
+            update(Node)
+            .where(Node.id.in_(node_ids[start : start + _IN_LIST_LIMIT]))
+            .values(parent_id=None)
+            .execution_options(synchronize_session=False)
+        )
+    for start in range(0, len(node_ids), _IN_LIST_LIMIT):
+        session.execute(
+            delete(Node)
+            .where(Node.id.in_(node_ids[start : start + _IN_LIST_LIMIT]))
+            .execution_options(synchronize_session=False)
+        )
+    for node in nodes:  # gone: nothing may flush them again
+        session.expunge(node)
+
+
+def superseded_versions(session: Session, before: datetime, limit: int) -> list[FileVersion]:
+    """Up to `limit` versions that a newer version of the same file replaced before `before`
+    (v1 keeps only the current version, requirements §8)."""
+    newer = aliased(FileVersion)
+    return list(
+        session.scalars(
+            select(FileVersion)
+            .join(Node, Node.id == FileVersion.node_id)
+            .where(
+                or_(Node.current_version_id.is_(None), Node.current_version_id != FileVersion.id),
+                exists().where(
+                    newer.node_id == FileVersion.node_id,
+                    newer.id != FileVersion.id,
+                    newer.created_at >= FileVersion.created_at,
+                    newer.created_at < before,
+                ),
+            )
+            .order_by(FileVersion.created_at, FileVersion.id)
+            .limit(limit)
+        )
+    )
+
+
+def known_blob_keys(session: Session, blob_keys: Sequence[str]) -> set[str]:
+    found: set[str] = set()
+    for start in range(0, len(blob_keys), _IN_LIST_LIMIT):
+        found.update(
+            session.scalars(
+                select(FileVersion.blob_key).where(
+                    FileVersion.blob_key.in_(blob_keys[start : start + _IN_LIST_LIMIT])
+                )
+            )
+        )
+    return found

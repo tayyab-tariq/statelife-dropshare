@@ -2,17 +2,22 @@
 
 import csv
 import json
+import logging
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TextIO
 
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from dropshare_server.models import AuditEvent, User
 from dropshare_server.repositories import audit as audit_repository
+from dropshare_server.repositories import audit_retention as audit_retention_repository
 from dropshare_server.services.context import CallContext
 from dropshare_shared.schemas.audit import AuditAction, AuditOutcome
+
+logger = logging.getLogger(__name__)
 
 # Small, flat, and never file content, passwords or tokens (FR-AUDIT-02).
 type AuditDetails = dict[str, str | int | bool | None]
@@ -146,3 +151,53 @@ def record_now(
     audit_repository.add_in_own_transaction(
         session_factory, _event(ctx, action, outcome, target, details)
     )
+
+
+_PURGE_BATCH = 500
+
+
+def purge_expired(
+    purge_sessions: sessionmaker[Session],
+    sessions: sessionmaker[Session],
+    ctx: CallContext,
+    now: datetime,
+    retention_days: int,
+) -> int:
+    """The purge-audit job (FR-AUDIT-03): delete events older than the retention period, a batch
+    per transaction, through the purge account (`purge_sessions`). Idempotent.
+
+    The purge is always logged, also when it fails partway (batches already committed stay
+    deleted): `audit.purged` with what was removed and the outcome, through the app's own
+    account, or through the purge account if the app's can't write."""
+    before = now - timedelta(days=retention_days)
+    removed = 0
+    outcome = AuditOutcome.FAILURE
+    try:
+        while True:
+            with purge_sessions.begin() as session:
+                deleted = audit_retention_repository.delete_before(session, before, _PURGE_BATCH)
+            removed += deleted
+            if deleted < _PURGE_BATCH:
+                break
+        outcome = AuditOutcome.SUCCESS
+    finally:
+        _log_purge(sessions, purge_sessions, ctx, outcome, removed, before)
+    return removed
+
+
+def _log_purge(
+    sessions: sessionmaker[Session],
+    purge_sessions: sessionmaker[Session],
+    ctx: CallContext,
+    outcome: AuditOutcome,
+    removed: int,
+    before: datetime,
+) -> None:
+    details: AuditDetails = {"removed": removed, "before": before.isoformat()}
+    try:
+        with sessions.begin() as session:
+            record(session, ctx, AuditAction.AUDIT_PURGED, outcome, details=details)
+    except SQLAlchemyError:
+        logger.exception("Couldn't log the audit purge with the app account; using the purge one")
+        with purge_sessions.begin() as session:
+            record(session, ctx, AuditAction.AUDIT_PURGED, outcome, details=details)

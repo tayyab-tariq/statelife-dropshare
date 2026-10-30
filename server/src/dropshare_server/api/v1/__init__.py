@@ -10,6 +10,7 @@ from dropshare_server.api.v1 import (
     namespaces,
     nodes,
     sharing,
+    trash,
     uploads,
 )
 from dropshare_server.dependencies.client_version import require_client_version
@@ -23,3 +24,4 @@ router.include_router(uploads.router)
 router.include_router(changes.router)
 router.include_router(directory.router)
 router.include_router(sharing.router)
+router.include_router(trash.router)
