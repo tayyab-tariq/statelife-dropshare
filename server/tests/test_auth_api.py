@@ -8,6 +8,7 @@ from httpx import Response
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
+from dropshare_server.core.config import Settings
 from dropshare_server.models import AuditEvent, Device, RefreshToken, User
 from dropshare_shared.schemas.audit import AuditAction, AuditActorType, AuditOutcome
 
@@ -328,7 +329,7 @@ def test_disabling_a_user_cuts_off_existing_tokens_immediately(
 
 
 def test_client_version_is_required_and_enforced(
-    api: TestClient, signed_in: dict[str, str]
+    api: TestClient, signed_in: dict[str, str], db_settings: Settings
 ) -> None:
     headers = _bearer(signed_in["access_token"])
 
@@ -341,7 +342,7 @@ def test_client_version_is_required_and_enforced(
     assert malformed.status_code == 400
     assert too_old.status_code == 426
     assert too_old.json()["error"]["code"] == "UPGRADE_REQUIRED"
-    assert too_old.json()["error"]["details"] == {"min_version": "0.1.0"}
+    assert too_old.json()["error"]["details"] == {"min_version": db_settings.min_client_version}
     assert newer.status_code == 200  # numeric comparison, not string comparison
 
 
