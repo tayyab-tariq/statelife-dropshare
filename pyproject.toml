@@ -46,7 +46,7 @@ known-first-party = ["dropshare_shared", "dropshare_server", "dropshare_client"]
 python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy"]
-mypy_path = ["shared/src", "server/src", "client/src", "client/tests"]
+mypy_path = ["shared/src", "server/src", "client/src", "client/tests", "scripts/perf"]
 explicit_package_bases = true
 exclude = ["^\\.venv/", "^\\.claude/", "^build/", "^dist/"]
 
