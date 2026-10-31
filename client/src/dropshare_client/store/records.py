@@ -84,3 +84,13 @@ class Problem:
     key: str
     path: str
     reason: str
+
+
+@dataclass(frozen=True)
+class StoredUpload:
+    """A started upload remembered for its target: the server session and the content it is
+    for (FR-XFER-01)."""
+
+    upload_id: uuid.UUID
+    sha256: str
+    size: int

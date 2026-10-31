@@ -8,6 +8,7 @@ The user's own namespace is followed, and each shared folder they added (FR-SHAR
 appearing in their tree starts its namespace, a mount going away lets it go (sync/mounts.py).
 """
 
+import concurrent.futures
 import dataclasses
 import functools
 import logging
@@ -42,7 +43,7 @@ from dropshare_client.sync.errors import (
     SyncStoppedError,
     UnsafePathError,
 )
-from dropshare_client.sync.executor import ActivityLog, Executor, no_crash
+from dropshare_client.sync.executor import ActivityLog, Executor, Transfer, no_crash
 from dropshare_client.sync.mounts import MountRelease, ReleaseIncompleteError
 from dropshare_client.sync.reconciler import (
     Action,
@@ -66,6 +67,14 @@ logger = logging.getLogger(__name__)
 STILL_WRITING_DELAY = 2.0
 # Locked or failing items: 2 s, 4 s, ... up to this (windows-fs.md "Locked and changing").
 MAX_RETRY_DELAY = 60.0
+MAX_TRANSFERS = 4  # files moving at once (FR-XFER-03)
+# Smaller files go first; once only larger ones are left running, a cycle ends without waiting
+# for them, so a small change made meanwhile is planned and sent beside them (FR-XFER-03).
+SMALL_TRANSFER_BYTES = 4 * 1024 * 1024
+# How often the engine looks up from waiting on transfers, to pass on a stop or pause.
+_TRANSFER_POLL_SECONDS = 0.2
+# How soon a cycle looks again at a file still moving after the cycle ended.
+_IN_FLIGHT_RECHECK = 1.0
 # The server state moved on: refetch and plan again right away.
 _REPLAN = frozenset({ErrorCode.REVISION_CONFLICT, ErrorCode.NAME_CONFLICT, ErrorCode.NOT_FOUND})
 # Our copy of the node may be out of date: ask the server for it before planning again.
@@ -106,6 +115,7 @@ def _stopped_because(exc: Exception) -> str:
 
 # Changes a viewer makes that the server refuses; the engine puts them right (FR-SHARE-05).
 _VIEWER_UNDOES = frozenset({Op.UPLOAD, Op.MAKE_REMOTE_FOLDER, Op.DELETE_REMOTE})
+_TRANSFERS = frozenset({Op.UPLOAD, Op.DOWNLOAD})
 # Reads of every namespace per fetch while items keep moving between them.
 _FETCH_PASSES = 4
 # Passed through to the engine: they stop the whole cycle, not just one item.
@@ -148,8 +158,15 @@ class SyncCore:
         crash_point: Callable[[str], None] = no_crash,
         progress: Callable[[int], None] = lambda _: None,
         transfer: Callable[[TransferEvent], None] = lambda _: None,
+        max_transfers: int = MAX_TRANSFERS,
     ) -> None:
         self._index = index
+        self._max_transfers = max(1, max_transfers)
+        # Transfers moving now, possibly started by an earlier cycle; finished ones are
+        # recorded by the next cycle (or when the engine stops). Engine thread only.
+        self._pool: concurrent.futures.ThreadPoolExecutor | None = None
+        self._flight: dict[concurrent.futures.Future[object], Transfer] = {}
+        self._last_progress: int | None = None
         self._server = server
         self._recycle_bin = recycle_bin
         self._file_attributes = file_attributes
@@ -415,7 +432,7 @@ class SyncCore:
             if item.kind == "release_mount":
                 continue  # carried out by the next cycle (_release_mounts)
             if item.kind == "upload":
-                self._recover_upload(item.key, item.data.get("sha256"), tree)
+                self._recover_upload(item.key, item.data, tree)
             else:
                 logger.info(
                     "Journal: %s of %s was interrupted; the next cycle checks it",
@@ -424,10 +441,14 @@ class SyncCore:
                 )
             self._index.finish(item.id)
 
-    def _recover_upload(self, key: str, sha256: str | None, tree: RemoteTree) -> None:
+    def _recover_upload(self, key: str, data: dict[str, str], tree: RemoteTree) -> None:
+        sha256 = data.get("sha256")
         remote = tree.items_under(key).get(key)
         if remote is None or sha256 is None or remote.node.sha256 != sha256:
-            return
+            return  # not done: the session stays, so the next attempt resumes it
+        session = data.get("session")
+        if session is not None:  # done: it must never be replayed for another file (B2)
+            self._index.forget_upload_session(session)
         try:
             path = self._scanner.resolve(key)
         except UnsafePathError:
@@ -453,13 +474,17 @@ class SyncCore:
         _, tree = self._require_connected()
         self._scanner.require_root()
         result = CycleResult()
+        self._settle_finished(tree, result)
         released, held, stuck = self._release_mounts(result)
         dirty = dirty | released
         self._mark_read_only()
         local: dict[str, LocalItem] = {}
         remote: dict[str, RemoteItem] = {}
         base: dict[str, Entry] = {}
-        deferred: set[str] = set()
+        # Files still moving aren't planned again until they have finished.
+        deferred: set[str] = {transfer.action.key for transfer in self._flight.values()}
+        for key in deferred:
+            result.retry.setdefault(key, _IN_FLIGHT_RECHECK)
         roots = paths.outermost(dirty)
         while roots:
             for root in roots:
@@ -661,29 +686,166 @@ class SyncCore:
                 self._transfers.queued(
                     action.key, action.remote.path, Direction.DOWNLOAD, action.remote.node.size
                 )
-        for done, action in enumerate(plan.actions):
+        actions = list(plan.actions)
+        position = 0
+        while position < len(actions):
             if self._stop.is_set():
                 raise SyncStoppedError()
-            self._progress(len(plan.actions) - done)
+            action = actions[position]
+            if action.op in _TRANSFERS:  # the plan keeps them together, after folders and moves
+                end = position
+                while end < len(actions) and actions[end].op in _TRANSFERS:
+                    end += 1
+                after = len(actions) - end
+                self._transfer_all(executor, actions[position:end], tree, result, after)
+                position = end
+                continue
+            self._report_progress(len(actions) - position + len(self._flight))
             done_ok, created = self._run(executor, action, tree, result)
+            position += 1
             if not done_ok:
                 if action.op in (Op.MOVE_LOCAL, Op.MOVE_REMOTE):
                     self._hold_move_together(action, result)
                 continue
-            self._attempts.pop(action.key, None)
-            if created is not None:
-                result.retry[created] = 0.0
-            if action.op != Op.RECORD:
-                result.changed_anything = True
-        self._progress(0)
+            self._done(action, created, result)
+        self._report_progress(len(self._flight))
+
+    def _report_progress(self, pending: int) -> None:
+        """Items still to do (FR-CLIENT-01 "Syncing (n items)"); sent only when it changes."""
+        if pending != self._last_progress:
+            self._last_progress = pending
+            self._progress(pending)
+
+    def _done(self, action: Action, created: str | None, result: CycleResult) -> None:
+        self._attempts.pop(action.key, None)
+        if created is not None:
+            result.retry[created] = 0.0
+        if action.op != Op.RECORD:
+            result.changed_anything = True
+
+    def _transfer_all(
+        self,
+        executor: Executor,
+        actions: list[Action],
+        tree: RemoteTree,
+        result: CycleResult,
+        after: int,
+    ) -> None:
+        """Up to `max_transfers` files at once, smallest first, so many small changes never
+        wait behind one large file (FR-XFER-03). Each is prepared only when a slot is free,
+        so nothing is started (or shown as moving) before its turn. Bytes move on transfer
+        threads; everything recorded happens here, on the engine's thread, as each finishes.
+
+        Once only large files are left moving, the cycle ends without them: the next cycle
+        plans whatever changed meanwhile and sends it beside them, and records them when
+        they finish. A stop or pause sends nothing more, stops the running ones within a
+        moment and records how they ended; a fatal error leaves them to the next cycle."""
+        waiting = sorted(actions, key=_transfer_size)
+        while True:
+            self._settle_finished(tree, result)
+            while waiting and len(self._flight) < self._max_transfers and not self._stop.is_set():
+                action = waiting.pop(0)
+                prepare = functools.partial(executor.prepare, action)
+                ok, prepared = self._attempt(action, prepare, tree, result)
+                if ok and isinstance(prepared, Transfer):
+                    self._flight[self._submit(prepared)] = prepared
+            if self._stop.is_set():
+                reason = _stopped_because(SyncStoppedError())
+                for action in waiting:  # never started: nothing to tidy up
+                    self._transfers.waiting(action.key, reason)
+                self._drain(reason)
+                raise SyncStoppedError()
+            if not waiting and not self._flight:
+                return
+            if not waiting and all(t.size >= SMALL_TRANSFER_BYTES for t in self._flight.values()):
+                for transfer in self._flight.values():
+                    result.retry[transfer.action.key] = _IN_FLIGHT_RECHECK
+                return
+            self._report_progress(after + len(waiting) + len(self._flight))
+            concurrent.futures.wait(
+                self._flight,
+                timeout=_TRANSFER_POLL_SECONDS,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+
+    def _submit(self, transfer: Transfer) -> concurrent.futures.Future[object]:
+        if self._pool is None:
+            self._pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=self._max_transfers, thread_name_prefix="dropshare-transfer"
+            )
+        stop, transfers = self._stop, self._transfers
+
+        def work() -> object:
+            try:
+                return transfer.work(stop)
+            except TransferCancelledError:  # shown at once, recorded by the engine later
+                transfers.waiting(transfer.action.key, _stopped_because(SyncStoppedError()))
+                raise
+
+        return self._pool.submit(work)
+
+    def _settle_finished(self, tree: RemoteTree, result: CycleResult) -> None:
+        """Record the transfers that have finished, on the engine's thread. One stopped by an
+        earlier pause is only tidied up: it goes again in this cycle. While stopping, the
+        stop itself records them all (`_drain`)."""
+        if self._stop.is_set():
+            return
+        for future in [f for f in self._flight if f.done()]:
+            transfer = self._flight.pop(future)
+            key = transfer.action.key
+            if isinstance(future.exception(), TransferCancelledError) and not self._stop.is_set():
+                transfer.failed(TransferCancelledError())
+                result.retry[key] = 0.0
+                continue
+            settle = functools.partial(_settle, transfer, future)
+            ok, _ = self._attempt(transfer.action, settle, tree, result)
+            if ok:
+                self._done(transfer.action, None, result)
+
+    def _drain(self, reason: str) -> None:
+        """Wait for the running transfers (they are stopping) and record how each ended: one
+        that got through is recorded as done, one that stopped is tidied up."""
+        if not self._flight:
+            return
+        concurrent.futures.wait(self._flight)
+        for future, transfer in list(self._flight.items()):
+            del self._flight[future]
+            key = transfer.action.key
+            try:
+                _settle(transfer, future)
+            except TransferCancelledError:
+                self._transfers.waiting(key, reason)
+            except Exception:
+                logger.warning("Couldn't record the transfer of %s", key, exc_info=True)
+                self._transfers.waiting(key, _TRY_AGAIN)
+            else:
+                self._attempts.pop(key, None)
+
+    def close(self) -> None:
+        """The engine is stopping: let the running transfers end and record them."""
+        self._drain(_stopped_because(SyncStoppedError()))
+        if self._pool is not None:
+            self._pool.shutdown(wait=True, cancel_futures=True)
+            self._pool = None
 
     def _run(
         self, executor: Executor, action: Action, tree: RemoteTree, result: CycleResult
     ) -> tuple[bool, str | None]:
-        """(done, key of an item the step created). A failure that isn't fatal is recorded
-        in `result` (what to retry and when) and reported as not done."""
+        """(done, key of an item the step created)."""
+        ok, created = self._attempt(action, functools.partial(executor.run, action), tree, result)
+        return ok, created if isinstance(created, str) else None
+
+    def _attempt(
+        self,
+        action: Action,
+        step: Callable[[], object],
+        tree: RemoteTree,
+        result: CycleResult,
+    ) -> tuple[bool, object]:
+        """(done, what `step` returned). A failure that isn't fatal is recorded in `result`
+        (what to retry and when) and reported as not done."""
         try:
-            return True, executor.run(action)
+            return True, step()
         except _FATAL as exc:
             self._transfers.waiting(action.key, _stopped_because(exc))
             raise
@@ -772,6 +934,11 @@ class SyncCore:
                 self._index.save_remote(delta.upserts.values(), delta.removed)
         elif exc.code in _TRANSIENT or exc.status >= 500 or exc.status == 429:
             result.retry[key] = self._backoff(key)
+        elif exc.code == ErrorCode.QUOTA_EXCEEDED and action.op == Op.UPLOAD and self._flight:
+            # Each running upload reserves its whole size (D1): one at a time it may fit, so
+            # it waits for them rather than telling the user they're out of space.
+            result.retry[key] = self._backoff(key)
+            self._transfers.waiting(key, _TRY_AGAIN)
         elif exc.code in _PROBLEM_REASONS or 400 <= exc.status < 500:
             reason = _PROBLEM_REASONS.get(exc.code, exc.message)
             if exc.request_id:
@@ -866,3 +1033,23 @@ class SyncCore:
 
 def _delete_keys(plan: Plan) -> frozenset[str]:
     return frozenset(a.key for a in plan.actions if a.op in (Op.DELETE_LOCAL, Op.DELETE_REMOTE))
+
+
+def _transfer_size(action: Action) -> int:
+    """Bytes to move: small files go first (FR-XFER-03)."""
+    if action.op == Op.UPLOAD and action.local is not None:
+        return action.local.size
+    if action.remote is not None:
+        return action.remote.node.size
+    return 0
+
+
+def _settle(transfer: Transfer, future: concurrent.futures.Future[object]) -> None:
+    """On the engine's thread: record a finished transfer, or tidy up after a failed one and
+    raise its error for the usual handling."""
+    try:
+        value = future.result()
+    except BaseException as exc:
+        transfer.failed(exc)
+        raise
+    transfer.finish(value)

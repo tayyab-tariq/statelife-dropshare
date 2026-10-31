@@ -25,7 +25,7 @@ from pydantic import ValidationError
 from dropshare_client.platform import rename_no_replace
 from dropshare_client.platform.base import FileAttributes, RecycleBin
 from dropshare_client.services.errors import ApiError, OfflineError
-from dropshare_client.services.files import NewFile, NewVersion, SourceFile
+from dropshare_client.services.files import NewFile, NewVersion, SourceFile, upload_key
 from dropshare_client.store.index import Index
 from dropshare_client.store.records import Entry, Problem, RemoteNode
 from dropshare_client.sync import paths
@@ -61,6 +61,22 @@ class ActivityLog(Protocol):
 
 def no_crash(_: str) -> None:
     return None
+
+
+@dataclasses.dataclass(frozen=True)
+class Transfer:
+    """An upload or download split so several can run at once (FR-XFER-03). `work` moves the
+    bytes on a transfer thread; the only thing it writes is the upload's session in the
+    index, so it can resume (FR-XFER-01). `finish` records the result and `failed` tidies up
+    after `work` failed, both on the engine's thread, which alone writes everything else in
+    the index and the remote tree. A crash between the two leaves what a crash mid-transfer
+    always did. `size` orders the queue: smaller files first."""
+
+    action: Action
+    size: int
+    work: Callable[[threading.Event], object]
+    finish: Callable[[object], None]
+    failed: Callable[[BaseException], None]
 
 
 class Executor:
@@ -100,11 +116,11 @@ class Executor:
         cycle must look at (a conflicted copy), if any."""
         if action.op == Op.CONFLICT:
             return self._conflict(action)
+        if action.op in (Op.UPLOAD, Op.DOWNLOAD):
+            raise ValueError(f"{action.op} goes through prepare(): it runs on a transfer thread")
         handlers: dict[Op, Callable[[Action], None]] = {
             Op.MAKE_LOCAL_FOLDER: self._make_local_folder,
             Op.MAKE_REMOTE_FOLDER: self._make_remote_folder,
-            Op.UPLOAD: self._upload,
-            Op.DOWNLOAD: self._download,
             Op.RECORD: self._record,
             Op.DELETE_LOCAL: self._delete_local,
             Op.DELETE_REMOTE: self._delete_remote,
@@ -219,7 +235,15 @@ class Executor:
 
     # --- transfers -----------------------------------------------------------------------
 
-    def _upload(self, action: Action) -> None:
+    def prepare(self, action: Action) -> Transfer:
+        """An upload or download, ready for a transfer thread (FR-XFER-03)."""
+        if action.op == Op.UPLOAD:
+            return self._prepare_upload(action)
+        if action.op == Op.DOWNLOAD:
+            return self._prepare_download(action)
+        raise ValueError(f"{action.op} is not a transfer")
+
+    def _prepare_upload(self, action: Action) -> Transfer:
         local = _required(action.local)
         if local.sha256 is None:
             raise LocalChangedError(action.key)
@@ -231,37 +255,56 @@ class Executor:
             target = NewFile(self._remote_parent(action.key), _nfc(paths.name_of(local.path)))
         source = SourceFile(self._disk(local.path), local.sha256, local.size, local.mtime_ns)
         self._transfers.started(action.key, local.path, Direction.UPLOAD, local.size)
-        # Kept when no answer came: the upload may have completed (SyncCore.recover).
-        with self._journaled(
-            "upload", action.key, {"sha256": local.sha256}, unsure=(OfflineError,)
-        ) as journal:
-            node = self._server.upload(
-                source, target, self._stop, partial(self._transfers.progress, action.key)
-            )
-        self._crash_point("upload.completed")
-        remembered = self._remember(node)
-        self._index.put_entry(
-            Entry(
-                key=action.key,
-                path=local.path,
-                node_id=remembered.node_id,
-                kind=NodeKind.FILE,
-                revision=remembered.revision,
-                sha256=remembered.sha256,
-                size=local.size,
-                mtime_ns=local.mtime_ns,
-                file_id=local.file_id,
-            )
+        # The session's key too: recovery forgets the session once it finds the upload done.
+        journal = self._index.begin(
+            "upload", action.key, {"sha256": local.sha256, "session": upload_key(target)}
         )
-        self._index.finish(journal)
-        self._transfers.finished(action.key)
-        self._log.activity("uploaded", local.path)
 
-    def _download(self, action: Action) -> None:
+        def work(stop: threading.Event) -> NodeOut:
+            return self._server.upload(
+                source,
+                target,
+                stop,
+                partial(self._transfers.progress, action.key),
+                sessions=self._index,  # resumed after a restart too (FR-XFER-01)
+            )
+
+        def finish(value: object) -> None:
+            if not isinstance(value, NodeOut):
+                raise TypeError("An upload returns the node")
+            self._crash_point("upload.completed")
+            remembered = self._remember(value)
+            self._index.put_entry(
+                Entry(
+                    key=action.key,
+                    path=local.path,
+                    node_id=remembered.node_id,
+                    kind=NodeKind.FILE,
+                    revision=remembered.revision,
+                    sha256=remembered.sha256,
+                    size=local.size,
+                    mtime_ns=local.mtime_ns,
+                    file_id=local.file_id,
+                )
+            )
+            self._index.finish(journal)
+            self._transfers.finished(action.key)
+            self._log.activity("uploaded", local.path)
+
+        def failed(exc: BaseException) -> None:
+            # Kept when no answer came (the upload may have completed: SyncCore.recover), and
+            # after anything that isn't an ordinary failure, as a crash would leave it.
+            if isinstance(exc, Exception) and not isinstance(exc, OfflineError):
+                self._index.finish(journal)
+
+        return Transfer(action, local.size, work, finish, failed)
+
+    def _prepare_download(self, action: Action) -> Transfer:
         """Into a temp file, verified, then moved over the target in one step (FR-SYNC-06)."""
         remote = _required(action.remote)
         node = remote.node
-        if node.sha256 is None:
+        sha256 = node.sha256
+        if sha256 is None:
             raise RetryLaterError("the server didn't give the file's hash")
         if action.local is not None:
             path = action.local.path  # keep the local spelling of an existing file
@@ -272,16 +315,26 @@ class Executor:
         # Named by node only: a newer version replaces a stale partial download.
         part = self._temp_dir() / f"{node.node_id}.part"
         self._transfers.started(action.key, path, Direction.DOWNLOAD, node.size)
-        self._server.download(
-            node.node_id,
-            node.sha256,
-            node.size,
-            part,
-            self._stop,
-            partial(self._transfers.progress, action.key),
-        )
+
+        def work(stop: threading.Event) -> None:
+            self._server.download(
+                node.node_id,
+                sha256,
+                node.size,
+                part,
+                stop,
+                partial(self._transfers.progress, action.key),
+            )
+
+        def finish(_: object) -> None:
+            self._finish_download(action, node, path, part)
+
+        return Transfer(action, node.size, work, finish, lambda _: None)
+
+    def _finish_download(self, action: Action, node: RemoteNode, path: str, part: Path) -> None:
         self._crash_point("download.fetched")
         target = self._disk(path)
+        assert node.sha256 is not None  # noqa: S101 - checked before it was fetched
         with self._journaled("download", action.key, {"sha256": node.sha256}) as journal:
             self._expect(target, action.local)
             if action.local is not None:  # Windows won't replace a read-only file
