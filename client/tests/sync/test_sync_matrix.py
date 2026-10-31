@@ -5,7 +5,8 @@ M5): {none, create, modify, delete} on this computer x the same on the server.
 overwritten (or the folder deleted and made again); on the server the item went to the trash
 and a new one took its name. After syncing, both sides must hold the same tree, and every
 piece of content must still be somewhere: in the tree, the Recycle Bin or the server trash.
-Renames and moves are roadmap F1 (OQ-15 sends them as delete + create until then).
+Renames and moves against every change are in test_moves.py; a crash at every step of every
+case is in test_matrix_crashes.py.
 """
 
 from dataclasses import dataclass, field
@@ -106,7 +107,7 @@ def device(tmp_path: Path, server: FakeFileServer) -> Device:
     return Device(tmp_path, server)
 
 
-def _check(device: Device, server: FakeFileServer, case: Case) -> None:
+def check(device: Device, server: FakeFileServer, case: Case) -> None:
     assert plain(device.tree()) == case.expected
     assert plain(server.tree()) == case.expected
     assert server.trashed() == case.trashed
@@ -123,9 +124,8 @@ def _sync(device: Device, mode: str, touched: list[str]) -> None:
     device.sync(local=touched if mode == "dirty" else None)
 
 
-@pytest.mark.parametrize("mode", MODES)
-@pytest.mark.parametrize("case", FILE_CASES, ids=str)
-def test_file(device: Device, server: FakeFileServer, case: Case, mode: str) -> None:
+def arrange_file(device: Device, server: FakeFileServer, case: Case) -> list[str]:
+    """Sync the starting point, then make the case's changes; returns what the watcher saw."""
     if case.synced_first:
         device.write("doc.txt", BASE)
         device.sync()
@@ -145,14 +145,17 @@ def test_file(device: Device, server: FakeFileServer, case: Case, mode: str) -> 
             server.put("doc.txt", REMOTE)
         case "delete":
             server.remove("doc.txt")
-
-    _sync(device, mode, [] if case.local == "none" else ["doc.txt"])
-    _check(device, server, case)
+    return [] if case.local == "none" else ["doc.txt"]
 
 
 @pytest.mark.parametrize("mode", MODES)
-@pytest.mark.parametrize("case", FOLDER_CASES, ids=str)
-def test_folder(device: Device, server: FakeFileServer, case: Case, mode: str) -> None:
+@pytest.mark.parametrize("case", FILE_CASES, ids=str)
+def test_file(device: Device, server: FakeFileServer, case: Case, mode: str) -> None:
+    _sync(device, mode, arrange_file(device, server, case))
+    check(device, server, case)
+
+
+def arrange_folder(device: Device, server: FakeFileServer, case: Case) -> list[str]:
     if case.synced_first:
         device.write("F/a.txt", A)
         device.sync()
@@ -178,8 +181,14 @@ def test_folder(device: Device, server: FakeFileServer, case: Case, mode: str) -
             server.remove("F")
 
     touched = {"none": [], "create": ["F"], "modify": ["F/local.txt"], "delete": ["F"]}
-    _sync(device, mode, touched[case.local])
-    _check(device, server, case)
+    return touched[case.local]
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("case", FOLDER_CASES, ids=str)
+def test_folder(device: Device, server: FakeFileServer, case: Case, mode: str) -> None:
+    _sync(device, mode, arrange_folder(device, server, case))
+    check(device, server, case)
 
 
 def test_same_edit_on_both_sides_is_not_a_conflict(device: Device, server: FakeFileServer) -> None:
