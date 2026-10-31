@@ -17,11 +17,16 @@ def get(session: Session, user_id: uuid.UUID) -> User | None:
 
 
 def get_for_update(session: Session, user_id: uuid.UUID) -> User | None:
-    """Lock the user row: quota usage is read and changed under this lock (database.md §7)."""
+    """Lock the user row: quota usage is read and changed under this lock (database.md §7).
+
+    `key_share`: FOR NO KEY UPDATE on PostgreSQL (the key never changes), which doesn't wait
+    for the key-share locks rows referencing this user take, such as a new upload session's.
+    With FOR UPDATE, starting and completing two uploads at once deadlocked (M10). Oracle
+    writes FOR UPDATE; its foreign-key checks don't lock the referenced row."""
     return session.scalars(
         select(User)
         .where(User.id == user_id)
-        .with_for_update()
+        .with_for_update(key_share=True)
         .execution_options(populate_existing=True)
     ).one_or_none()
 
