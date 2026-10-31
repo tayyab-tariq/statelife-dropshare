@@ -20,6 +20,7 @@ from dropshare_client.controllers.shared_controller import SharedController
 from dropshare_client.controllers.sync_controller import SyncController
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
 from dropshare_client.controllers.transfers_controller import TransfersController
+from dropshare_client.controllers.trash_controller import TrashController
 from dropshare_client.controllers.upload_controller import UploadController
 from dropshare_client.platform.base import VolumeInfo, VolumeKind
 from dropshare_client.platform.macos.attributes import MacFileAttributes
@@ -43,6 +44,7 @@ from dropshare_shared.schemas.sharing import (
     SharingOut,
     UserHit,
 )
+from dropshare_shared.schemas.trash import EmptyTrashOut, TrashItemOut
 from dropshare_shared.version import Version, parse_version
 
 SERVER_URL = "http://127.0.0.1:8000"
@@ -95,6 +97,12 @@ class FakeServer:
         self.shared: list[SharedItemOut] = []
         # Nodes Alice may read that aren't in any listed folder (a shared folder's root).
         self.extra_nodes: dict[uuid.UUID, NodeOut] = {}
+        # The trash (server services/trash.py): its items, and answers to give for some.
+        self.trash: list[TrashItemOut] = []
+        self.trash_errors: dict[uuid.UUID, httpx.Response] = {}
+        self.restored: dict[uuid.UUID, NodeOut] = {}  # by ID: restoring again answers with it
+        self.restore_names: dict[uuid.UUID, str] = {}  # names taken: comes back renamed
+        self.empty_limit = 200  # items one DELETE /trash removes, as the server's EMPTY_LIMIT
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.calls.append(f"{request.method} {request.url.path}")
@@ -122,6 +130,8 @@ class FakeServer:
             route = self._files_route(request.url.path)
         if route is None:
             route = self._sharing_route(request.method, request.url.path)
+        if route is None:
+            route = self._trash_route(request.method, request.url.path)
         if route is None:
             return _error(404, "NOT_FOUND", "Not found")
         return route(request)
@@ -253,6 +263,94 @@ class FakeServer:
             if method == "DELETE":
                 return lambda request: self._remove_member(member_id)
         return None
+
+    # --- the trash (server api/v1/trash.py) --------------------------------------------------
+
+    def _trash_route(
+        self, method: str, path: str
+    ) -> Callable[[httpx.Request], httpx.Response] | None:
+        parts = path.split("/")[3:]  # after /api/v1/
+        if parts == ["trash"]:
+            return {"GET": self._trash_list, "DELETE": self._trash_empty}.get(method)
+        if len(parts) == 2 and parts[0] == "trash" and method == "DELETE":
+            return lambda request: self._trash_act(uuid.UUID(parts[1]), restore=False)
+        if len(parts) == 3 and parts[0] == "trash" and parts[2] == "restore" and method == "POST":
+            return lambda request: self._trash_act(uuid.UUID(parts[1]), restore=True)
+        return None
+
+    def trash_item(self, name: str, *, can_delete: bool = True, size: int = 0) -> TrashItemOut:
+        item = TrashItemOut(
+            id=uuid.uuid4(),
+            namespace_id=self.namespace_id,
+            name=name,
+            kind=NodeKind.FILE,
+            size_bytes=size,
+            item_count=0,
+            trashed_at=datetime(2026, 10, 28, 9, 30, tzinfo=UTC),
+            trashed_by="Alice" if can_delete else "Bob",
+            location="Docs",
+            shared_folder=None if can_delete else "Budget",
+            can_delete=can_delete,
+        )
+        self.trash.append(item)
+        return item
+
+    def _trash_list(self, request: httpx.Request) -> httpx.Response:
+        query = PageQuery.model_validate(dict(request.url.params))
+        start = (query.page - 1) * query.limit
+        body = ListResponse[TrashItemOut](
+            data=self.trash[start : start + query.limit],
+            meta=Meta(page=query.page, limit=query.limit, total=len(self.trash)),
+        )
+        return httpx.Response(200, content=body.model_dump_json())
+
+    def _trash_act(self, node_id: uuid.UUID, *, restore: bool) -> httpx.Response:
+        """As the server: a restored item keeps its ID and comes back where it was (here, the
+        top of My files), and restoring it again answers with it; deleting it permanently
+        after it was restored is 409."""
+        if node_id in self.trash_errors:
+            return self.trash_errors[node_id]
+        if node_id in self.restored:
+            if not restore:
+                return _error(409, "REVISION_CONFLICT", "It was restored meanwhile.")
+            body = DataResponse[NodeOut](data=self.restored[node_id])
+            return httpx.Response(200, content=body.model_dump_json())
+        item = next((i for i in self.trash if i.id == node_id), None)
+        if item is None:
+            return _error(404, "NOT_FOUND", "Item not found.")
+        if not restore and not item.can_delete:
+            return _error(403, "FORBIDDEN", "Only the owner can delete this permanently.")
+        self.trash.remove(item)
+        if not restore:
+            return httpx.Response(204)
+        now = datetime(2026, 10, 28, 9, 30, tzinfo=UTC)
+        node = NodeOut(
+            id=item.id,
+            namespace_id=item.namespace_id,
+            parent_id=self.root_id,
+            name=self.restore_names.get(item.id, item.name),
+            kind=item.kind,
+            size_bytes=item.size_bytes,
+            content_hash="0" * 64 if item.kind == NodeKind.FILE else None,
+            revision=2,
+            created_at=now,
+            modified_at=now,
+            modified_by_user_id=uuid.UUID(int=1),
+        )
+        self.children[self.root_id].append(node)
+        self.restored[item.id] = node
+        return httpx.Response(200, content=DataResponse[NodeOut](data=node).model_dump_json())
+
+    def _trash_empty(self, request: httpx.Request) -> httpx.Response:
+        mine = [item for item in self.trash if item.can_delete]
+        gone = mine[: self.empty_limit]
+        self.trash = [item for item in self.trash if item not in gone]
+        body = EmptyTrashOut(
+            removed=len(gone),
+            freed_bytes=sum(i.size_bytes for i in gone),
+            more=len(mine) > len(gone),
+        )
+        return httpx.Response(200, content=DataResponse[EmptyTrashOut](data=body).model_dump_json())
 
     def _node(self, node_id: uuid.UUID) -> httpx.Response:
         node = self.node(node_id)
@@ -604,6 +702,7 @@ class Client:
     uploads: UploadController
     share: ShareController
     shared: SharedController
+    trashed: TrashController
     revealed: list[Path]  # what "Show in folder" asked the system to show
     engines: FakeEngines
     trash: Path

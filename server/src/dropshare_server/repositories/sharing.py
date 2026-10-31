@@ -2,7 +2,7 @@
 
 import hashlib
 import uuid
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 
 from sqlalchemy import ColumnElement, delete, or_, select
 from sqlalchemy.orm import Session
@@ -11,6 +11,8 @@ from dropshare_server.models import FileShare, GroupMember, NamespaceMember, Nod
 from dropshare_shared.schemas.sharing import GranteeKind, ShareRole
 
 type Share = NamespaceMember | FileShare
+
+_IN_LIST_LIMIT = 1000  # Oracle ORA-01795
 
 
 def grantee_key(target_id: uuid.UUID, user_id: uuid.UUID | None, group_id: uuid.UUID | None) -> str:
@@ -157,3 +159,13 @@ def mount_holders(session: Session, namespace_ids: Collection[uuid.UUID]) -> lis
             )
         )
     )
+
+
+def delete_file_shares(session: Session, node_ids: Sequence[uuid.UUID]) -> None:
+    """Remove the single-file shares of these nodes (they are being purged)."""
+    for start in range(0, len(node_ids), _IN_LIST_LIMIT):
+        session.execute(
+            delete(FileShare)
+            .where(FileShare.node_id.in_(node_ids[start : start + _IN_LIST_LIMIT]))
+            .execution_options(synchronize_session=False)
+        )

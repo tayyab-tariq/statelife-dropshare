@@ -358,3 +358,18 @@ def test_expire_uploads_job_runs_from_the_cli(cli: Cli) -> None:
 
     assert code == 0
     assert out == "Expired 0 upload(s); removed 0 staged upload folder(s).\n"
+
+
+@pytest.mark.parametrize(
+    ("job", "output"),
+    [
+        ("purge-trash", "Permanently deleted 0 item(s) from the trash, freeing 0 bytes.\n"),
+        ("gc-blobs", "Removed 0 replaced version(s) and 0 unreferenced blob(s).\n"),
+        ("purge-audit", "Removed 0 audit event(s) older than 365 days.\n"),
+    ],
+)
+def test_cleanup_jobs_run_from_the_cli(cli: Cli, job: str, output: str) -> None:
+    code, out, _ = cli("jobs", "run", job)
+
+    assert code == 0
+    assert out == output

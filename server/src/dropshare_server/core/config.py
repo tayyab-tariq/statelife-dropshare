@@ -2,9 +2,9 @@
 
 from ipaddress import IPv4Address, IPv6Address
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from dropshare_shared.version import parse_version
@@ -66,6 +66,36 @@ class Settings(DatabaseSettings):
 
     # Reverse proxies whose X-Forwarded-For is trusted for the audit source IP.
     trusted_proxies: list[IPv4Address | IPv6Address] = []
+
+    # Cleanup jobs (FR-TRASH-04, NFR-REL-05, FR-AUDIT-03).
+    trash_retention_days: int = Field(default=30, ge=1)
+    # Blobs no version row points at, and versions superseded by a newer one, are kept this long
+    # so a download that started before is never cut off.
+    blob_grace_hours: int = Field(default=24, ge=1)
+    audit_retention_days: int = Field(default=365, ge=1)
+    # The account purge-audit uses: in production the app user may only insert and read audit
+    # rows (FR-AUDIT-03). Unset (dev, test) means the DB_USER account.
+    audit_purge_db_user: str | None = Field(default=None, min_length=1)
+    audit_purge_db_password: SecretStr | None = Field(default=None, min_length=1)
+
+    @model_validator(mode="after")
+    def _audit_purge_account_complete(self) -> Self:
+        if (self.audit_purge_db_user is None) != (self.audit_purge_db_password is None):
+            raise ValueError("Set both AUDIT_PURGE_DB_USER and AUDIT_PURGE_DB_PASSWORD, or neither")
+        return self
+
+    def audit_purge_database(self) -> DatabaseSettings:
+        """The database settings purge-audit connects with."""
+        if self.audit_purge_db_user is None or self.audit_purge_db_password is None:
+            return self
+        return self.model_copy(
+            update={
+                "db_user": self.audit_purge_db_user,
+                "db_password": self.audit_purge_db_password,
+                "db_pool_size": 1,
+                "db_max_overflow": 0,
+            }
+        )
 
     @field_validator("min_client_version")
     @classmethod

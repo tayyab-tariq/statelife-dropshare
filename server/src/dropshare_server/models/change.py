@@ -27,7 +27,8 @@ class Change(Base):
     id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
     namespace_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("namespaces.id"))
     seq: Mapped[int] = mapped_column(BigInteger)
-    node_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("nodes.id"), index=True)
+    # No foreign key: rows outlive nodes purged from the trash (the journal is append-only).
+    node_id: Mapped[uuid.UUID] = mapped_column(Uuid, index=True)
     change_type: Mapped[ChangeType] = mapped_column(string_enum(ChangeType))
     occurred_at: Mapped[datetime] = mapped_column(UtcDateTime())
     actor_user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
@@ -39,3 +40,6 @@ class Change(Base):
     revision: Mapped[int] = mapped_column(Integer)
     modified_at: Mapped[datetime] = mapped_column(UtcDateTime())
     modified_by_user_id: Mapped[uuid.UUID] = mapped_column(Uuid)
+    # Set when the node is a mount (OQ-31). Kept here, not read from `nodes`, so the rows of
+    # items purged from the trash are still served (FR-TRASH-04).
+    mount_namespace_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)

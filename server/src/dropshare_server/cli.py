@@ -19,7 +19,9 @@ from dropshare_server.core.config import Settings
 from dropshare_server.core.db import create_db_engine, create_session_factory
 from dropshare_server.core.errors import AppError
 from dropshare_server.services import audit as audit_service
+from dropshare_server.services import blobs as blob_service
 from dropshare_server.services import groups as group_service
+from dropshare_server.services import trash as trash_service
 from dropshare_server.services import uploads as upload_service
 from dropshare_server.services import users as user_service
 from dropshare_server.services.audit import AuditTarget
@@ -183,19 +185,73 @@ def _export_audit(
 
 
 def _run_job(
-    args: argparse.Namespace, sessions: sessionmaker[Session], settings: Settings, _: CallContext
+    args: argparse.Namespace, sessions: sessionmaker[Session], settings: Settings, ctx: CallContext
 ) -> int:
     """Scheduled maintenance, run by the OS scheduler (NFR-REL-05). Jobs log what they did."""
+    now = datetime.now(UTC)
     match args.job:
         case "expire-uploads":
-            result = upload_service.expire_uploads(
-                sessions, create_storage_backend(settings), datetime.now(UTC)
-            )
+            result = upload_service.expire_uploads(sessions, create_storage_backend(settings), now)
             _out(
                 f"Expired {result.expired} upload(s); "
                 f"removed {result.swept} staged upload folder(s)."
             )
+        case "purge-trash":
+            purged = trash_service.purge_expired(
+                sessions, create_storage_backend(settings), ctx, now, settings.trash_retention_days
+            )
+            _out(
+                f"Permanently deleted {purged.items} item(s) from the trash, "
+                f"freeing {purged.freed_bytes} bytes."
+            )
+        case "gc-blobs":
+            try:
+                collected = blob_service.collect(
+                    sessions,
+                    create_storage_backend(settings),
+                    now,
+                    settings.blob_grace_hours,
+                    force=args.force,
+                )
+            except blob_service.TooManyOrphansError as exc:
+                _err(
+                    f"Stopped: {exc.orphans} of {exc.blobs} stored files have no record in this "
+                    "database, which looks like the wrong database or an older backup. Nothing "
+                    "unreferenced was deleted. Check the DB_* settings; if this is expected, "
+                    "run again with --force."
+                )
+                return 1
+            _out(
+                f"Removed {collected.versions} replaced version(s) and "
+                f"{collected.orphans} unreferenced blob(s)."
+            )
+        case "purge-audit":
+            removed = _purge_audit(sessions, settings, ctx, now)
+            _out(
+                f"Removed {removed} audit event(s) older than {settings.audit_retention_days} days."
+            )
     return 0
+
+
+def _purge_audit(
+    sessions: sessionmaker[Session], settings: Settings, ctx: CallContext, now: datetime
+) -> int:
+    """Through the purge account when one is set (FR-AUDIT-03), else the app's own."""
+    if settings.audit_purge_db_user is None:
+        _err(
+            "AUDIT_PURGE_DB_USER isn't set: purging with the app's own account. In production, "
+            "only a separate account should be able to delete audit events."
+        )
+        return audit_service.purge_expired(
+            sessions, sessions, ctx, now, settings.audit_retention_days
+        )
+    engine = create_db_engine(settings.audit_purge_database())
+    try:
+        return audit_service.purge_expired(
+            create_session_factory(engine), sessions, ctx, now, settings.audit_retention_days
+        )
+    finally:
+        engine.dispose()
 
 
 def _day_start(day: date | None) -> datetime | None:
@@ -300,7 +356,12 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="command", required=True
     )
     run = jobs.add_parser("run", help="Run one job now")
-    run.add_argument("job", choices=["expire-uploads"])
+    run.add_argument("job", choices=["expire-uploads", "purge-trash", "gc-blobs", "purge-audit"])
+    run.add_argument(
+        "--force",
+        action="store_true",
+        help="gc-blobs: delete unreferenced blobs even when unusually many look unreferenced",
+    )
     run.set_defaults(handler=_run_job, audit_action=None)
     return parser
 

@@ -14,6 +14,7 @@ import shutil
 import tempfile
 import uuid
 from collections.abc import Iterable, Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import BinaryIO
 
@@ -78,6 +79,20 @@ class LocalFilesystemBackend:
         for path in staging.iterdir():
             with contextlib.suppress(ValueError):  # not one of ours: leave it alone
                 yield uuid.UUID(hex=path.name)
+
+    def blobs(self) -> Iterator[tuple[str, datetime]]:
+        blobs = self._root / "blobs"
+        if not blobs.is_dir():
+            return
+        for path in blobs.glob("*/*/*"):
+            key = path.relative_to(self._root).as_posix()
+            if not BLOB_KEY_PATTERN.fullmatch(key):  # anything else (temp files) is left alone
+                continue
+            try:
+                written = path.stat().st_mtime
+            except FileNotFoundError:  # deleted meanwhile (a purge, or this very sweep)
+                continue
+            yield key, datetime.fromtimestamp(written, UTC)
 
     def health_check(self) -> None:
         with tempfile.NamedTemporaryFile(dir=self._root, prefix=".health-"):

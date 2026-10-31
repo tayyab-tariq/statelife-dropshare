@@ -41,6 +41,7 @@ class CloudNode:
     content: bytes = b""
     revision: int = 1
     trashed: bool = False
+    trash_root: uuid.UUID | None = None  # the item deleted with it (server: trash_root_id)
     mount_namespace_id: uuid.UUID | None = None
     modified_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
@@ -175,11 +176,60 @@ class FakeCloud:
 
     def trash(self, node: CloudNode) -> None:
         node.revision += 1
-        node.trashed = True
+        node.trashed, node.trash_root = True, node.id
         for item in self.below(node):
             if item.namespace_id == node.namespace_id:
-                item.trashed = True
+                item.trashed, item.trash_root = True, node.id
+        shared = self.namespaces.get(node.mount_namespace_id) if node.mount_namespace_id else None
+        if shared is not None and shared.owner == self.namespaces[node.namespace_id].owner:
+            # The owner's own shared folder: its contents go with it, with no rows of their own.
+            for item in self.below(self.nodes[shared.root_id]):
+                item.trashed, item.trash_root = True, node.id
         self.record(ChangeType.TRASHED, node)
+
+    def restore(self, node: CloudNode) -> None:
+        """Restore from the trash as the server does (FR-TRASH-02): what was deleted with it and
+        nothing deleted earlier on its own; a deleted parent recreated by name; a taken name
+        "(restored)"; each item with a new revision and a CREATED row, parents first."""
+        with self.lock:
+            group = [n for n in self.nodes.values() if n.trash_root == node.id]
+            parent_id = self._live_parent(node)
+            assert node.name is not None
+            name = node.name
+            if self.child(parent_id, name) is not None:
+                stem, dot, extension = name.rpartition(".")
+                name = f"{stem} (restored).{extension}" if dot and stem else f"{name} (restored)"
+            node.parent_id, node.name = parent_id, name
+            for item in group:
+                item.trashed, item.trash_root = False, None
+                item.revision += 1
+            ordered = [node] + [n for n in self.below(node) if n in group]
+            if node.mount_namespace_id is not None:
+                root = self.nodes[self.namespaces[node.mount_namespace_id].root_id]
+                ordered += [n for n in self.below(root) if n in group]
+            for item in ordered:
+                self.record(ChangeType.CREATED, item)
+
+    def _live_parent(self, node: CloudNode) -> uuid.UUID:
+        """The live folder above `node`, recreating deleted ones by name on the way down."""
+        missing: list[CloudNode] = []
+        assert node.parent_id is not None
+        parent = self.nodes[node.parent_id]
+        while parent.trashed:
+            missing.append(parent)
+            assert parent.parent_id is not None
+            parent = self.nodes[parent.parent_id]
+        for gone in reversed(missing):
+            assert gone.name is not None
+            existing = self.child(parent.id, gone.name)
+            if existing is None or existing.kind != NodeKind.FOLDER:
+                existing = CloudNode(
+                    uuid.uuid4(), parent.namespace_id, parent.id, gone.name, NodeKind.FOLDER
+                )
+                self.nodes[existing.id] = existing
+                self.record(ChangeType.CREATED, existing)
+            parent = existing
+        return parent.id
 
     # --- other people's actions (server side) ------------------------------------------
 

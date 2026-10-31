@@ -48,9 +48,16 @@ class _TestDatabaseSettings(BaseSettings):
     password: SecretStr = Field(min_length=1)
 
 
+class SettingsWithoutEnvFile(Settings):
+    """Settings that never read server/.env, so tests don't depend on the developer's values
+    (only TEST_DB_* come from there, through _TestDatabaseSettings). Validating Settings
+    itself would still read the file, even through model_validate."""
+
+    model_config = SettingsConfigDict(**{**Settings.model_config, "env_file": None})
+
+
 def _settings(storage_root: Path, **database: object) -> Settings:
-    # Explicit values for everything, so tests never depend on the developer's server/.env.
-    return Settings.model_validate(
+    return SettingsWithoutEnvFile.model_validate(
         {**database, "storage_local_root": storage_root, "token_secret": TEST_TOKEN_SECRET}
     )
 
@@ -164,6 +171,8 @@ def cli(
     for name, value in values.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setattr("getpass.getuser", lambda: "it-admin")
+    # The CLI builds its own Settings: keep the developer's server/.env out of those too.
+    monkeypatch.setitem(Settings.model_config, "env_file", None)
 
     def run(*argv: str) -> tuple[int, str, str]:
         code = cli_main(list(argv))

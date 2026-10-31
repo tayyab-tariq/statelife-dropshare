@@ -332,3 +332,79 @@ def new_shares(names: list[str]) -> str:
     if len(names) == 1:
         return f"“{names[0]}” was shared with you."
     return f"{len(names)} items were shared with you."
+
+
+# --- trash (FR-TRASH-01 … 03) -------------------------------------------------------------
+
+TRASH = "Trash"
+TRASH_EMPTY = (
+    "Nothing in the trash. What you delete is kept here for a while, then deleted for good."
+)
+DELETE_FOREVER = "Delete permanently…"
+ONLY_OWNER_DELETES_SELECTED = (
+    "Only the owner can delete these permanently. You can restore what you deleted."
+)
+NOT_IN_TRASH = "It isn't in the trash any more: it was restored or deleted by someone else."
+ONLY_OWNER_DELETES = "Only the owner can delete this permanently."
+
+
+def restored(count: int) -> str:
+    if count == 1:
+        return "Restored. It's back where it was and syncs to your computers in a moment."
+    return (
+        f"{count} items restored. They're back where they were and sync to your computers in "
+        "a moment."
+    )
+
+
+def restored_as(name: str | None) -> str:
+    return f"Restored as “{name}”: its name was taken. It syncs to your computers in a moment."
+
+
+def restoring(position: int, total: int) -> str:
+    return f"Restoring {position} of {total}…"
+
+
+def deleting_forever(position: int, total: int) -> str:
+    return f"Deleting {position} of {total} permanently…"
+
+
+def emptying(removed: int) -> str:
+    return f"Emptying the trash… {removed} deleted so far."
+
+
+def trash_action_stopped(done: int) -> str:
+    return f"Stopped. {done} done before that; the rest is still in the trash."
+
+
+def deleted_forever(count: int) -> str:
+    return "Deleted permanently." if count == 1 else f"{count} items deleted permanently."
+
+
+def trash_emptied(count: int, freed: int) -> str:
+    if count == 0:
+        return "The trash was already empty."
+    return f"Trash emptied. {size_text(freed)} freed."
+
+
+def confirm_delete_forever(names: list[str], kept: int = 0) -> str:
+    """Names up to three items (ui.md §5), and says what stays because the user can't delete it."""
+    shown = ", ".join(f"“{name}”" for name in names[:3])
+    more = len(names) - 3
+    what = shown if more <= 0 else f"{shown} and {more} more"
+    text = f"{what} will be deleted permanently. This can't be undone."
+    if kept:
+        whose = "1 item you don't own stays" if kept == 1 else f"{kept} items you don't own stay"
+        text += f" {whose} in the trash."
+    return text
+
+
+CONFIRM_EMPTY_TRASH = (
+    "Everything in your trash will be deleted permanently, including what others deleted from "
+    "folders you shared. This can't be undone."
+)
+
+
+def some_failed(failed: int, reason: str) -> str:
+    what = "1 item" if failed == 1 else f"{failed} items"
+    return f"{what} couldn't be done. {reason}"
