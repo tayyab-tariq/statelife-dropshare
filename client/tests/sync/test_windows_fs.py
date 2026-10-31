@@ -13,6 +13,7 @@ from sync_fakes import Device, FakeFileServer
 
 from dropshare_client.platform.windows.attributes import WindowsFileAttributes
 from dropshare_client.sync.errors import UnsafePathError
+from dropshare_client.sync.transfers import TransferEvent, TransferStatus
 
 if sys.platform == "win32":
     from dropshare_client.platform.windows.recycle_bin import WindowsRecycleBin
@@ -72,9 +73,12 @@ def test_a_download_waits_while_the_file_is_open_elsewhere(tmp_path: Path) -> No
 
 
 def test_an_upload_waits_while_the_file_is_locked(tmp_path: Path) -> None:
+    """FR-SYNC-06: shown as waiting in Transfers, with why, and sent once it is closed."""
     server = FakeFileServer()
     device = Device(tmp_path, server)
     device.write("budget.xlsx", b"numbers")
+    events: list[TransferEvent] = []
+    device.restart(transfer=events.append)
     device.core.connect()
     device.core.fetch()
 
@@ -82,6 +86,8 @@ def test_an_upload_waits_while_the_file_is_locked(tmp_path: Path) -> None:
         result = device.core.cycle({""})
         assert "budget.xlsx" in result.retry
         assert device.index.problems() == []  # waiting, not "can't sync"
+        waiting = [e for e in events if e.status is TransferStatus.WAITING]
+        assert waiting and "another program" in waiting[-1].reason
 
     device.sync()
     assert server.tree() == {"budget.xlsx": b"numbers"}

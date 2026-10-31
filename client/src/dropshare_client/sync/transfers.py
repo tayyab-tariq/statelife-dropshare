@@ -1,10 +1,11 @@
 """Per-file transfer progress for the Transfers view and the tray (FR-CLIENT-08).
 
 The engine reports each upload and download as it is queued, starts, moves bytes, and ends.
-Byte updates are throttled here, on the engine's thread, so the UI gets at most about four
-per second per file whatever the chunk or read size (transfers.md "Scheduling").
+Byte updates arrive from transfer threads and are throttled here, so the UI gets at most about
+four per second per file whatever the chunk or read size (transfers.md "Scheduling").
 """
 
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -43,8 +44,9 @@ class TransferEvent:
 
 
 class TransferReporter:
-    """Turns the engine's transfer steps into events, throttling byte progress. Used on the
-    engine's thread only."""
+    """Turns the engine's transfer steps into events, throttling byte progress. Byte progress
+    arrives from transfer threads (FR-XFER-03), so every step takes the same lock; events for
+    one file therefore go out in the order they happened."""
 
     def __init__(
         self,
@@ -58,6 +60,7 @@ class TransferReporter:
         self._interval = interval
         self._current: dict[str, TransferEvent] = {}
         self._last_sent: dict[str, float] = {}
+        self._lock = threading.Lock()
 
     def queued(self, key: str, path: str, direction: Direction, total: int) -> None:
         self._send(TransferEvent(key, path, direction, TransferStatus.QUEUED, 0, total))
@@ -67,18 +70,20 @@ class TransferReporter:
 
     def progress(self, key: str, done: int) -> None:
         """Bytes so far; sent only if the last update for `key` is old enough."""
-        event = self._current.get(key)
-        if event is None or event.status is not TransferStatus.ACTIVE or done == event.done:
-            return
-        updated = replace(event, done=max(event.done, min(done, event.total)))
-        self._current[key] = updated
-        if self._clock() - self._last_sent.get(key, float("-inf")) >= self._interval:
-            self._send(updated)
+        with self._lock:
+            event = self._current.get(key)
+            if event is None or event.status is not TransferStatus.ACTIVE or done == event.done:
+                return
+            updated = replace(event, done=max(event.done, min(done, event.total)))
+            self._current[key] = updated
+            if self._clock() - self._last_sent.get(key, float("-inf")) >= self._interval:
+                self._send_locked(updated)
 
     def finished(self, key: str) -> None:
-        event = self._current.get(key)
-        if event is not None:
-            self._send(replace(event, status=TransferStatus.DONE, done=event.total))
+        with self._lock:
+            event = self._current.get(key)
+            if event is not None:
+                self._send_locked(replace(event, status=TransferStatus.DONE, done=event.total))
 
     def waiting(self, key: str, reason: str) -> None:
         self._end(key, TransferStatus.WAITING, reason)
@@ -87,11 +92,16 @@ class TransferReporter:
         self._end(key, TransferStatus.FAILED, reason)
 
     def _end(self, key: str, status: TransferStatus, reason: str) -> None:
-        event = self._current.get(key)
-        if event is not None:
-            self._send(replace(event, status=status, reason=reason))
+        with self._lock:
+            event = self._current.get(key)
+            if event is not None:
+                self._send_locked(replace(event, status=status, reason=reason))
 
     def _send(self, event: TransferEvent) -> None:
+        with self._lock:
+            self._send_locked(event)
+
+    def _send_locked(self, event: TransferEvent) -> None:
         if event.status in (TransferStatus.QUEUED, TransferStatus.ACTIVE):
             self._current[event.key] = event
         else:

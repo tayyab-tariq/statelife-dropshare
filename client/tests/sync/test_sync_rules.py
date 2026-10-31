@@ -167,6 +167,7 @@ def test_a_refused_upload_is_listed_and_the_rest_continues(
     server.fail(
         "upload",
         ApiError(409, ErrorCode.QUOTA_EXCEEDED, "There isn't enough space left in your quota."),
+        skip=1,  # the smaller file goes first (FR-XFER-03)
     )
 
     device.sync()

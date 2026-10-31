@@ -1,6 +1,7 @@
 """Per-file transfer events for the Transfers view (FR-CLIENT-08): throttled to ~4 updates a
 second per file, increasing, ending at 100%; failures say whether they'll be retried."""
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -124,8 +125,9 @@ def test_a_refused_upload_fails_with_the_reason_and_a_busy_server_waits(
 ) -> None:
     device.write("big.bin", b"too big")
     device.write("later.txt", b"later")
-    server.fail("upload", ApiError(409, ErrorCode.QUOTA_EXCEEDED, "Over quota"))
+    # The smaller file goes first (FR-XFER-03): it meets the busy server.
     server.fail("upload", ApiError(503, ErrorCode.SERVICE_UNAVAILABLE, "Busy"))
+    server.fail("upload", ApiError(409, ErrorCode.QUOTA_EXCEEDED, "Over quota"))
     events = _record(device)
 
     device.core.connect()
@@ -165,10 +167,17 @@ def test_a_file_open_in_another_program_waits_with_that_reason(
     assert "another program" in last.reason
 
 
-def test_stopping_mid_transfer_leaves_it_waiting(device: Device, server: FakeFileServer) -> None:
+def test_stopping_mid_transfer_leaves_it_waiting(
+    device: Device, server: FakeFileServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
     device.write("a.txt", b"a")
     events = _record(device)
-    server.fail("upload", TransferCancelledError())  # paused while sending
+
+    def paused_while_sending(*_: object, **__: object) -> None:
+        device.stop.set()  # the user pauses; the transfer notices and stops
+        raise TransferCancelledError()
+
+    monkeypatch.setattr(server, "upload", paused_while_sending)
 
     device.core.connect()
     device.core.fetch()
@@ -180,3 +189,49 @@ def test_stopping_mid_transfer_leaves_it_waiting(device: Device, server: FakeFil
         TransferStatus.WAITING,
         "Paused.",
     )
+
+
+def test_progress_from_several_threads_stays_in_order_per_file() -> None:
+    """Transfers run side by side (FR-XFER-03): each file's events still only go forward and
+    end at its size."""
+    events: list[TransferEvent] = []
+    reporter = TransferReporter(events.append, interval=0.0)
+    keys = [f"f{n}.bin" for n in range(4)]
+    for key in keys:
+        reporter.started(key, key, Direction.UPLOAD, 1000)
+
+    def send(key: str) -> None:
+        for done in range(0, 1001, 10):
+            reporter.progress(key, done)
+        reporter.finished(key)
+
+    threads = [threading.Thread(target=send, args=(key,)) for key in keys]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    for key in keys:
+        mine = [e for e in events if e.key == key and e.status is TransferStatus.ACTIVE]
+        assert [e.done for e in mine] == sorted(e.done for e in mine)
+        assert [e for e in events if e.key == key][-1].status is TransferStatus.DONE
+
+
+def test_a_locked_file_waits_and_goes_once_it_is_released(
+    device: Device, server: FakeFileServer
+) -> None:
+    """FR-SYNC-06 on any system: the file can't be read while another program holds it."""
+    device.write("budget.xlsx", b"numbers")
+    events = _record(device)
+    server.fail("upload", PermissionError(32, "The process cannot access the file"))
+
+    device.core.connect()
+    device.core.fetch()
+    first = device.core.cycle({""})
+    device.sync()  # released: the retry goes through
+
+    waiting = [e for e in events if e.status is TransferStatus.WAITING]
+    assert "budget.xlsx" in first.retry and device.index.problems() == []
+    assert waiting and "another program" in waiting[-1].reason
+    assert server.tree() == {"budget.xlsx": b"numbers"}
+    assert events[-1].status is TransferStatus.DONE

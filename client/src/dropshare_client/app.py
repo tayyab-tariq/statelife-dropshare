@@ -174,6 +174,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     files = RemoteFiles(api)
     sharing = Sharing(api, files)
+    # Signed out: the next user never resumes this one's uploads (FR-XFER-01).
+    session.signed_out.connect(lambda _: files.forget_uploads())
     index_path = app_data / "index.db"
 
     def make_engine(

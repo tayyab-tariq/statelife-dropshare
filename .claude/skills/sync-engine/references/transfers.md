@@ -7,8 +7,8 @@ Requirements: FR-XFER-01..03, FR-SYNC-03, NFR-REL-02/04, NFR-PERF-02/04.
 
 1. Wait until the file is stable (FR-SYNC-06) and can be opened for reading. Open it with sharing that tolerates other readers; if it is locked, retry later.
 2. Hash the whole file (SHA-256) in a streaming pass. Note size and mtime.
-3. `POST /uploads` with parent/name (new file) or node ID + base revision (edit), size, and hash. Store the returned upload ID in the journal.
-4. For each missing chunk (8 MiB; ask `GET /uploads/{id}` after a restart), read the slice, compute its SHA-256, `PUT /uploads/{id}/chunks/{index}` with `X-Chunk-SHA256`. Up to 2–3 chunks of the same file in flight.
+3. `POST /uploads` with parent/name (new file) or node ID + base revision (edit), size, and hash. Store the returned upload ID in the index's `upload_sessions` table, keyed by the target, with the hash and size it is for (OQ-39). A stored session for other content is cancelled (`DELETE /uploads/{id}`) and a new one started; one the server ended (cancelled, expired, 404) is forgotten. The upload's journal row records the session key, so recovery forgets the session once it finds the upload completed. A replayed completion whose node is no longer the target (moved since) is forgotten and uploaded again.
+4. For each missing chunk (8 MiB; ask `GET /uploads/{id}` after a restart), read the slice, compute its SHA-256, `PUT /uploads/{id}/chunks/{index}` with `X-Chunk-SHA256`. One chunk at a time per file; files run in parallel instead (Scheduling). Chunks of one file in parallel only if a measurement over a real network shows one stream below NFR-PERF-04 (OQ-39).
 5. Before completing, check the file hasn't changed since step 2 (size + mtime). If it has, discard the session and start over.
 6. `POST /uploads/{id}/complete`. On success, update the index with the returned node, revision, and hash. On `REVISION_CONFLICT`, resolve as a conflict.
 
@@ -23,9 +23,12 @@ Requirements: FR-XFER-01..03, FR-SYNC-03, NFR-REL-02/04, NFR-PERF-02/04.
 
 ## Scheduling (FR-XFER-03)
 
-- Bounded concurrency: default 4 files in parallel, configurable.
-- Two queues by size (small < 4 MiB first) so many small changes aren't stuck behind one large file.
-- Progress callbacks are throttled (~4 updates/s per transfer) before reaching the UI.
+- Bounded concurrency: default 4 files in parallel (`MAX_TRANSFERS`, a setting in M11), on a pool that outlives a cycle (`SyncCore._transfer_all`).
+- One queue per cycle, smallest first. Each transfer is prepared (journal row, "started" in Transfers) only when a slot is free, so nothing is started before its turn and a pause sends nothing more.
+- Once only files of 4 MiB or more (`SMALL_TRANSFER_BYTES`) are still moving, the cycle ends without them: the next cycle plans what changed meanwhile and sends it beside them; the files in flight are left out of planning until they finish, and are recorded by the cycle after.
+- Transfer threads only move bytes (and write the upload session row); everything recorded — entries, remote tree, journal — happens on the engine thread as each finishes.
+- Over-quota for an upload while others are still moving is retried (each reserves its whole size); only with nothing else moving is it "Can't sync".
+- Progress callbacks are throttled (~4 updates/s per transfer) before reaching the UI; the reporter is locked, since bytes arrive from transfer threads.
 
 ## Remote change notifications
 

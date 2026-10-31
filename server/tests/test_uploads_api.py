@@ -4,21 +4,34 @@ Test settings use 4-byte chunks, a 4096-byte file size limit and a 1024-byte quo
 """
 
 import hashlib
+import threading
+import time
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from httpx import Response
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from dropshare_server.models import AuditEvent, Change, FileVersion, UploadSession, User
+from dropshare_server.core.config import Settings
+from dropshare_server.models import (
+    AuditEvent,
+    Change,
+    FileVersion,
+    Namespace,
+    Node,
+    UploadSession,
+    User,
+)
 from dropshare_server.repositories import uploads as upload_repository
 from dropshare_server.services import uploads as upload_service
 from dropshare_server.storage.local import LocalFilesystemBackend
 from dropshare_shared.schemas.audit import AuditAction, AuditOutcome
+from dropshare_shared.schemas.uploads import UploadCreateIn
 
 type Account = dict[str, str]
 type SignIn = Callable[..., Account]
@@ -506,3 +519,57 @@ def test_denied_upload_access_records_the_target(
 
     [event] = audit_events(AuditAction.ACCESS_DENIED)
     assert (event.target_type, event.target_id) == ("upload", upload_id)
+
+
+def test_starting_an_upload_never_holds_the_owner_while_waiting_for_its_folder(
+    signed_in: dict[str, str],
+    root_of: RootOf,
+    db_settings: Settings,
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Completing an upload locks its folder, then the owner. Starting one must take them in
+    the same order, or two uploads of one user deadlock (M10: uploads run in parallel). Only
+    PostgreSQL locks a referenced row while checking a foreign key; Oracle doesn't, so the
+    deadlock can't happen there."""
+    if db_settings.db_dialect != "postgresql":
+        pytest.skip("the foreign-key lock this guards against is PostgreSQL's")
+    root = uuid.UUID(root_of(signed_in))
+    with session_factory() as session:
+        user = session.scalars(select(User).where(User.username == "alice")).one()
+    body = UploadCreateIn(parent_id=root, name="new.txt", size_bytes=1, sha256=_sha(b"x"))
+    started: list[object] = []
+
+    def start() -> None:
+        with session_factory.begin() as session:
+            started.append(upload_service.start(session, db_settings, user.id, body))
+
+    with session_factory.begin() as completing:  # as `complete` does: the folder first...
+        completing.scalars(select(Node).where(Node.id == root).with_for_update()).one()
+        starter = threading.Thread(target=start)
+        starter.start()
+        _wait_for_a_blocked_query(session_factory)  # the start, waiting for the folder
+        # ...then the owner and the namespace, as the repositories lock them. Held by the
+        # start, this would fail at once (in `complete`, a deadlock).
+        completing.scalars(
+            select(User).where(User.id == user.id).with_for_update(nowait=True, key_share=True)
+        ).one()
+        completing.scalars(
+            select(Namespace)
+            .where(Namespace.owner_user_id == user.id)
+            .with_for_update(nowait=True, key_share=True)
+        ).all()
+    starter.join(timeout=10)
+
+    assert len(started) == 1
+
+
+def _wait_for_a_blocked_query(session_factory: sessionmaker[Session]) -> None:
+    """Until another session waits for a lock (PostgreSQL), so the test never races it."""
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        with session_factory() as session:
+            waiting = session.scalar(text("SELECT count(*) FROM pg_locks WHERE NOT granted"))
+        if waiting:
+            return
+        time.sleep(0.02)
+    raise AssertionError("the upload start never waited for the folder")

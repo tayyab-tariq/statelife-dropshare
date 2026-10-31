@@ -18,7 +18,14 @@ from pathlib import Path
 from sync_fakes import Tree, sha
 
 from dropshare_client.services.errors import ApiError, RemoteContentChangedError, SourceChangedError
-from dropshare_client.services.files import NewFile, Progress, SourceFile, UploadTarget, no_progress
+from dropshare_client.services.files import (
+    NewFile,
+    Progress,
+    SourceFile,
+    UploadSessions,
+    UploadTarget,
+    no_progress,
+)
 from dropshare_shared.errors import ErrorCode
 from dropshare_shared.naming import normalize_name
 from dropshare_shared.schemas.nodes import (
@@ -528,6 +535,8 @@ class Account:
         target: UploadTarget,
         stop: threading.Event,
         progress: Progress = no_progress,
+        *,
+        sessions: UploadSessions | None = None,
     ) -> NodeOut:
         with self.cloud.lock:
             self.calls.append("upload")

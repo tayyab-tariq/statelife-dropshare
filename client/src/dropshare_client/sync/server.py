@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Protocol
 
-from dropshare_client.services.files import Progress, SourceFile, UploadTarget
+from dropshare_client.services.files import Progress, SourceFile, UploadSessions, UploadTarget
 from dropshare_shared.schemas.nodes import NamespaceOut, NodeOut
 from dropshare_shared.schemas.sync import ChangesResponse
 
@@ -45,6 +45,8 @@ class FileServer(Protocol):
         target: UploadTarget,
         stop: threading.Event,
         progress: Progress = ...,
+        *,
+        sessions: UploadSessions | None = ...,
     ) -> NodeOut: ...
 
     def download(

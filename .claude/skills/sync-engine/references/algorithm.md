@@ -33,8 +33,9 @@ long-poll ──► remote change fetch ─┘        ▲                       
 
 ## 2. Local index (`store/`)
 
-SQLite file at `%LOCALAPPDATA%\StateLife\DropShare\index.db`, accessed through SQLAlchemy and owned by the
-engine's executor thread (one writer). WAL mode on.
+SQLite file at `%LOCALAPPDATA%\StateLife\DropShare\index.db`, accessed through SQLAlchemy and written by the
+engine thread, except `upload_sessions`, which transfer threads write as uploads start and finish
+(OQ-39). WAL mode on.
 
 | Table | Purpose |
 |---|---|
@@ -46,6 +47,7 @@ engine's executor thread (one writer). WAL mode on.
 | `journal` | In-flight multi-step operations (section 10) |
 | `activity` | Recent events for the Activity view (bounded, oldest pruned) |
 | `problems` | Items that can't sync and why ("Can't sync", FR-SYNC-07) |
+| `upload_sessions` | Started uploads by target (with the hash and size they are for), so they resume after a restart (FR-XFER-01) |
 
 The index is a cache of what was last in sync: a schema change rebuilds it instead of migrating.
 Without a base the reconciler never deletes; it links equal items and keeps both copies of

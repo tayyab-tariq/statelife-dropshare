@@ -26,11 +26,14 @@ from dropshare_client.services.files import (
     NewFile,
     Progress,
     SourceFile,
+    UploadSessions,
     UploadTarget,
     no_progress,
+    upload_key,
 )
 from dropshare_client.store.index import Index
-from dropshare_client.sync.core import CycleResult, SyncCore
+from dropshare_client.store.records import StoredUpload
+from dropshare_client.sync.core import MAX_TRANSFERS, CycleResult, SyncCore
 from dropshare_client.sync.executor import no_crash
 from dropshare_client.sync.paths import key_of, outermost
 from dropshare_client.sync.server import FileServer
@@ -129,6 +132,12 @@ class FakeFileServer:
         self.calls: list[str] = []
         self.offline = False
         self.wait_seconds = wait_seconds  # how long wait() holds when there is no news
+        # Transfers cut short once (the connection drops after this many bytes), and what the
+        # next attempt picked up: bytes already there for downloads, sessions for uploads.
+        self.cut_download_at: int | None = None
+        self.cut_upload_at: int | None = None
+        self.download_offsets: list[int] = []
+        self.resumed_uploads: list[str] = []
         self._lock = threading.RLock()
 
     # --- test helpers (another device's actions) ------------------------------------------
@@ -350,6 +359,8 @@ class FakeFileServer:
         target: UploadTarget,
         stop: threading.Event,
         progress: Progress = no_progress,
+        *,
+        sessions: UploadSessions | None = None,
     ) -> NodeOut:
         self._call("upload")
         info = source.path.stat()
@@ -358,6 +369,16 @@ class FakeFileServer:
             content
         ) != source.sha256:
             raise SourceChangedError(str(source.path))
+        key = upload_key(target)
+        stored = None if sessions is None else sessions.upload_session(key)
+        if stored is not None and (stored.sha256, stored.size) == (source.sha256, source.size):
+            self.resumed_uploads.append(key)  # only what the server is missing goes now
+        if sessions is not None and stored is None:  # as RemoteFiles: kept until it completes
+            sessions.put_upload_session(key, StoredUpload(uuid.uuid4(), source.sha256, source.size))
+        if self.cut_upload_at is not None:
+            cut, self.cut_upload_at = self.cut_upload_at, None
+            progress(cut)
+            raise OfflineError("connection lost mid-upload")
         if isinstance(target, NewFile):
             parent = self._live_folder(target.parent_id)
             self._check_free(parent, target.name)
@@ -376,7 +397,9 @@ class FakeFileServer:
             node = existing
             self._record(ChangeType.MODIFIED, node)
         progress(len(content))
-        self._after("upload")
+        self._after("upload")  # an answer lost here keeps the session, as in RemoteFiles
+        if sessions is not None:
+            sessions.forget_upload_session(key)
         return node.out(self.namespace_id)
 
     @_locked
@@ -395,8 +418,16 @@ class FakeFileServer:
             raise ApiError(404, ErrorCode.NOT_FOUND, "Not found")
         if sha(node.content) != sha256:
             raise RemoteContentChangedError(str(node_id))
-        part.write_bytes(node.content)
-        progress(len(node.content))
+        offset = part.stat().st_size if part.exists() else 0  # a Range request resumes
+        self.download_offsets.append(offset)
+        end = len(node.content)
+        if self.cut_download_at is not None:
+            end, self.cut_download_at = self.cut_download_at, None
+        with part.open("ab" if offset else "wb") as out:
+            out.write(node.content[offset:end])
+        progress(end)
+        if end < len(node.content):
+            raise OfflineError("connection lost mid-download")
         self._after("download")
 
     # --- internals -------------------------------------------------------------------------
@@ -617,6 +648,7 @@ class Device:
         recycle_bin: RecycleBin | None = None,
         file_identity: FileIdentity | None = None,
         transfer: Callable[[TransferEvent], None] = lambda _: None,
+        max_transfers: int = MAX_TRANSFERS,
     ) -> SyncCore:
         """A fresh engine over the same folder and index, as after the app restarts."""
         self.core = SyncCore(
@@ -633,6 +665,7 @@ class Device:
             max_path=self.max_path,
             crash_point=crash_point,
             transfer=transfer,
+            max_transfers=max_transfers,
         )
         return self.core
 

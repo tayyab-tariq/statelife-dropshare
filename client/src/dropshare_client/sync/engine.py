@@ -23,7 +23,7 @@ from dropshare_client.services.errors import (
 )
 from dropshare_client.store.index import Index
 from dropshare_client.sync import paths
-from dropshare_client.sync.core import NoPersonalFolderError, SyncCore
+from dropshare_client.sync.core import MAX_TRANSFERS, NoPersonalFolderError, SyncCore
 from dropshare_client.sync.errors import SyncRootMissingError, SyncStoppedError
 from dropshare_client.sync.scanner import STABLE_AFTER_NS
 from dropshare_client.sync.server import FileServer
@@ -80,7 +80,8 @@ class SyncListener(Protocol):
 
     def transfer(self, event: TransferEvent) -> None:
         """An upload or download was queued, moved bytes (at most ~4 times a second), or
-        ended (FR-CLIENT-08). Called on the engine's thread."""
+        ended (FR-CLIENT-08). Called on the engine's thread, and on transfer threads for
+        bytes moved (FR-XFER-03): implementations must be thread-safe."""
         ...
 
 
@@ -105,6 +106,7 @@ class SyncEngine:
         settle_seconds: float = SETTLE_SECONDS,
         periodic_scan_seconds: float = PERIODIC_SCAN_SECONDS,
         max_path: int | None = None,
+        max_transfers: int = MAX_TRANSFERS,
     ) -> None:
         """The engine owns `index` from here on and closes it once stopped."""
         self._root = root
@@ -129,6 +131,7 @@ class SyncEngine:
             max_path=max_path,
             progress=listener.progress,
             transfer=listener.transfer,
+            max_transfers=max_transfers,
         )
         self._watcher = Watcher(root, self.local_changed) if watch else None
         self._watcher_lock = threading.Lock()  # started by the engine thread, stopped by stop()
@@ -293,6 +296,7 @@ class SyncEngine:
             if replans > _REPLANS_IN_A_ROW:
                 logger.warning("Still replanning after %d cycles; slowing down", replans)
                 self._back_off(_REPLAN_DELAY, full_scan=False)
+        self._core.close()  # running transfers stop (the interrupt is set) and are recorded
         with self._lock:
             final = self._state
         if final is not None and final[0] not in (SyncState.UPGRADE_REQUIRED, SyncState.STOPPED):

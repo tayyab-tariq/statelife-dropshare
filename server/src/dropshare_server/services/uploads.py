@@ -117,11 +117,6 @@ def start(
         raise invalid("Send either parent_id and name, or node_id and base_revision.", "target")
 
     now = datetime.now(UTC)
-    # The whole size is reserved, new versions included: that's what gets staged on disk until
-    # the upload completes or expires (audit decision D1). Locking the owner serialises
-    # reservations, so two uploads can't both take the last space.
-    owner = _owner(session, namespace_id, lock=True)
-    _check_quota(owner, body.size_bytes, upload_repository.reserved_bytes(session, owner.id, now))
     upload = UploadSession(
         user_id=user_id,
         namespace_id=namespace_id,
@@ -136,7 +131,16 @@ def start(
         created_at=now,
         expires_at=now + timedelta(hours=settings.upload_expiry_hours),
     )
+    # Inserted before the owner is locked: the row's foreign keys lock its folder (or file), and
+    # completing an upload locks that node and then the owner, so this order can't deadlock
+    # with it (M10, parallel uploads). A refused upload rolls back with the request.
     upload_repository.add(session, upload)
+    # The whole size is reserved, new versions included: that's what gets staged on disk until
+    # the upload completes or expires (audit decision D1). Locking the owner serialises
+    # reservations, so two uploads can't both take the last space.
+    owner = _owner(session, namespace_id, lock=True)
+    others = upload_repository.reserved_bytes(session, owner.id, now) - upload.size_bytes
+    _check_quota(owner, body.size_bytes, others)
     return _to_out(upload, set())
 
 

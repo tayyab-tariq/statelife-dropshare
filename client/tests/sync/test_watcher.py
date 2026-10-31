@@ -4,6 +4,8 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from dropshare_client.sync.watcher import Watcher
 
 TIMEOUT = 5.0
@@ -66,3 +68,25 @@ def test_can_be_started_again_after_stopping(tmp_path: Path) -> None:
     finally:
         watcher.stop()
     assert not watcher.alive
+
+
+def test_a_sync_folder_reached_through_a_link_still_reports_changes(tmp_path: Path) -> None:
+    """Events may name the folder by its resolved path (/var -> /private/var on macOS, a
+    junction on Windows); they must not be dropped, or changes wait for the next full scan
+    (NFR-PERF-02)."""
+    real = tmp_path / "real" / "DropShare"
+    real.mkdir(parents=True)
+    link = tmp_path / "link"
+    try:
+        link.symlink_to(tmp_path / "real", target_is_directory=True)
+    except OSError:  # Windows without Developer Mode: covered by the Windows check (junction)
+        pytest.skip("this account can't create symbolic links")
+    seen = Seen()
+    watcher = Watcher(link / "DropShare", seen)
+    watcher.start()
+    try:
+        (real / "a.txt").write_bytes(b"a")
+
+        assert seen.wait_for("a.txt")
+    finally:
+        watcher.stop()

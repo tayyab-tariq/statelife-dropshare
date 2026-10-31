@@ -1,4 +1,5 @@
-"""The local SQLite index (algorithm.md §2). Only the sync engine's thread writes to it.
+"""The local SQLite index (algorithm.md §2). Only the sync engine's thread writes to it, except
+the upload sessions table, which transfers write as they start and finish (FR-XFER-01).
 
 It is a cache of what was last in sync, so a schema change rebuilds it rather than migrating:
 with no base, the engine links identical items and keeps both copies of different ones, and
@@ -10,7 +11,7 @@ import logging
 import sqlite3
 import uuid
 from collections.abc import Iterable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from sqlite3 import Connection as SqliteConnection
 
@@ -44,13 +45,15 @@ from dropshare_client.store.records import (
     NamespaceCursor,
     Problem,
     RemoteNode,
+    StoredUpload,
 )
 from dropshare_shared.schemas.nodes import NodeKind
 
 logger = logging.getLogger(__name__)
 
-_SCHEMA_VERSION = "2"  # 2: mounts of shared folders
+_SCHEMA_VERSION = "3"  # 2: mounts of shared folders; 3: upload sessions (FR-XFER-01)
 _ACTIVITY_KEPT = 1000
+_UPLOAD_SESSIONS_KEPT = timedelta(days=2)  # the server ends them after 24 hours
 _SIDE_FILES = ("-wal", "-shm", "-journal")
 _JOURNAL_DATA = TypeAdapter(dict[str, str])
 
@@ -143,8 +146,22 @@ class _Problem(_Base):
     reason: Mapped[str] = mapped_column(Text)
 
 
+class _UploadSession(_Base):
+    """An upload started and not finished yet, so it resumes after the app restarts: the
+    server keeps its chunks for 24 hours (FR-XFER-01)."""
+
+    __tablename__ = "upload_sessions"
+    key: Mapped[str] = mapped_column(Text, primary_key=True)  # the target (files.upload_key)
+    upload_id: Mapped[uuid.UUID] = mapped_column(Uuid)
+    sha256: Mapped[str] = mapped_column(String(64))  # the content it is for
+    size: Mapped[int] = mapped_column(BigInteger)
+    started_at: Mapped[datetime] = mapped_column(_UtcDateTime)
+
+
 def _pragmas(connection: SqliteConnection, _: ConnectionPoolEntry) -> None:
     cursor = connection.cursor()
+    # Transfers write upload sessions from their own threads: wait for the engine's writes.
+    cursor.execute("PRAGMA busy_timeout=5000")
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA synchronous=FULL")  # an index update survives a power cut
     cursor.close()
@@ -281,7 +298,15 @@ class Index:
     def reset(self, binding: Binding) -> None:
         """Forget everything and describe `binding`'s files from now on."""
         with self._sessions.begin() as session:
-            for table in (_Entry, _RemoteNode, _Cursor, _Journal, _Activity, _Problem):
+            for table in (
+                _Entry,
+                _RemoteNode,
+                _Cursor,
+                _Journal,
+                _Activity,
+                _Problem,
+                _UploadSession,
+            ):
                 session.execute(delete(table))
             value = _BindingData(
                 server_url=binding.server_url,
@@ -455,6 +480,36 @@ class Index:
                 JournalItem(row.id, row.kind, row.key, _JOURNAL_DATA.validate_json(row.data))
                 for row in session.scalars(select(_Journal).order_by(_Journal.id))
             ]
+
+    # --- upload sessions (FR-XFER-01) ----------------------------------------------------
+
+    def upload_session(self, key: str) -> StoredUpload | None:
+        with self._sessions() as session:
+            row = session.get(_UploadSession, key)
+            return None if row is None else StoredUpload(row.upload_id, row.sha256, row.size)
+
+    def put_upload_session(self, key: str, stored: StoredUpload) -> None:
+        """Remember a started upload; sessions the server has let expire are dropped."""
+        now = datetime.now(UTC)
+        with self._sessions.begin() as session:
+            session.execute(
+                delete(_UploadSession).where(
+                    _UploadSession.started_at < now - _UPLOAD_SESSIONS_KEPT
+                )
+            )
+            session.merge(
+                _UploadSession(
+                    key=key,
+                    upload_id=stored.upload_id,
+                    sha256=stored.sha256,
+                    size=stored.size,
+                    started_at=now,
+                )
+            )
+
+    def forget_upload_session(self, key: str) -> None:
+        with self._sessions.begin() as session:
+            session.execute(delete(_UploadSession).where(_UploadSession.key == key))
 
     # --- activity and problems -----------------------------------------------------------
 

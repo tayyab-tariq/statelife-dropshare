@@ -19,9 +19,17 @@ from dropshare_client.services.errors import (
     OfflineError,
     RemoteContentChangedError,
     SourceChangedError,
+    TransferCancelledError,
 )
-from dropshare_client.services.files import NewFile, NewVersion, RemoteFiles, SourceFile
+from dropshare_client.services.files import (
+    NewFile,
+    NewVersion,
+    RemoteFiles,
+    SourceFile,
+    upload_key,
+)
 from dropshare_client.services.tokens import TokenStore
+from dropshare_client.store.index import Index
 from dropshare_shared.schemas.auth import TokenPairOut
 
 CHUNK = 4
@@ -80,6 +88,7 @@ class FakeTransfers:
         self.extra_bytes = b""  # sent after the content (a misbehaving server)
         self.params: list[str] = []
         self.bodies: list[object] = []
+        self.moved: set[str] = set()  # completed uploads whose file was renamed since
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(f"{request.method} {request.url.path}")
@@ -99,6 +108,8 @@ class FakeTransfers:
                 self.chunks[upload_id] = {}
                 return httpx.Response(201, json={"data": self._upload(upload_id)})
             case "GET", ["uploads", upload_id]:
+                if upload_id not in self.uploads:  # cleaned up, or someone else's
+                    return _error(404, "NOT_FOUND")
                 return httpx.Response(200, json={"data": self._upload(upload_id)})
             case "PUT", ["uploads", upload_id, "chunks", index]:
                 data = request.content
@@ -107,6 +118,9 @@ class FakeTransfers:
                 self.chunks[upload_id][int(index)] = data
                 return httpx.Response(204)
             case "POST", ["uploads", upload_id, "complete"]:
+                if self.uploads[upload_id]["status"] == "completed" and upload_id in self.moved:
+                    moved = {**_node(self.content_of(upload_id), 2), "name": "renamed.txt"}
+                    return httpx.Response(200, json={"data": moved})
                 if self.complete_error is not None:
                     code, self.complete_error = self.complete_error, None
                     return _error(409, code)
@@ -130,6 +144,9 @@ class FakeTransfers:
                 self.bodies.append(json.loads(request.content))
                 return httpx.Response(200, json={"data": _node(b"moved", 2)})
         return _error(404, "NOT_FOUND")
+
+    def content_of(self, upload_id: str) -> bytes:
+        return b"".join(v for _, v in sorted(self.chunks[upload_id].items()))
 
     def _upload(self, upload_id: str) -> dict[str, object]:
         upload = self.uploads[upload_id]
@@ -222,6 +239,170 @@ def test_a_retry_sends_only_the_missing_chunks(
     puts = [r for r in fake.requests if r.startswith("PUT")]
     assert len(puts) == 1 and puts[0].endswith("/chunks/2")
     assert not any(r == "POST /api/v1/uploads" for r in fake.requests)
+
+
+def test_an_upload_resumes_after_the_app_restarts(
+    files: RemoteFiles, fake: FakeTransfers, tmp_path: Path
+) -> None:
+    """With an index as the store, the session is kept there and nowhere in memory: reopened
+    (the app started again), it sends only what the server is missing (FR-XFER-01)."""
+    source = _source(tmp_path, b"0123456789")
+    index = Index(tmp_path / "index.db")
+    fake.drop_after = lambda r: r.url.path.endswith("/chunks/1")
+    with pytest.raises(OfflineError):
+        files.upload(source, NewVersion(NODE_ID, 1), threading.Event(), sessions=index)
+    index.close()
+
+    fake.drop_after = lambda _: False
+    fake.requests.clear()
+    restarted = Index(tmp_path / "index.db")
+    files.upload(source, NewVersion(NODE_ID, 1), threading.Event(), sessions=restarted)
+
+    puts = [r for r in fake.requests if r.startswith("PUT")]
+    assert len(puts) == 1 and puts[0].endswith("/chunks/2")
+    assert "POST /api/v1/uploads" not in fake.requests
+    assert restarted.upload_session(upload_key(NewVersion(NODE_ID, 1))) is None
+
+
+def test_an_expired_session_starts_a_new_upload(
+    files: RemoteFiles, fake: FakeTransfers, tmp_path: Path
+) -> None:
+    source = _source(tmp_path, b"0123456789")
+    index = Index(tmp_path / "index.db")
+    fake.drop_after = lambda r: r.url.path.endswith("/chunks/1")
+    with pytest.raises(OfflineError):
+        files.upload(source, NewVersion(NODE_ID, 1), threading.Event(), sessions=index)
+    fake.drop_after = lambda _: False
+    for upload in fake.uploads.values():
+        upload["status"] = "expired"  # the app was away for more than a day
+
+    files.upload(source, NewVersion(NODE_ID, 1), threading.Event(), sessions=index)
+
+    assert len(fake.uploads) == 2
+
+
+def test_nothing_is_sent_when_stopped_before_its_turn(
+    files: RemoteFiles, fake: FakeTransfers, tmp_path: Path
+) -> None:
+    """Paused while queued (B1): not even the session is started, also for an empty file."""
+    stop = threading.Event()
+    stop.set()
+
+    with pytest.raises(TransferCancelledError):
+        files.upload(_source(tmp_path, b""), NewFile(PARENT_ID, "empty.txt"), stop)
+    with pytest.raises(TransferCancelledError):
+        files.download(NODE_ID, hashlib.sha256(b"x").hexdigest(), 1, tmp_path / "x.part", stop)
+
+    assert fake.requests == []
+
+
+def test_a_completed_upload_whose_file_moved_since_is_uploaded_again(
+    files: RemoteFiles, fake: FakeTransfers, tmp_path: Path
+) -> None:
+    """B2: the answer to completing was lost, then the file was renamed on the server. The
+    same content saved at the old name again is a new file, not the renamed one."""
+    source = _source(tmp_path, b"0123456789")
+    index = Index(tmp_path / "index.db")
+    fake.drop_after = lambda r: r.url.path.endswith("/complete")
+    with pytest.raises(OfflineError):
+        files.upload(source, NewFile(PARENT_ID, "doc.txt"), threading.Event(), sessions=index)
+    fake.drop_after = lambda _: False
+    fake.moved.update(fake.uploads)
+
+    node = files.upload(source, NewFile(PARENT_ID, "doc.txt"), threading.Event(), sessions=index)
+
+    assert node.name == "doc.txt"
+    assert fake.requests.count("POST /api/v1/uploads") == 2  # a new upload, not the replay
+    index.close()
+
+
+def test_a_session_for_content_edited_since_is_cancelled_not_left_reserving_space(
+    files: RemoteFiles, fake: FakeTransfers, tmp_path: Path
+) -> None:
+    """S6: one session per target; the old one is cancelled at once, giving its space back."""
+    index = Index(tmp_path / "index.db")
+    fake.drop_after = lambda r: r.url.path.endswith("/chunks/1")
+    with pytest.raises(OfflineError):
+        files.upload(
+            _source(tmp_path, b"0123456789"),
+            NewVersion(NODE_ID, 1),
+            threading.Event(),
+            sessions=index,
+        )
+    fake.drop_after = lambda _: False
+    first = next(iter(fake.uploads))
+
+    files.upload(
+        _source(tmp_path, b"edited since"),
+        NewVersion(NODE_ID, 1),
+        threading.Event(),
+        sessions=index,
+    )
+
+    assert fake.uploads[first]["status"] == "cancelled"
+    assert f"DELETE /api/v1/uploads/{first}" in fake.requests
+    index.close()
+
+
+@pytest.mark.parametrize("status", ["cancelled", "expired", "gone"])
+def test_a_session_the_server_ended_starts_a_new_upload(
+    files: RemoteFiles, fake: FakeTransfers, tmp_path: Path, status: str
+) -> None:
+    source = _source(tmp_path, b"0123456789")
+    index = Index(tmp_path / "index.db")
+    fake.drop_after = lambda r: r.url.path.endswith("/chunks/1")
+    with pytest.raises(OfflineError):
+        files.upload(source, NewVersion(NODE_ID, 1), threading.Event(), sessions=index)
+    fake.drop_after = lambda _: False
+    (first,) = fake.uploads
+    if status == "gone":  # expired and cleaned up, or someone else's: the server says 404
+        del fake.uploads[first]
+    else:
+        fake.uploads[first]["status"] = status
+
+    files.upload(source, NewVersion(NODE_ID, 1), threading.Event(), sessions=index)
+
+    assert len(fake.uploads) == (1 if status == "gone" else 2)
+    assert fake.requests.count("POST /api/v1/uploads") == 2
+    index.close()
+
+
+def test_a_completed_upload_resumed_after_a_restart_is_not_sent_again(
+    files: RemoteFiles, fake: FakeTransfers, tmp_path: Path
+) -> None:
+    source = _source(tmp_path, b"0123456789")
+    index = Index(tmp_path / "index.db")
+    fake.drop_after = lambda r: r.url.path.endswith("/complete")
+    with pytest.raises(OfflineError):
+        files.upload(source, NewVersion(NODE_ID, 1), threading.Event(), sessions=index)
+    index.close()
+    fake.drop_after = lambda _: False
+    fake.requests.clear()
+
+    restarted = Index(tmp_path / "index.db")
+    node = files.upload(source, NewVersion(NODE_ID, 1), threading.Event(), sessions=restarted)
+
+    assert node.content_hash == source.sha256
+    assert not any(r.startswith(("PUT", "POST /api/v1/uploads ")) for r in fake.requests)
+    assert "POST /api/v1/uploads" not in fake.requests
+    restarted.close()
+
+
+def test_signing_out_forgets_the_uploads_kept_in_memory(
+    files: RemoteFiles, fake: FakeTransfers, tmp_path: Path
+) -> None:
+    """S13: the next user never resumes (and is never refused for) this one's session."""
+    source = _source(tmp_path, b"0123456789")
+    fake.drop_after = lambda r: r.url.path.endswith("/chunks/1")
+    with pytest.raises(OfflineError):
+        files.upload(source, NewVersion(NODE_ID, 1), threading.Event())
+    fake.drop_after = lambda _: False
+
+    files.forget_uploads()
+    fake.requests.clear()
+    files.upload(source, NewVersion(NODE_ID, 1), threading.Event())
+
+    assert fake.requests[0] == "POST /api/v1/uploads"  # no attempt to resume the old one
 
 
 def test_a_lost_completion_is_completed_again_not_uploaded_again(

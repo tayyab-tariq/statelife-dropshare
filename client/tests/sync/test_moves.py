@@ -50,6 +50,25 @@ FILE_CASES = [
     Case("move", "delete", {**D, "Dest/doc.txt": BASE}, [("doc.txt", BASE)], same_node=False),
     Case("delete", "rename", {**D, "there.txt": BASE}),
     Case("delete", "move", {**D, "Dest/doc.txt": BASE}),
+    # "create": the item replaced by a new one (NFR-REL-01, M10). Moved away here while the
+    # server replaced it: both are kept, the moved one as a new item (its node went to trash).
+    Case(
+        "rename",
+        "create",
+        {**D, "here.txt": BASE, "doc.txt": REMOTE},
+        [("doc.txt", BASE)],
+        same_node=False,
+    ),
+    Case(
+        "move",
+        "create",
+        {**D, "Dest/doc.txt": BASE, "doc.txt": REMOTE},
+        [("doc.txt", BASE)],
+        same_node=False,
+    ),
+    # Replaced here while the server moved it: the new content follows the move, as an edit.
+    Case("create", "rename", {**D, "there.txt": LOCAL}),
+    Case("create", "move", {**D, "Dest/doc.txt": LOCAL}),
 ]
 
 FOLDER_CASES = [
@@ -82,6 +101,32 @@ FOLDER_CASES = [
     ),
     Case("delete", "rename", {**D, "There": None, "There/a.txt": A}),
     Case("delete", "move", {**D, "Dest/F": None, "Dest/F/a.txt": A}),
+    Case(
+        "move",
+        "delete",
+        {**D, "Dest/F": None, "Dest/F/a.txt": A},
+        [("F", None)],
+        same_node=False,
+    ),
+    # "create": the folder replaced by a new, empty one (NFR-REL-01, M10).
+    Case(
+        "rename",
+        "create",
+        {**D, "Here": None, "Here/a.txt": A, "F": None},
+        [("F", None)],
+        same_node=False,
+    ),
+    Case(
+        "move",
+        "create",
+        {**D, "Dest/F": None, "Dest/F/a.txt": A, "F": None},
+        [("F", None)],
+        same_node=False,
+    ),
+    # Emptied and made again here while the server moved it: the folder follows the move,
+    # and the file deleted here is in the server trash.
+    Case("create", "rename", {**D, "There": None}, [("a.txt", A)]),
+    Case("create", "move", {**D, "Dest/F": None}, [("a.txt", A)]),
 ]
 
 # Where each action leaves the item, for the file and the folder.
@@ -108,7 +153,7 @@ def _node_id(server: FakeFileServer, path: str) -> object:
     return next(n.id for n in server.nodes.values() if server.path_of(n) == path and not n.trashed)
 
 
-def _check(device: Device, server: FakeFileServer, case: Case) -> None:
+def check(device: Device, server: FakeFileServer, case: Case) -> None:
     assert plain(device.tree()) == case.expected
     assert plain(server.tree()) == case.expected
     assert server.trashed() == case.trashed
@@ -116,9 +161,9 @@ def _check(device: Device, server: FakeFileServer, case: Case) -> None:
     assert device.log.conflicts == []
 
 
-@pytest.mark.parametrize("mode", MODES)
-@pytest.mark.parametrize("case", FILE_CASES, ids=str)
-def test_file(device: Device, server: FakeFileServer, case: Case, mode: str) -> None:
+def arrange_file(device: Device, server: FakeFileServer, case: Case) -> tuple[object, list[str]]:
+    """Sync the starting point, then make the case's changes; returns the synced node's ID and
+    what the watcher saw."""
     device.mkdir("Dest")
     device.write("doc.txt", BASE)
     device.sync()
@@ -132,6 +177,9 @@ def test_file(device: Device, server: FakeFileServer, case: Case, mode: str) -> 
             touched.append(target)
         case "modify":
             device.write("doc.txt", LOCAL)
+        case "create":
+            device.delete("doc.txt")
+            device.write("doc.txt", LOCAL)
         case "delete":
             device.delete("doc.txt")
     match case.remote:
@@ -139,19 +187,27 @@ def test_file(device: Device, server: FakeFileServer, case: Case, mode: str) -> 
             server.relocate("doc.txt", _FILE_PATHS[case.remote][1])
         case "modify":
             server.put("doc.txt", REMOTE)
+        case "create":
+            server.remove("doc.txt")
+            server.put("doc.txt", REMOTE)
         case "delete":
             server.remove("doc.txt")
+    return original, touched
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("case", FILE_CASES, ids=str)
+def test_file(device: Device, server: FakeFileServer, case: Case, mode: str) -> None:
+    original, touched = arrange_file(device, server, case)
 
     device.sync(local=touched if mode == "dirty" else None)
 
-    _check(device, server, case)
+    check(device, server, case)
     survivor = next(path for path in case.expected if path != "Dest")
     assert (_node_id(server, survivor) == original) is case.same_node
 
 
-@pytest.mark.parametrize("mode", MODES)
-@pytest.mark.parametrize("case", FOLDER_CASES, ids=str)
-def test_folder(device: Device, server: FakeFileServer, case: Case, mode: str) -> None:
+def arrange_folder(device: Device, server: FakeFileServer, case: Case) -> tuple[object, list[str]]:
     device.mkdir("Dest")
     device.write("F/a.txt", A)
     device.sync()
@@ -166,6 +222,9 @@ def test_folder(device: Device, server: FakeFileServer, case: Case, mode: str) -
         case "modify":
             device.write("F/local.txt", LOCAL)
             touched.append("F/local.txt")
+        case "create":
+            device.delete("F")
+            device.mkdir("F")
         case "delete":
             device.delete("F")
     match case.remote:
@@ -173,14 +232,25 @@ def test_folder(device: Device, server: FakeFileServer, case: Case, mode: str) -
             server.relocate("F", _FOLDER_PATHS[case.remote][1])
         case "modify":
             server.put("F/remote.txt", REMOTE)
+        case "create":
+            server.remove("F")
+            server.put("F")
         case "delete":
             server.remove("F")
+    return original, touched
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("case", FOLDER_CASES, ids=str)
+def test_folder(device: Device, server: FakeFileServer, case: Case, mode: str) -> None:
+    original, touched = arrange_folder(device, server, case)
 
     device.sync(local=touched if mode == "dirty" else None)
 
-    _check(device, server, case)
-    survivor = next(path for path in case.expected if path.endswith("/a.txt"))
-    assert (_node_id(server, survivor) == original) is case.same_node
+    check(device, server, case)
+    survivor = next((path for path in case.expected if path.endswith("/a.txt")), None)
+    if survivor is not None:  # unless the file was deleted on one side
+        assert (_node_id(server, survivor) == original) is case.same_node
 
 
 def test_renaming_a_folder_of_1000_files_sends_one_request(

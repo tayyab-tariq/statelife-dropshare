@@ -28,7 +28,9 @@ _JOIN_SECONDS = 5.0
 
 class _Handler(FileSystemEventHandler):
     def __init__(self, root: Path, on_change: Callable[[str], None]) -> None:
-        self._root = root
+        # Events can name the folder by its resolved path when the configured one goes
+        # through a link (/var on macOS, a junction on Windows): both count as inside it.
+        self._roots = list(dict.fromkeys((root, root.resolve())))
         self._on_change = on_change
 
     def on_any_event(self, event: FileSystemEvent) -> None:
@@ -43,9 +45,15 @@ class _Handler(FileSystemEventHandler):
                 self._report(os.fsdecode(raw))
 
     def _report(self, absolute: str) -> None:
-        try:
-            relative = Path(absolute).relative_to(self._root).as_posix()
-        except ValueError:
+        relative = next(
+            (
+                Path(absolute).relative_to(root).as_posix()
+                for root in self._roots
+                if Path(absolute).is_relative_to(root)
+            ),
+            None,
+        )
+        if relative is None:
             return
         path = "" if relative == "." else relative
         if path.split("/", 1)[0] == paths.TEMP_DIR:

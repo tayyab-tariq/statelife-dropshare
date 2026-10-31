@@ -10,6 +10,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 import httpx
 
@@ -22,7 +23,9 @@ from dropshare_client.services.errors import (
     SourceChangedError,
     TransferCancelledError,
 )
+from dropshare_client.store.records import StoredUpload
 from dropshare_shared.errors import ErrorCode
+from dropshare_shared.naming import normalize_name
 from dropshare_shared.schemas.envelope import PAGE_LIMIT_MAX, DataResponse, ListResponse
 from dropshare_shared.schemas.nodes import FolderCreateIn, NamespaceOut, NodeOut, NodeUpdateIn
 from dropshare_shared.schemas.sync import ChangesResponse, WaitIn, WaitOut
@@ -89,12 +92,57 @@ class SourceFile:
     mtime_ns: int
 
 
+class UploadSessions(Protocol):
+    """Where started uploads are remembered by target, so a retry resumes them instead of
+    starting over. Called from transfer threads. The sync engine keeps them in its index, so
+    they survive the app restarting; elsewhere they last until sign-out."""
+
+    def upload_session(self, key: str) -> StoredUpload | None: ...
+
+    def put_upload_session(self, key: str, stored: StoredUpload) -> None: ...
+
+    def forget_upload_session(self, key: str) -> None: ...
+
+
+class MemoryUploadSessions:
+    def __init__(self) -> None:
+        self._sessions: dict[str, StoredUpload] = {}
+        self._lock = threading.Lock()
+
+    def upload_session(self, key: str) -> StoredUpload | None:
+        with self._lock:
+            return self._sessions.get(key)
+
+    def put_upload_session(self, key: str, stored: StoredUpload) -> None:
+        with self._lock:
+            self._sessions[key] = stored
+
+    def forget_upload_session(self, key: str) -> None:
+        with self._lock:
+            self._sessions.pop(key, None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._sessions.clear()
+
+
+def upload_key(target: UploadTarget) -> str:
+    """What an upload goes to: one session per target. The content it is for is stored with
+    it, so an edit made since replaces the session instead of leaving it behind (S6)."""
+    if isinstance(target, NewFile):
+        return f"new:{target.parent_id}/{normalize_name(target.name)}"
+    return f"version:{target.node_id}@{target.base_revision}"
+
+
 class RemoteFiles:
     def __init__(self, api: ApiClient) -> None:
         self._api = api
-        # Upload sessions to resume, for this run of the app only (OQ-15; F2 adds restarts).
-        self._uploads: dict[tuple[UploadTarget, str, int], uuid.UUID] = {}
-        self._lock = threading.Lock()
+        self._memory = MemoryUploadSessions()  # when the caller has no store of its own
+
+    def forget_uploads(self) -> None:
+        """Signed out: the next user never resumes this one's uploads (their session IDs
+        would only be refused, and audited as denied)."""
+        self._memory.clear()
 
     # --- metadata ------------------------------------------------------------------------
 
@@ -178,34 +226,61 @@ class RemoteFiles:
         target: UploadTarget,
         stop: threading.Event,
         progress: Progress = no_progress,
+        *,
+        sessions: UploadSessions | None = None,
     ) -> NodeOut:
-        """Send the file in chunks and complete it. Retrying after any failure picks the same
-        session up and sends only the missing chunks; completing twice returns the same node,
-        so a retry after a lost response never makes a duplicate (NFR-REL-04)."""
-        key = (target, source.sha256, source.size)
+        """Send the file in chunks and complete it. Retrying after any failure, also after the
+        app restarted when `sessions` keeps them, picks the same session up and sends only the
+        missing chunks; completing twice returns the same node, so a retry after a lost
+        response never makes a duplicate (NFR-REL-04)."""
+        if stop.is_set():  # paused before its turn came: nothing is sent
+            raise TransferCancelledError()
+        store = sessions or self._memory
+        key = upload_key(target)
         self._check_unchanged(source)
-        upload = self._resume(key)
+        upload = self._resume(store, key, source)
         if upload is None:
+            if stop.is_set():
+                raise TransferCancelledError()
             upload = self._start(source, target)
-            with self._lock:
-                self._uploads[key] = upload.id
+            store.put_upload_session(key, StoredUpload(upload.id, source.sha256, source.size))
         try:
             if upload.status != UploadStatus.COMPLETED:
                 self._send_chunks(source, upload, stop, progress)
                 self._check_unchanged(source)
             node = self._complete(source, upload, stop, progress)
+            if upload.status == UploadStatus.COMPLETED and not self._is_target(node, target):
+                # Completed earlier (its answer lost) and the file moved since: that node
+                # isn't this target any more. Upload this file as what it is now (B2).
+                logger.info("Upload %s completed for a file that has moved; starting over", key)
+                store.forget_upload_session(key)
+                return self.upload(source, target, stop, progress, sessions=sessions)
         except ApiError as exc:
             if exc.code in _UPLOAD_OVER:
-                self._abandon(key, upload.id)
+                self._abandon(store, key, upload)
             if exc.code == ErrorCode.FILE_HASH_MISMATCH:
                 raise SourceChangedError(str(source.path)) from exc
             raise
         except SourceChangedError:
-            self._abandon(key, upload.id)
+            self._abandon(store, key, upload)
             raise
-        with self._lock:
-            self._uploads.pop(key, None)
+        store.forget_upload_session(key)
         return node
+
+    def _is_target(self, node: NodeOut, target: UploadTarget) -> bool:
+        """Whether a replayed upload's node is still the target it was started for: the same
+        file for a new version; the same name in the same folder for a new file (a folder
+        that is a shared folder holds its files under that folder's root)."""
+        if isinstance(target, NewVersion):
+            return node.id == target.node_id
+        if node.name is None or normalize_name(node.name) != normalize_name(target.name):
+            return False
+        if node.parent_id == target.parent_id:
+            return True
+        folder = self.get_node(target.parent_id)
+        return folder.mount_namespace_id is not None and folder.mount_namespace_id == (
+            node.namespace_id
+        )
 
     def _complete(
         self, source: SourceFile, upload: UploadOut, stop: threading.Event, progress: Progress
@@ -250,20 +325,25 @@ class RemoteFiles:
             json=body.model_dump(mode="json", exclude_none=True),
         )
 
-    def _resume(self, key: tuple[UploadTarget, str, int]) -> UploadOut | None:
-        with self._lock:
-            upload_id = self._uploads.get(key)
-        if upload_id is None:
+    def _resume(self, store: UploadSessions, key: str, source: SourceFile) -> UploadOut | None:
+        """The session started for this target, if it is for this very content and the
+        server still has it. One for other content (the file was edited since) is cancelled,
+        so its reserved space is given back at once rather than in 24 hours."""
+        stored = store.upload_session(key)
+        if stored is None:
+            return None
+        if (stored.sha256, stored.size) != (source.sha256, source.size):
+            self._cancel(stored.upload_id)
+            store.forget_upload_session(key)
             return None
         try:
-            upload = self._api.data("GET", f"/api/v1/uploads/{upload_id}", UploadOut)
+            upload = self._api.data("GET", f"/api/v1/uploads/{stored.upload_id}", UploadOut)
         except ApiError as exc:
             if exc.code != ErrorCode.NOT_FOUND:
                 raise
             upload = None
         if upload is None or upload.status in (UploadStatus.CANCELLED, UploadStatus.EXPIRED):
-            with self._lock:
-                self._uploads.pop(key, None)
+            store.forget_upload_session(key)
             return None
         return upload
 
@@ -299,10 +379,14 @@ class RemoteFiles:
                 done += len(data)
                 progress(done)
 
-    def _abandon(self, key: tuple[UploadTarget, str, int], upload_id: uuid.UUID) -> None:
-        """Forget a session that can't complete, and free its space on the server."""
-        with self._lock:
-            self._uploads.pop(key, None)
+    def _abandon(self, store: UploadSessions, key: str, upload: UploadOut) -> None:
+        """Forget a session that can't complete, and free its space on the server (a
+        completed one has none reserved, and can't be cancelled)."""
+        store.forget_upload_session(key)
+        if upload.status != UploadStatus.COMPLETED:
+            self._cancel(upload.id)
+
+    def _cancel(self, upload_id: uuid.UUID) -> None:
         try:
             self._api.no_content("DELETE", f"/api/v1/uploads/{upload_id}")
         except (ApiError, OfflineError):
@@ -327,6 +411,8 @@ class RemoteFiles:
     ) -> None:
         """Fetch the content into `part`, resuming from what is already there, and verify it
         (FR-SYNC-06, FR-XFER-02). A mismatch starts once more from scratch, then gives up."""
+        if stop.is_set():  # paused before its turn came: nothing is fetched
+            raise TransferCancelledError()
         for attempt in (1, 2):
             digest = self._fetch(node_id, sha256, size, part, stop, progress)
             if digest == sha256 and part.stat().st_size == size:
