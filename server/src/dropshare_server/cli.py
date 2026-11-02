@@ -21,6 +21,7 @@ from dropshare_server.core.errors import AppError
 from dropshare_server.services import audit as audit_service
 from dropshare_server.services import blobs as blob_service
 from dropshare_server.services import groups as group_service
+from dropshare_server.services import storage_report as storage_report_service
 from dropshare_server.services import trash as trash_service
 from dropshare_server.services import uploads as upload_service
 from dropshare_server.services import users as user_service
@@ -47,7 +48,7 @@ def _err(text: str) -> None:
 def _create_user(
     args: argparse.Namespace, sessions: sessionmaker[Session], settings: Settings, ctx: CallContext
 ) -> int:
-    quota = settings.default_quota_bytes if args.quota_gb is None else int(args.quota_gb * _GIB)
+    quota = settings.default_quota_bytes if args.quota_bytes is None else args.quota_bytes
     with sessions.begin() as session:
         created = user_service.create_user(
             session,
@@ -89,6 +90,15 @@ def _set_disabled(disabled: bool) -> Handler:
     return handler
 
 
+def _set_quota(
+    args: argparse.Namespace, sessions: sessionmaker[Session], _: Settings, ctx: CallContext
+) -> int:
+    with sessions.begin() as session:
+        user = user_service.set_quota(session, ctx, args.username, args.quota_bytes)
+    _out(f"Quota for '{user.username}' set to {user.quota_bytes / _GIB:g} GB.")
+    return 0
+
+
 def _list_users(
     _args: argparse.Namespace, sessions: sessionmaker[Session], _: Settings, ctx: CallContext
 ) -> int:
@@ -101,6 +111,42 @@ def _list_users(
             f"{user.quota_bytes / _GIB:g}"
         )
     return 0
+
+
+def _storage_report(
+    args: argparse.Namespace, sessions: sessionmaker[Session], settings: Settings, ctx: CallContext
+) -> int:
+    try:
+        stored_blobs = storage_report_service.count_blobs(create_storage_backend(settings))
+    except OSError as exc:
+        # Unmounted or unreadable: no traceback or path (it shows where files are stored), but
+        # audited like any failed command.
+        _record_failure(sessions, ctx, args, "STORAGE_UNAVAILABLE")
+        _err(f"The file storage couldn't be read ({type(exc).__name__}). Check STORAGE_* settings.")
+        return 1
+    with sessions.begin() as session:
+        report = storage_report_service.build(session, ctx, stored_blobs)
+    _out(f"{'USERNAME':<24} {'STATUS':<9} {'QUOTA_GB':>10} {'USED_GB':>10} {'USED%':>6} TRASH_GB")
+    for user in report.users:
+        _out(
+            f"{user.username:<24} {user.status.value:<9} {user.quota_bytes / _GIB:>10.2f} "
+            f"{user.used_bytes / _GIB:>10.2f} {_percent(user.used_bytes, user.quota_bytes):>6} "
+            f"{user.trash_bytes / _GIB:.2f}"
+        )
+    _out("")
+    _out(f"Users: {len(report.users)}")
+    _out(f"Used: {report.used_bytes / _GIB:.2f} GB of {report.quota_bytes / _GIB:.2f} GB allocated")
+    _out(
+        f"File versions: {report.version_count} ({report.version_bytes / _GIB:.2f} GB); "
+        f"blobs in storage: {report.stored_blobs}"
+    )
+    return 0
+
+
+def _percent(used: int, quota: int) -> str:
+    if quota == 0:
+        return "-" if used == 0 else "full"
+    return f"{used * 100 / quota:.0f}%"
 
 
 def _create_group(
@@ -258,14 +304,15 @@ def _day_start(day: date | None) -> datetime | None:
     return None if day is None else datetime.combine(day, time.min, tzinfo=UTC)
 
 
-def _quota_gb(text: str) -> float:
+def _quota_bytes(text: str) -> int:
+    """--quota-gb: a number of GB (decimals allowed), as bytes."""
     try:
         value = float(text)
     except ValueError:
         raise argparse.ArgumentTypeError("must be a number of GB") from None
     if not math.isfinite(value) or not 0 <= value <= _MAX_QUOTA_GB:
         raise argparse.ArgumentTypeError(f"must be between 0 and {_MAX_QUOTA_GB} GB")
-    return value
+    return int(value * _GIB)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -282,7 +329,12 @@ def _build_parser() -> argparse.ArgumentParser:
     create.add_argument("--email", required=True)
     create.add_argument("--display-name", required=True)
     create.add_argument("--role", choices=[role.value for role in UserRole], default="user")
-    create.add_argument("--quota-gb", type=_quota_gb, help="Default: DEFAULT_QUOTA_BYTES (50 GB)")
+    create.add_argument(
+        "--quota-gb",
+        dest="quota_bytes",
+        type=_quota_bytes,
+        help="Default: DEFAULT_QUOTA_BYTES (50 GB)",
+    )
     create.set_defaults(handler=_create_user, audit_action=AuditAction.USER_CREATED)
     for name, handler, action, help_text in (
         (
@@ -302,6 +354,12 @@ def _build_parser() -> argparse.ArgumentParser:
         command = users.add_parser(name, help=help_text)
         command.add_argument("username")
         command.set_defaults(handler=handler, audit_action=action)
+    set_quota = users.add_parser(
+        "set-quota", help="Change a user's quota; never below what they already use"
+    )
+    set_quota.add_argument("username")
+    set_quota.add_argument("--quota-gb", dest="quota_bytes", type=_quota_bytes, required=True)
+    set_quota.set_defaults(handler=_set_quota, audit_action=AuditAction.USER_QUOTA_CHANGED)
     users.add_parser("list", help="List all users").set_defaults(
         handler=_list_users, audit_action=AuditAction.USER_LISTED
     )
@@ -351,6 +409,13 @@ def _build_parser() -> argparse.ArgumentParser:
     export.add_argument("--action", choices=[action.value for action in AuditAction])
     export.add_argument("--outcome", choices=[outcome.value for outcome in AuditOutcome])
     export.set_defaults(handler=_export_audit, audit_action=AuditAction.AUDIT_EXPORTED)
+
+    storage = groups.add_parser("storage", help="Storage usage").add_subparsers(
+        dest="command", required=True
+    )
+    storage.add_parser(
+        "report", help="Quota and usage per user, and totals of what is stored"
+    ).set_defaults(handler=_storage_report, audit_action=AuditAction.STORAGE_REPORTED)
 
     jobs = groups.add_parser("jobs", help="Scheduled maintenance jobs").add_subparsers(
         dest="command", required=True

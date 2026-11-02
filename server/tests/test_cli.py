@@ -286,6 +286,112 @@ def test_listing_users_is_audited(cli: Cli, audit_events: AuditEvents) -> None:
     assert (event.actor_label, event.outcome) == ("it-admin", AuditOutcome.SUCCESS)
 
 
+def _set_used_bytes(sessions: sessionmaker[Session], username: str, used: int) -> None:
+    with sessions.begin() as session:
+        user = session.scalars(select(User).where(User.username == username)).one()
+        user.used_bytes = used
+
+
+def _quota_of(sessions: sessionmaker[Session], username: str) -> int:
+    with sessions() as session:
+        return session.scalars(select(User.quota_bytes).where(User.username == username)).one()
+
+
+def test_set_quota_changes_it_and_is_audited(
+    cli: Cli, session_factory: sessionmaker[Session], audit_events: AuditEvents
+) -> None:
+    _create(cli)
+
+    code, out, _ = cli("users", "set-quota", "BOB", "--quota-gb", "2.5")
+
+    assert code == 0
+    assert "2.5 GB" in out
+    assert _quota_of(session_factory, "bob") == int(2.5 * 1024**3)
+    (event,) = audit_events(AuditAction.USER_QUOTA_CHANGED)
+    assert (event.actor_label, event.outcome, event.target_name) == (
+        "it-admin",
+        AuditOutcome.SUCCESS,
+        "bob",
+    )
+    assert f'"old_quota_bytes": {50 * 1024**3}' in (event.details or "")
+
+
+def test_quota_can_be_set_to_exactly_what_is_used(
+    cli: Cli, session_factory: sessionmaker[Session]
+) -> None:
+    _create(cli)
+    _set_used_bytes(session_factory, "bob", 1024**3)
+
+    code, _, err = cli("users", "set-quota", "bob", "--quota-gb", "1")
+
+    assert code == 0, err
+    assert _quota_of(session_factory, "bob") == 1024**3
+
+
+def test_quota_is_never_set_below_what_is_used(
+    cli: Cli, session_factory: sessionmaker[Session], audit_events: AuditEvents
+) -> None:
+    _create(cli)
+    _set_used_bytes(session_factory, "bob", 2 * 1024**3)
+
+    code, _, err = cli("users", "set-quota", "bob", "--quota-gb", "1.99")
+
+    assert code == 1
+    assert "already uses 2.00 GB" in err
+    assert _quota_of(session_factory, "bob") == 50 * 1024**3
+    (event,) = audit_events(AuditAction.USER_QUOTA_CHANGED)
+    assert event.outcome is AuditOutcome.FAILURE
+    assert '"code": "VALIDATION_ERROR"' in (event.details or "")
+
+
+def test_trashed_files_count_towards_the_usage_a_quota_is_checked_against(
+    cli: Cli,
+    api: TestClient,
+    signed_in: dict[str, str],
+    root_of: Callable[[dict[str, str]], str],
+    upload_file: Callable[..., Response],
+) -> None:
+    uploaded = upload_file(signed_in, b"kept in the trash", parent_id=root_of(signed_in), name="a")
+    node = uploaded.json()["data"]
+    trashed = api.delete(
+        f"/api/v1/nodes/{node['id']}",
+        params={"if_revision": node["revision"]},
+        headers={"Authorization": signed_in["authorization"]},
+    )
+    assert trashed.status_code == 204, trashed.text
+
+    code, _, err = cli("users", "set-quota", "alice", "--quota-gb", "0")
+
+    assert code == 1
+    assert "trash included" in err
+
+
+def test_a_new_quota_applies_to_the_next_upload(
+    cli: Cli,
+    signed_in: dict[str, str],
+    root_of: Callable[[dict[str, str]], str],
+    api: TestClient,
+) -> None:
+    assert cli("users", "set-quota", "alice", "--quota-gb", "0")[0] == 0
+
+    started = api.post(
+        "/api/v1/uploads",
+        json={"parent_id": root_of(signed_in), "name": "a", "size_bytes": 1, "sha256": "0" * 64},
+        headers={"Authorization": signed_in["authorization"]},
+    )
+
+    assert started.status_code == 409
+    assert started.json()["error"]["code"] == ErrorCode.QUOTA_EXCEEDED
+
+
+def test_set_quota_for_an_unknown_user_fails(cli: Cli, audit_events: AuditEvents) -> None:
+    code, _, err = cli("users", "set-quota", "ghost", "--quota-gb", "1")
+
+    assert code == 1
+    assert "No user named 'ghost'" in err
+    assert audit_events(AuditAction.USER_QUOTA_CHANGED)[0].outcome is AuditOutcome.FAILURE
+
+
 def test_failed_commands_are_audited(cli: Cli, audit_events: AuditEvents) -> None:
     cli("users", "create", "--username", "x", "--email", "x@example.com", "--display-name", "X")
     cli("users", "disable", "ghost")

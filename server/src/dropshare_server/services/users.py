@@ -170,6 +170,32 @@ def set_disabled(session: Session, ctx: CallContext, username: str, disabled: bo
     return to_out(user)
 
 
+def set_quota(session: Session, ctx: CallContext, username: str, quota_bytes: int) -> UserOut:
+    """Never below what the user already stores, trash included (OQ-46). Checked under the
+    row lock uploads take to charge usage, so a finishing upload can't slip in between."""
+    if quota_bytes < 0:
+        raise _invalid("Quota can't be negative.")
+    user = user_repository.get_for_update(session, _require(session, username).id)
+    if user is None:  # users are disabled, never deleted; only for the type checker
+        raise AppError(404, ErrorCode.NOT_FOUND, f"No user named '{username}'.")
+    if quota_bytes < user.used_bytes:
+        raise _invalid(
+            f"'{username}' already uses {user.used_bytes / 1024**3:.2f} GB (trash included); "
+            "the quota can't be set below that."
+        )
+    old_quota = user.quota_bytes
+    user.quota_bytes = quota_bytes
+    user.updated_at = datetime.now(UTC)
+    audit_service.record(
+        session,
+        ctx,
+        AuditAction.USER_QUOTA_CHANGED,
+        target=user_target(user),
+        details={"old_quota_bytes": old_quota, "quota_bytes": quota_bytes},
+    )
+    return to_out(user)
+
+
 def list_users(session: Session, ctx: CallContext) -> list[tuple[UserOut, UserStatus]]:
     users = [(to_out(user), user.status) for user in user_repository.list_all(session)]
     audit_service.record(session, ctx, AuditAction.USER_LISTED, details={"count": len(users)})

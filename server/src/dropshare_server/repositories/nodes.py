@@ -414,6 +414,27 @@ def trash_totals(
     return found
 
 
+def trash_bytes_by_owner(session: Session) -> dict[uuid.UUID, int]:
+    """Bytes of the files in the trash, per owner of their namespace (whose quota they use)."""
+    rows = session.execute(
+        select(Namespace.owner_user_id, func.coalesce(func.sum(Node.size_bytes), 0))
+        .join(Namespace, Namespace.id == Node.namespace_id)
+        .where(Node.trash_root_id.is_not(None))
+        .group_by(Namespace.owner_user_id)
+    )
+    return {owner_id: int(size) for owner_id, size in rows}
+
+
+def version_totals(session: Session) -> tuple[int, int]:
+    """How many file versions are recorded, and their bytes (the blobs they point at)."""
+    count, size = session.execute(
+        select(func.count(), func.coalesce(func.sum(FileVersion.size_bytes), 0)).select_from(
+            FileVersion
+        )
+    ).one()
+    return int(count), int(size)
+
+
 def owned_trash_roots(session: Session, user_id: uuid.UUID, limit: int) -> list[uuid.UUID]:
     """Up to `limit` items in the trash of the namespaces the user owns, oldest first (emptying
     the trash). Mounts of other people's shared folders count: they are the user's too."""
