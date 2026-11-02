@@ -5,11 +5,12 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFormLayout,
     QLabel,
+    QLineEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from dropshare_client.controllers.session_controller import SessionController
+from dropshare_client.controllers.session_controller import PasswordField, SessionController
 from dropshare_client.ui.forms import add_field, message_label, password_field, show_message
 from dropshare_shared.schemas.auth import PASSWORD_MIN_LENGTH
 
@@ -28,13 +29,18 @@ class ChangePasswordDialog(QDialog):
             else "Other computers signed in to your account will be signed out."
         )
         intro.setWordWrap(True)
-        hint = QLabel(f"Use at least {PASSWORD_MIN_LENGTH} characters.")
+        hint = QLabel(
+            f"Use at least {PASSWORD_MIN_LENGTH} characters. Common passwords aren't allowed."
+        )
+        hint.setWordWrap(True)
         self._message = message_label("password_message")
 
         self._current = password_field()
         self._new = password_field()
         self._confirm = password_field()
-        self._new.setAccessibleDescription(hint.text())
+        # Each field's own description; while an error is shown, it leads the target's.
+        self._descriptions = {self._current: "", self._new: hint.text(), self._confirm: ""}
+        self._describe(None, "")
         form = QFormLayout()
         add_field(form, "&Current password", self._current)
         add_field(form, "&New password", self._new)
@@ -64,6 +70,7 @@ class ChangePasswordDialog(QDialog):
 
     def accept(self) -> None:
         show_message(self._message, "")
+        self._describe(None, "")
         self._controller.change_password(
             self._current.text(), self._new.text(), self._confirm.text()
         )
@@ -78,9 +85,23 @@ class ChangePasswordDialog(QDialog):
             field.clear()
         super().accept()
 
-    def _failed(self, message: str) -> None:
+    def _failed(self, message: str, field: PasswordField) -> None:
+        """Focus moves first and the field's description carries the reason: a screen reader
+        cuts an alert short when focus moves, but reads the focused field's description."""
+        target = {PasswordField.NEW: self._new, PasswordField.CONFIRM: self._confirm}.get(
+            field, self._current
+        )
+        if target is self._new:
+            self._confirm.clear()  # it holds the refused password too
+        self._describe(target, message)
+        target.setFocus()
+        target.selectAll()
         show_message(self._message, message)
-        self._current.setFocus()
+
+    def _describe(self, target: QLineEdit | None, message: str) -> None:
+        for field, description in self._descriptions.items():
+            text = f"{message} {description}".strip() if field is target else description
+            field.setAccessibleDescription(text)
 
     def _set_busy(self, busy: bool) -> None:
         for widget in (self._current, self._new, self._confirm, self._change, self._leave):

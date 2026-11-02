@@ -8,7 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-from client_fakes import NEW_PASSWORD, USER_PASSWORD, Client
+from client_fakes import COMMON_PASSWORD, NEW_PASSWORD, USER_PASSWORD, Client
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -145,6 +145,66 @@ def test_temporary_password_must_be_changed_before_anything_else(
     assert shell.password_dialog is None
     assert client.server.accounts["alice"].password == NEW_PASSWORD
     find_by_name(shell.window, QLabel, "Signed in as: Alice (alice)")
+
+
+def test_each_refused_password_puts_the_cursor_in_the_field_to_fix(
+    qtbot: QtBot, make_client: MakeClient, make_shell: MakeShell, find_by_name: FindByName
+) -> None:
+    """NFR-SEC-04: the server refuses a common password; the dialog says why and stays open."""
+    client = make_client()
+    client.server.accounts["alice"].must_change = True
+    shell = make_shell(client)
+    shell.start()
+    _sign_in(qtbot, find_by_name, shell, "alice", USER_PASSWORD)
+    qtbot.waitUntil(lambda: shell.password_dialog is not None and shell.password_dialog.isVisible())
+    dialog = shell.password_dialog
+    assert dialog is not None
+    fields = {
+        name: find_by_name(dialog, QLineEdit, name)
+        for name in ("Current password", "New password", "Confirm new password")
+    }
+
+    def change(current: str, new: str, confirm: str) -> None:
+        for name, text in zip(fields, (current, new, confirm), strict=True):
+            _type(find_by_name, dialog, name, text)
+        _click(qtbot, find_by_name, dialog, "Change password")
+
+    change(USER_PASSWORD, COMMON_PASSWORD, COMMON_PASSWORD)
+    qtbot.waitUntil(lambda: _message(find_by_name, dialog, "password_message") != "")
+    assert _message(find_by_name, dialog, "password_message") == (
+        "This password is too common and easy to guess. Choose another."
+    )
+    new = fields["New password"]
+    assert isinstance(new, QLineEdit)
+    qtbot.waitUntil(new.hasFocus)
+    assert new.selectedText() == COMMON_PASSWORD
+    confirm = fields["Confirm new password"]
+    assert isinstance(confirm, QLineEdit) and confirm.text() == ""
+    # Read with the focused field, in case the screen reader cuts the alert short.
+    assert new.accessibleDescription().startswith("This password is too common")
+    assert dialog.isVisible() and client.server.accounts["alice"].must_change
+
+    change(USER_PASSWORD, NEW_PASSWORD, "does-not-match-at-all")
+    qtbot.waitUntil(confirm.hasFocus)
+    assert _message(find_by_name, dialog, "password_message") == "The new passwords don't match."
+    assert confirm.accessibleDescription() == "The new passwords don't match."
+    assert (
+        new.accessibleDescription()
+        == "Use at least 12 characters. Common passwords aren't allowed."
+    )
+
+    change("wrong-current-password", NEW_PASSWORD, NEW_PASSWORD)
+    qtbot.waitUntil(
+        lambda: (
+            _message(find_by_name, dialog, "password_message")
+            == ("Your current password is incorrect.")
+        )
+    )
+    qtbot.waitUntil(fields["Current password"].hasFocus)
+
+    change(USER_PASSWORD, NEW_PASSWORD, NEW_PASSWORD)
+    qtbot.waitUntil(lambda: shell.password_dialog is None)
+    assert client.server.accounts["alice"].password == NEW_PASSWORD
 
 
 def test_leaving_the_forced_change_signs_out(

@@ -1,0 +1,113 @@
+# StateLife DropShare - reference nginx configuration for the reverse proxy (NFR-SEC-01, NFR-SEC-06).
+# Read docs/deploy/reverse-proxy.md first. Values marked CHANGE must be set per environment.
+# This file goes in the `http` context (e.g. /etc/nginx/conf.d/dropshare.conf).
+
+# --- Rate limits (NFR-SEC-06) ------------------------------------------------------------------
+# Limits are per caller. An IPv4 caller is its address. An IPv6 caller is its /64: anyone gets
+# a whole /64 and could otherwise use a new address for every request. nginx writes IPv6
+# addresses compressed (RFC 5952), so:
+#   - no "::" among the first four groups: the key is those four groups;
+#   - a "::" among them: the key is everything before it (the /64 is that, zero-filled).
+# One /64 can yield at most two keys this way (for example 2001:0:0:5::/64 written as
+# "2001::5:..." or "2001:0:0:5::..."), so it gets at most twice the limit, never unlimited.
+map $remote_addr $dropshare_client_key {
+    "~^([0-9a-f]+:[0-9a-f]+:[0-9a-f]+:[0-9a-f]+):" $1;
+    "~^((?:[0-9a-f]+)?(?::[0-9a-f]+){0,2}::)"      $1;
+    default                                        $remote_addr;
+}
+
+# Office egress addresses can be exempted from the global limit: many users behind one NAT
+# address would otherwise share it. They stay under the sign-in limit; account lockout
+# (FR-AUTH-06) applies to everyone regardless.
+geo $dropshare_global_exempt {
+    default 0;
+    # 203.0.113.0/24 1;   # CHANGE: office egress range(s), if any
+}
+map $dropshare_global_exempt $dropshare_global_key {
+    0 $dropshare_client_key;
+    1 "";                 # an empty key is never limited
+}
+
+# Global: a flood guard, not a throttle. An initial sync (NFR-PERF-05) makes ~3 requests per
+# small file and was measured at 80-250 files/s from one client (docs/perf-results.md).
+limit_req_zone $dropshare_global_key zone=dropshare_global:20m rate=100r/s;
+# Sign-in and password change: password guessing per caller.
+limit_req_zone $dropshare_client_key zone=dropshare_auth:10m rate=20r/m;
+limit_req_status 429;
+limit_req_log_level warn;
+
+upstream dropshare_app {
+    server 127.0.0.1:8000;   # CHANGE: app server(s); list each one if there are several
+    keepalive 32;
+}
+
+server {
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
+    server_name dropshare.example.com;                       # CHANGE (OQ-8)
+
+    ssl_certificate     /etc/nginx/tls/dropshare.crt;        # CHANGE (OQ-8)
+    ssl_certificate_key /etc/nginx/tls/dropshare.key;        # CHANGE (OQ-8)
+    ssl_protocols TLSv1.2 TLSv1.3;                           # NFR-SEC-01
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:dropshare_tls:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+    server_tokens off;
+
+    # Exactly one HSTS header: the app sends it too (as a fallback), so drop the app's copy.
+    proxy_hide_header Strict-Transport-Security;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    # Upload chunks are 8 MiB (UPLOAD_CHUNK_SIZE_BYTES); leave headroom.
+    client_max_body_size 16m;
+
+    # The app reads the client address and scheme from these, but only from TRUSTED_PROXIES.
+    # X-Forwarded-For is replaced, not appended to: nginx is the edge, so whatever a caller
+    # sent is discarded.
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header Connection "";
+    proxy_http_version 1.1;
+
+    # Stream both ways: chunks go straight to the app, downloads straight to the client.
+    proxy_request_buffering off;
+    proxy_buffering off;
+    # Long-poll holds up to 55 s (LONG_POLL_TIMEOUT_SECONDS); chunk writes can take a while.
+    proxy_read_timeout 90s;
+    proxy_send_timeout 90s;
+
+    # Errors in the API's own envelope, so the client shows them like any other.
+    error_page 429 = @dropshare_rate_limited;
+    location @dropshare_rate_limited {
+        default_type application/json;
+        add_header Retry-After 10 always;
+        add_header X-Request-ID $request_id always;   # every response has one (requirements §9)
+        add_header Strict-Transport-Security "max-age=31536000" always;
+        return 429 '{"error":{"code":"RATE_LIMITED","message":"Too many requests, try again later","details":null}}';
+    }
+
+    location = /api/v1/auth/login {
+        limit_req zone=dropshare_auth burst=10 nodelay;
+        limit_req zone=dropshare_global burst=500 nodelay;
+        proxy_pass http://dropshare_app;
+    }
+
+    location = /api/v1/me/password {
+        limit_req zone=dropshare_auth burst=10 nodelay;
+        limit_req zone=dropshare_global burst=500 nodelay;
+        proxy_pass http://dropshare_app;
+    }
+
+    location / {
+        limit_req zone=dropshare_global burst=500 nodelay;
+        proxy_pass http://dropshare_app;
+    }
+}
+
+# No plain-HTTP listener (NFR-SEC-01): the client only ever uses https://. If the infra team
+# wants port 80 open for browsers, it must do nothing but redirect:
+#   server { listen 80; listen [::]:80; server_name dropshare.example.com; return 301 https://$host$request_uri; }

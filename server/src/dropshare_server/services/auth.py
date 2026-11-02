@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from dropshare_server.core.config import Settings
 from dropshare_server.core.errors import AppError
+from dropshare_server.core.password_policy import is_common
 from dropshare_server.core.security import (
     AccessClaims,
     InvalidAccessTokenError,
@@ -443,6 +444,12 @@ def change_password(
     if body.new_password == body.current_password:
         raise _field_error(
             "new_password", "Choose a password different from the current one.", "password_reused"
+        )
+    if is_common(body.new_password):  # NFR-SEC-04
+        raise _field_error(
+            "new_password",
+            "This password is too common and easy to guess. Choose another.",
+            "password_common",
         )
 
     now = datetime.now(UTC)
