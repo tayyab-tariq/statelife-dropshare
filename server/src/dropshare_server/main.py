@@ -14,11 +14,16 @@ from dropshare_server.core.config import Settings
 from dropshare_server.core.db import create_db_engine, create_session_factory
 from dropshare_server.core.error_handlers import error_response, register_error_handlers
 from dropshare_server.core.logging import configure_logging, request_id_var
+from dropshare_server.dependencies.context import is_https
 from dropshare_server.dependencies.resources import AppResources
 from dropshare_server.storage.factory import create_storage_backend
 from dropshare_shared.errors import ErrorCode
 
 logger = logging.getLogger(__name__)
+
+# NFR-SEC-01. The reverse proxy sends the same header (docs/deploy/reverse-proxy.md); this one
+# is the fallback. No includeSubDomains: other hosts on the organization's domain aren't ours.
+_HSTS = "max-age=31536000"
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -70,6 +75,8 @@ async def _request_context(
             )
             response = error_response(500, ErrorCode.INTERNAL_ERROR, "Something went wrong")
         response.headers["X-Request-ID"] = request_id
+        if _reached_over_https(request):
+            response.headers["Strict-Transport-Security"] = _HSTS
         logger.info(
             "Request handled",
             extra={
@@ -82,6 +89,19 @@ async def _request_context(
         return response
     finally:
         request_id_var.reset(token)
+
+
+def _reached_over_https(request: Request) -> bool:
+    """HSTS only over HTTPS: browsers ignore it on plain HTTP, and a development server on
+    http://localhost must never pin itself (NFR-SEC-01, OQ-12). Runs outside the last-resort
+    boundary, so it must not raise: without resources (startup failed) no proxy is trusted."""
+    resources = getattr(request.app.state, "resources", None)
+    return is_https(
+        request.url.scheme,
+        request.client.host if request.client else None,
+        request.headers.get("X-Forwarded-Proto"),
+        resources.settings.trusted_proxies if isinstance(resources, AppResources) else [],
+    )
 
 
 app = create_app()

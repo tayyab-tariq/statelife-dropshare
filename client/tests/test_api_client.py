@@ -216,14 +216,28 @@ def test_a_server_error_on_refresh_ends_the_session(status: int) -> None:
     assert credentials.secret is None
 
 
-def test_refusals_before_the_token_is_used_keep_it() -> None:
-    def handle(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(429, text="Slow down")  # proxy rate limit, no envelope
+_NGINX_429 = (  # exactly what docs/deploy/nginx.conf.example answers
+    '{"error":{"code":"RATE_LIMITED","message":"Too many requests, try again later",'
+    '"details":null}}'
+)
 
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(429, text="Slow down"),  # a proxy without the envelope
+        httpx.Response(
+            429,
+            text=_NGINX_429,
+            headers={"Content-Type": "application/json", "X-Request-ID": "nginx-1"},
+        ),
+    ],
+)
+def test_refusals_before_the_token_is_used_keep_it(response: httpx.Response) -> None:
     credentials = _Credentials("refresh-0")
 
     with pytest.raises(ApiError) as caught:
-        _client(handle, credentials).ensure_access_token()
+        _client(lambda request: response, credentials).ensure_access_token()
 
     assert caught.value.code == ErrorCode.RATE_LIMITED
     assert credentials.secret == "refresh-0"

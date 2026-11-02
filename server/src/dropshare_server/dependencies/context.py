@@ -30,6 +30,24 @@ def client_ip(
     return peer
 
 
+def is_https(
+    scheme: str,
+    peer: str | None,
+    forwarded_proto: str | None,
+    trusted_proxies: Sequence[IPv4Address | IPv6Address],
+) -> bool:
+    """Whether the caller reached us over HTTPS: directly, or through a trusted proxy that
+    terminated TLS and said so in X-Forwarded-Proto (anyone else's header is ignored)."""
+    if scheme == "https":
+        return True
+    return (
+        peer is not None
+        and forwarded_proto is not None
+        and forwarded_proto.strip().lower() == "https"
+        and _is_trusted(peer, trusted_proxies)
+    )
+
+
 def _is_trusted(peer: str, trusted_proxies: Sequence[IPv4Address | IPv6Address]) -> bool:
     try:
         return ip_address(peer) in trusted_proxies

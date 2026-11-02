@@ -64,7 +64,8 @@ class Settings(DatabaseSettings):
     long_poll_timeout_seconds: float = Field(default=55, gt=0, le=60)  # clients wait 75 s
     long_poll_interval_seconds: float = Field(default=1, gt=0)
 
-    # Reverse proxies whose X-Forwarded-For is trusted for the audit source IP.
+    # Reverse proxies whose X-Forwarded-For (the audit source IP) and X-Forwarded-Proto (whether
+    # to send HSTS) are trusted.
     trusted_proxies: list[IPv4Address | IPv6Address] = []
 
     # Cleanup jobs (FR-TRASH-04, NFR-REL-05, FR-AUDIT-03).
