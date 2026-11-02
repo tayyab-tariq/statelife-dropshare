@@ -43,7 +43,13 @@ from dropshare_client.sync.errors import (
     SyncStoppedError,
     UnsafePathError,
 )
-from dropshare_client.sync.executor import ActivityLog, Executor, Transfer, no_crash
+from dropshare_client.sync.executor import (
+    TOO_LONG_HERE,
+    ActivityLog,
+    Executor,
+    Transfer,
+    no_crash,
+)
 from dropshare_client.sync.mounts import MountRelease, ReleaseIncompleteError
 from dropshare_client.sync.reconciler import (
     Action,
@@ -495,6 +501,7 @@ class SyncCore:
             roots = self._moved_out_of_view(roots, dirty, tree, remote, base)
             dirty = dirty | roots
         self._scanner.require_root()  # a vanished root must never read as "all deleted"
+        self._refuse_too_long(remote, base, deferred)
         # Not decided this cycle: folders still being let go, and items in flight between
         # two namespaces. Deferred keys are left alone, with everything below them.
         for key in held | self._in_transit:
@@ -605,6 +612,33 @@ class SyncCore:
         for problem in problems.values():
             self._index.set_problem(problem)
         base.update(self._index.entries_under(root))
+
+    def _refuse_too_long(
+        self, remote: dict[str, RemoteItem], base: dict[str, Entry], deferred: set[str]
+    ) -> None:
+        """Server items whose path here would be too long for Windows (D4) are left alone,
+        with everything below them, and listed once, like the scanner's local ones. Planned,
+        they'd be refused on every cycle and retried forever. A synced item moved there on
+        the server stays where it is here: its old key is held too, so the move neither
+        runs nor waits, and the old copy is never read as deleted."""
+        refused: list[str] = []
+        for key in sorted(remote):  # a folder sorts before what's inside it
+            if any(paths.is_within(key, done) for done in refused):
+                continue
+            item = remote[key]
+            if not self._scanner.too_long(item.path, folder=item.node.kind == NodeKind.FOLDER):
+                continue
+            refused.append(key)
+            if key not in deferred:  # else already left alone, and listed if it's a problem
+                deferred.add(key)
+                self._index.set_problem(Problem(key, item.path, TOO_LONG_HERE))
+        if not refused:
+            return
+        synced_at = {entry.node_id: key for key, entry in base.items()}
+        for key, item in remote.items():
+            old = synced_at.get(item.node.node_id)
+            if old is not None and old != key and any(paths.is_within(key, r) for r in refused):
+                deferred.add(old)
 
     @staticmethod
     def _moved_out_of_view(

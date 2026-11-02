@@ -466,7 +466,10 @@ def _folder_deletes(
                 continue
             subsumed = (Op.DELETE_LOCAL, Op.RECORD)
         else:
-            if any(decisions.get(k) in _KEEPS_REMOTE for k in below):
+            # A server item left alone here (too long for this computer) is still kept.
+            if any(decisions.get(k) in _KEEPS_REMOTE for k in below) or any(
+                d != key and paths.is_within(d, key) and d in remote for d in deferred
+            ):
                 taken = local.get(key) is not None
                 decisions[key] = Op.CONFLICT if taken else Op.MAKE_LOCAL_FOLDER
                 again = again or taken

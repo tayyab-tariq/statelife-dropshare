@@ -287,3 +287,81 @@ def test_paths_too_long_for_windows_are_listed(tmp_path: Path, server: FakeFileS
     reasons = {p.path: p.reason for p in device.index.problems()}
     assert "too long" in reasons[long_name]
     assert "too long" in reasons["r" * 40 + ".txt"]
+
+
+def test_a_server_folder_too_deep_for_windows_settles(
+    tmp_path: Path, server: FakeFileServer
+) -> None:
+    """D4: listed once, its contents left alone, and the sync settles instead of retrying
+    what's inside it on every cycle."""
+    device = Device(tmp_path, server)
+    device.max_path = len(str(device.root)) + 35  # folders: up to 3 deep
+    device.restart()
+    server.put("keep.txt", b"x")
+    for depth in range(1, 6):
+        server.put("/".join(["folder"] * depth))
+    server.put("/".join(["folder"] * 5) + "/deep.txt", b"deep")
+    before = server.tree()
+
+    device.sync()
+    device.sync()  # nothing new to do: still settles, still listed once
+
+    assert server.tree() == before
+    problems = device.index.problems()
+    assert [p.path for p in problems] == ["folder/folder/folder/folder"]
+    assert "too long" in problems[0].reason
+    assert device.tree() == {
+        "keep.txt": b"x",
+        **{"/".join(["folder"] * d): None for d in (1, 2, 3)},
+    }
+
+
+def test_a_folder_deleted_here_keeps_a_new_server_item_too_long_for_windows(
+    tmp_path: Path, server: FakeFileServer
+) -> None:
+    """FR-CONF-03 and D4: the item can't come here, but it must not go to the server trash
+    with the folder; the folder comes back instead."""
+    device = Device(tmp_path, server)
+    device.max_path = len(str(device.root)) + 35  # folders: up to 3 deep
+    device.restart()
+    server.put("P")
+    device.sync()
+    server.put("P/" + "k" * 30 + ".txt", b"from a colleague")
+
+    (device.root / "P").rmdir()
+    device.sync()
+
+    assert server.tree()["P/" + "k" * 30 + ".txt"] == b"from a colleague"
+    assert server.trashed() == []
+    assert "P" in device.tree()
+    assert any("too long" in p.reason for p in device.index.problems())
+
+
+@pytest.mark.parametrize(
+    ("new_folder", "new_path"),
+    [
+        ("n" * 30, "n" * 30 + "/x.txt"),  # into a new folder that is itself too long here
+        (None, "Docs/" + "x" * 30 + ".txt"),  # renamed in a folder that is already here
+    ],
+)
+def test_a_server_move_to_a_path_too_long_for_windows_keeps_the_copy_here(
+    tmp_path: Path, server: FakeFileServer, new_folder: str | None, new_path: str
+) -> None:
+    """D4: the move can't happen here. The file stays where it was, nothing is deleted on
+    either side, it's listed, and the sync settles instead of trying the move forever."""
+    device = Device(tmp_path, server)
+    device.max_path = len(str(device.root)) + 35  # folders: up to 3 deep
+    device.restart()
+    device.write("Docs/x.txt", b"report")
+    device.sync()
+    if new_folder is not None:
+        server.put(new_folder)
+    server.relocate("Docs/x.txt", new_path)
+    on_server = server.tree()
+
+    device.sync()
+    device.sync()
+
+    assert server.tree() == on_server and server.trashed() == []
+    assert device.tree()["Docs/x.txt"] == b"report"
+    assert any("too long" in p.reason for p in device.index.problems())
