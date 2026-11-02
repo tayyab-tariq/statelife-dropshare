@@ -35,4 +35,4 @@ dist/
 .agent-artifacts/
 .DS_Store
 
-docs/
+# docs/
