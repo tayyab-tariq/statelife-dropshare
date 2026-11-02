@@ -47,7 +47,7 @@ from dropshare_shared.schemas.nodes import NodeKind, NodeOut
 logger = logging.getLogger(__name__)
 
 _DELETED_DIR = "deleted"
-_TOO_LONG = (
+TOO_LONG_HERE = (
     "The full path would be too long for Windows. Rename it, or move it nearer the top of "
     "your DropShare folder, on another computer or in the browser."
 )
@@ -188,7 +188,7 @@ class Executor:
         remote = _required(action.remote)
         path = paths.join(self._local_parent(action.key), paths.name_of(remote.path))
         if self._scanner.too_long(path, folder=True):
-            raise CantSyncError(_TOO_LONG)
+            raise CantSyncError(TOO_LONG_HERE)
         disk = self._disk(path)
         try:
             disk.mkdir()
@@ -311,7 +311,7 @@ class Executor:
         else:
             path = paths.join(self._local_parent(action.key), paths.name_of(remote.path))
         if self._scanner.too_long(path):
-            raise CantSyncError(_TOO_LONG)
+            raise CantSyncError(TOO_LONG_HERE)
         # Named by node only: a newer version replaces a stale partial download.
         part = self._temp_dir() / f"{node.node_id}.part"
         self._transfers.started(action.key, path, Direction.DOWNLOAD, node.size)
@@ -405,7 +405,7 @@ class Executor:
         folder = local.kind == NodeKind.FOLDER
         target_path = paths.join(self._local_parent(action.key), paths.name_of(remote.path))
         if self._scanner.too_long(target_path, folder=folder):
-            raise CantSyncError(_TOO_LONG)
+            raise CantSyncError(TOO_LONG_HERE)
         unchanged = folder or remote.node.sha256 == entry.sha256
         moved = dataclasses.replace(
             entry, revision=remote.node.revision if unchanged else entry.revision

@@ -9,6 +9,7 @@ from sync_fakes import Device, FakeFileServer
 
 from dropshare_client.services.errors import ApiError, TransferCancelledError
 from dropshare_client.sync.errors import SyncStoppedError
+from dropshare_client.sync.scanner import LocalItem, Scanner
 from dropshare_client.sync.transfers import (
     Direction,
     TransferEvent,
@@ -235,3 +236,28 @@ def test_a_locked_file_waits_and_goes_once_it_is_released(
     assert waiting and "another program" in waiting[-1].reason
     assert server.tree() == {"budget.xlsx": b"numbers"}
     assert events[-1].status is TransferStatus.DONE
+
+
+def test_a_new_file_locked_while_being_read_waits_with_that_reason(
+    device: Device, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FR-SYNC-06: locked before an upload is even planned (its content is read first)."""
+    device.write("budget.xlsx", b"numbers")
+    events = _record(device)
+
+    def locked(self: Scanner, item: LocalItem, stop: threading.Event) -> LocalItem:
+        raise PermissionError(32, "The process cannot access the file")
+
+    monkeypatch.setattr(Scanner, "hash", locked)
+    device.core.connect()
+    device.core.fetch()
+    first = device.core.cycle({""})
+
+    assert "budget.xlsx" in first.retry and device.index.problems() == []
+    [event] = events
+    assert (event.path, event.direction, event.status) == (
+        "budget.xlsx",
+        Direction.UPLOAD,
+        TransferStatus.WAITING,
+    )
+    assert "another program" in event.reason

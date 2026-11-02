@@ -61,12 +61,13 @@ def test_a_download_waits_while_the_file_is_open_elsewhere(tmp_path: Path) -> No
     device.write("doc.txt", b"old")
     device.sync()
     server.put("doc.txt", b"new from the server")
+    device.core.fetch()
 
     with exclusively_open(device.root / "doc.txt"):
         result = device.core.cycle({""})
         assert "doc.txt" in result.retry
-        assert (device.root / "doc.txt").read_bytes() == b"old"
         assert list((device.root / ".dropshare-tmp").glob("*.part"))
+    assert (device.root / "doc.txt").read_bytes() == b"old"  # unreadable while it's open
 
     device.sync()
     assert (device.root / "doc.txt").read_bytes() == b"new from the server"

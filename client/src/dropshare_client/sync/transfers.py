@@ -88,6 +88,13 @@ class TransferReporter:
     def waiting(self, key: str, reason: str) -> None:
         self._end(key, TransferStatus.WAITING, reason)
 
+    def waiting_for(
+        self, key: str, path: str, direction: Direction, total: int, reason: str
+    ) -> None:
+        """Waiting before it was ever queued, e.g. a new file locked while it was being
+        read to decide what to do with it (FR-SYNC-06)."""
+        self._send(TransferEvent(key, path, direction, TransferStatus.WAITING, 0, total, reason))
+
     def failed(self, key: str, reason: str) -> None:
         self._end(key, TransferStatus.FAILED, reason)
 
