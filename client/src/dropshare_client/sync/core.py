@@ -685,6 +685,8 @@ class SyncCore:
                 logger.info("Can't read %s yet (%s); trying again later", item.path, exc)
                 deferred.add(key)
                 result.retry[key] = self._backoff(key)
+                reason = _IN_USE if isinstance(exc, PermissionError) else _TRY_AGAIN
+                self._transfers.waiting_for(key, item.path, Direction.UPLOAD, item.size, reason)
 
     def _identify_new(self, local: dict[str, LocalItem], base: dict[str, Entry]) -> None:
         """File IDs for move detection (FR-SYNC-10), only where they can matter: items that
