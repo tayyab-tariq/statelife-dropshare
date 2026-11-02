@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from dropshare_client.platform.base import (
+    Autostart,
     CredentialStore,
     FileAttributes,
     FileIdentity,
@@ -29,6 +30,7 @@ class Platform:
     file_identity: FileIdentity
     file_attributes: FileAttributes
     volumes: Volumes
+    autostart: Autostart
 
 
 def paths() -> Paths:
@@ -100,20 +102,25 @@ def current(profile: str | None = None) -> Platform:
     recycle_bin: RecycleBin
     volumes: Volumes
     attributes: FileAttributes
+    autostart: Autostart
     if sys.platform == "win32":
         from dropshare_client.platform.windows.attributes import WindowsFileAttributes
+        from dropshare_client.platform.windows.autostart import WindowsAutostart
         from dropshare_client.platform.windows.recycle_bin import WindowsRecycleBin
         from dropshare_client.platform.windows.volumes import WindowsVolumes
 
         recycle_bin, volumes = WindowsRecycleBin(), WindowsVolumes()
         attributes = WindowsFileAttributes()
+        autostart = WindowsAutostart()
     else:
         from dropshare_client.platform.macos.attributes import MacFileAttributes
+        from dropshare_client.platform.macos.autostart import MacAutostart
         from dropshare_client.platform.macos.recycle_bin import MacTrash
         from dropshare_client.platform.macos.volumes import MacVolumes
 
         recycle_bin, volumes = MacTrash(), MacVolumes()
         attributes = MacFileAttributes()
+        autostart = MacAutostart()
     return Platform(
         paths=selected,
         credentials=KeyringCredentialStore(service),
@@ -121,4 +128,5 @@ def current(profile: str | None = None) -> Platform:
         file_identity=StatFileIdentity(),
         file_attributes=attributes,
         volumes=volumes,
+        autostart=autostart,
     )

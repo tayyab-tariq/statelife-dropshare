@@ -1,16 +1,19 @@
 """The running engine: its threads, long-poll wake-ups, pause and resume, offline backoff,
 mass-delete confirmation and stopping (FR-SYNC-03/04/05/08, transfers.md)."""
 
+import sqlite3
 import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
+from sqlalchemy.exc import OperationalError
 from sync_fakes import FakeFileServer, FakeRecycleBin, InodeIdentity, NoAttributes
 
 from dropshare_client.services.errors import SessionExpiredError
 from dropshare_client.store.index import Index
+from dropshare_client.store.records import Activity, Problem
 from dropshare_client.sync.engine import SyncEngine, SyncProblem, SyncState
 from dropshare_client.sync.transfers import TransferEvent
 
@@ -25,6 +28,8 @@ class Listener:
         self.expired = threading.Event()
         self.pending: list[int] = []
         self.transfers: list[TransferEvent] = []
+        self.activities: list[Activity] = []
+        self.problem_reports: list[list[Problem]] = []
         self._changed = threading.Condition()
 
     def state_changed(self, state: SyncState, problem: SyncProblem | None) -> None:
@@ -48,6 +53,12 @@ class Listener:
 
     def transfer(self, event: TransferEvent) -> None:
         self.transfers.append(event)
+
+    def activity(self, item: Activity) -> None:
+        self.activities.append(item)
+
+    def problems(self, items: list[Problem]) -> None:
+        self.problem_reports.append(items)
 
     @property
     def state(self) -> SyncState | None:
@@ -357,3 +368,51 @@ def test_retry_now_tries_a_failed_upload_again_without_waiting(
 
     eventually(lambda: server.tree() == {"big.bin": b"big"})
     assert listener.transfers[-1].status is TransferStatus.DONE
+
+
+def test_reports_activity_and_what_cant_sync_when_it_changes(
+    engine: SyncEngine, root: Path, listener: Listener
+) -> None:
+    engine.start()
+    listener.wait_for(lambda: listener.state == SyncState.UP_TO_DATE)
+    assert listener.problem_reports == [[]]  # at start: nothing left from an earlier run
+
+    _write(root, "a.txt", b"a")
+    _write(root, "bad:name.txt", b"x")  # ":" isn't allowed in a Windows name
+    engine.local_changed("a.txt")
+    engine.local_changed("bad:name.txt")
+
+    eventually(lambda: ("uploaded", "a.txt") in [(a.kind, a.path) for a in listener.activities])
+    eventually(lambda: [p.path for p in listener.problem_reports[-1]] == ["bad:name.txt"])
+    listener.wait_for(lambda: listener.state == SyncState.UP_TO_DATE)
+    engine.local_changed("a.txt")  # a cycle that changes nothing reports nothing
+    listener.wait_for(lambda: listener.state == SyncState.UP_TO_DATE)
+    assert len(listener.problem_reports) == 2
+
+
+def test_an_unreadable_problems_list_never_stops_syncing(
+    engine: SyncEngine,
+    root: Path,
+    server: FakeFileServer,
+    listener: Listener,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = Index.problems
+    failures = 3  # "database is locked", then it can be read again
+
+    def flaky(index: Index) -> list[Problem]:
+        nonlocal failures
+        if failures:
+            failures -= 1
+            raise OperationalError("SELECT", {}, sqlite3.OperationalError("database is locked"))
+        return real(index)
+
+    monkeypatch.setattr(Index, "problems", flaky)
+    engine.start()
+    _write(root, "a.txt", b"a")
+    engine.local_changed("a.txt")
+
+    eventually(lambda: server.tree() == {"a.txt": b"a"})
+    listener.wait_for(lambda: listener.state == SyncState.UP_TO_DATE)
+    assert all(problem is None for _, problem in listener.states)  # never shown as an error
+    eventually(lambda: listener.problem_reports == [[]])  # reported once it could be read

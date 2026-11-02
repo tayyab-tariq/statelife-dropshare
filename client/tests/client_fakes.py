@@ -13,12 +13,18 @@ import httpx
 from pydantic import ValidationError
 
 from dropshare_client.controllers.browser_controller import BrowserController
+from dropshare_client.controllers.devices_controller import DevicesController
+from dropshare_client.controllers.diagnostics_controller import DiagnosticsController
 from dropshare_client.controllers.file_actions_controller import FileActionsController
+from dropshare_client.controllers.folder_move_controller import FolderMoveController
+from dropshare_client.controllers.notification_controller import NotificationController
 from dropshare_client.controllers.session_controller import SessionController
+from dropshare_client.controllers.settings_controller import SettingsController
 from dropshare_client.controllers.share_controller import ShareController
 from dropshare_client.controllers.shared_controller import SharedController
 from dropshare_client.controllers.sync_controller import SyncController
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
+from dropshare_client.controllers.sync_log_controller import ActivityController, CantSyncController
 from dropshare_client.controllers.transfers_controller import TransfersController
 from dropshare_client.controllers.trash_controller import TrashController
 from dropshare_client.controllers.upload_controller import UploadController
@@ -32,6 +38,7 @@ from dropshare_client.store.index import Index
 from dropshare_client.sync import binding
 from dropshare_client.sync.engine import SyncListener, SyncState
 from dropshare_shared.naming import normalize_name
+from dropshare_shared.schemas.devices import DeviceOut
 from dropshare_shared.schemas.envelope import DataResponse, ListResponse, Meta, PageQuery
 from dropshare_shared.schemas.nodes import NodeKind, NodeOut
 from dropshare_shared.schemas.sharing import (
@@ -103,6 +110,9 @@ class FakeServer:
         self.restored: dict[uuid.UUID, NodeOut] = {}  # by ID: restoring again answers with it
         self.restore_names: dict[uuid.UUID, str] = {}  # names taken: comes back renamed
         self.empty_limit = 200  # items one DELETE /trash removes, as the server's EMPTY_LIMIT
+        # Signed-in devices (server services/devices.py), and the answer to listing them.
+        self.devices: list[DeviceOut] = []
+        self.devices_error: httpx.Response | None = None
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.calls.append(f"{request.method} {request.url.path}")
@@ -132,6 +142,8 @@ class FakeServer:
             route = self._sharing_route(request.method, request.url.path)
         if route is None:
             route = self._trash_route(request.method, request.url.path)
+        if route is None:
+            route = self._devices_route(request.method, request.url.path)
         if route is None:
             return _error(404, "NOT_FOUND", "Not found")
         return route(request)
@@ -265,6 +277,40 @@ class FakeServer:
         return None
 
     # --- the trash (server api/v1/trash.py) --------------------------------------------------
+
+    def _devices_route(
+        self, method: str, path: str
+    ) -> Callable[[httpx.Request], httpx.Response] | None:
+        parts = path.split("/")[3:]  # after /api/v1/
+        if parts == ["me", "devices"] and method == "GET":
+            return lambda request: (
+                self.devices_error
+                or _data([device.model_dump(mode="json") for device in self.devices])
+            )
+        if len(parts) == 3 and parts[:2] == ["me", "devices"] and method == "DELETE":
+            return lambda request: self._revoke_device(uuid.UUID(parts[2]))
+        return None
+
+    def device(self, name: str, *, current: bool = False) -> DeviceOut:
+        seen = datetime(2026, 10, 28, 9, 30, tzinfo=UTC)
+        device = DeviceOut(
+            id=uuid.uuid4(),
+            name=name,
+            os_name="Windows 11",
+            client_version="0.3.0",
+            created_at=seen,
+            last_seen_at=seen,
+            is_current=current,
+        )
+        self.devices.append(device)
+        return device
+
+    def _revoke_device(self, device_id: uuid.UUID) -> httpx.Response:
+        kept = [d for d in self.devices if d.id != device_id]
+        if len(kept) == len(self.devices):
+            return _error(404, "NOT_FOUND", "Device not found.")
+        self.devices = kept
+        return httpx.Response(204)
 
     def _trash_route(
         self, method: str, path: str
@@ -563,7 +609,7 @@ class FakeServer:
         return httpx.Response(204)
 
 
-def _data(data: dict[str, object]) -> httpx.Response:
+def _data(data: dict[str, object] | list[object]) -> httpx.Response:
     return httpx.Response(200, json={"data": data}, headers={"X-Request-ID": "req-1"})
 
 
@@ -615,6 +661,7 @@ class FakeEngine:
         self.display_name = display_name
         self.calls: list[str] = []
         self.paused = False
+        self.stops_in_time = True  # False: still busy when asked to stop (stop() times out)
 
     def start(self) -> None:
         self.calls.append("start")
@@ -622,12 +669,17 @@ class FakeEngine:
 
     def stop(self, timeout: float = 15.0) -> bool:
         self.calls.append("stop")
+        if not self.stops_in_time:
+            return False
         self.listener.state_changed(SyncState.STOPPED, None)
         self.index.close()
         return True
 
     def retry_now(self, key: str) -> None:
         self.calls.append(f"retry {key}")
+
+    def set_max_transfers(self, count: int) -> None:
+        self.calls.append(f"max_transfers {count}")
 
     def local_changed(self, path: str) -> None:
         self.calls.append(f"changed {path}")
@@ -683,6 +735,26 @@ class FakeEngines:
         return self.made[-1]
 
 
+class FakeAutostart:
+    """Start at sign-in, as the installed app on Windows has it (or not, `available=False`)."""
+
+    def __init__(self, *, available: bool = True) -> None:
+        self.is_available = available
+        self.registered = False
+        self.fail = False
+
+    def available(self) -> bool:
+        return self.is_available
+
+    def is_enabled(self) -> bool:
+        return self.registered
+
+    def set_enabled(self, enabled: bool) -> None:
+        if self.fail:
+            raise PermissionError("registry")
+        self.registered = enabled
+
+
 @dataclass
 class Client:
     """One client install, wired like app.main but against the fake server."""
@@ -703,6 +775,14 @@ class Client:
     share: ShareController
     shared: SharedController
     trashed: TrashController
+    notifications: NotificationController
+    activity: ActivityController
+    cant_sync: CantSyncController
+    settings: SettingsController
+    devices: DevicesController
+    folder_move: FolderMoveController
+    diagnostics: DiagnosticsController
+    autostart: "FakeAutostart"
     revealed: list[Path]  # what "Show in folder" asked the system to show
     engines: FakeEngines
     trash: Path

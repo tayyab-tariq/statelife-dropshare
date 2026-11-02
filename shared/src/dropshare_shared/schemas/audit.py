@@ -11,6 +11,7 @@ class AuditAction(StrEnum):
     AUTH_UNLOCKED = "auth.unlocked"
     AUTH_PASSWORD_CHANGED = "auth.password_changed"  # noqa: S105 - action name, not a secret
     AUTH_PASSWORD_RESET = "auth.password_reset"  # noqa: S105 - action name, not a secret
+    AUTH_DEVICE_REVOKED = "auth.device_revoked"
     USER_CREATED = "user.created"
     USER_DISABLED = "user.disabled"
     USER_ENABLED = "user.enabled"

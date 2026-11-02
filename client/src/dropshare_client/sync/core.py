@@ -68,6 +68,9 @@ STILL_WRITING_DELAY = 2.0
 # Locked or failing items: 2 s, 4 s, ... up to this (windows-fs.md "Locked and changing").
 MAX_RETRY_DELAY = 60.0
 MAX_TRANSFERS = 4  # files moving at once (FR-XFER-03)
+# The most the setting allows (OQ-39); the pool has this many threads, started as needed, so the
+# setting can change while syncing.
+MAX_TRANSFERS_LIMIT = 8
 # Smaller files go first; once only larger ones are left running, a cycle ends without waiting
 # for them, so a small change made meanwhile is planned and sent beside them (FR-XFER-03).
 SMALL_TRANSFER_BYTES = 4 * 1024 * 1024
@@ -161,7 +164,7 @@ class SyncCore:
         max_transfers: int = MAX_TRANSFERS,
     ) -> None:
         self._index = index
-        self._max_transfers = max(1, max_transfers)
+        self._max_transfers = _transfers_allowed(max_transfers)
         # Transfers moving now, possibly started by an earlier cycle; finished ones are
         # recorded by the next cycle (or when the engine stops). Engine thread only.
         self._pool: concurrent.futures.ThreadPoolExecutor | None = None
@@ -768,10 +771,15 @@ class SyncCore:
                 return_when=concurrent.futures.FIRST_COMPLETED,
             )
 
+    def set_max_transfers(self, count: int) -> None:
+        """Files moving at once from now on (any thread: read before each start). Fewer than
+        are moving lets the running ones finish."""
+        self._max_transfers = _transfers_allowed(count)
+
     def _submit(self, transfer: Transfer) -> concurrent.futures.Future[object]:
         if self._pool is None:
             self._pool = concurrent.futures.ThreadPoolExecutor(
-                max_workers=self._max_transfers, thread_name_prefix="dropshare-transfer"
+                max_workers=MAX_TRANSFERS_LIMIT, thread_name_prefix="dropshare-transfer"
             )
         stop, transfers = self._stop, self._transfers
 
@@ -1053,3 +1061,7 @@ def _settle(transfer: Transfer, future: concurrent.futures.Future[object]) -> No
         transfer.failed(exc)
         raise
     transfer.finish(value)
+
+
+def _transfers_allowed(count: int) -> int:
+    return min(max(count, 1), MAX_TRANSFERS_LIMIT)

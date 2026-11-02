@@ -14,6 +14,8 @@ _TOOLTIP_MAX = 127  # Windows truncates longer tray tooltips
 class Tray(QObject):
     open_folder_requested = Signal()
     open_app_requested = Signal()
+    recent_activity_requested = Signal()
+    settings_requested = Signal()
     pause_toggled = Signal(bool)  # True: pause
     quit_requested = Signal()
 
@@ -28,11 +30,10 @@ class Tray(QObject):
         self._menu.addSeparator()
         self.open_folder = self._action("Open sync folder", self.open_folder_requested.emit)
         self.open_app = self._action("Open DropShare", self.open_app_requested.emit)
-        # Activity and Settings arrive with roadmap F5; listed now so the menu doesn't change.
-        self.recent_activity = self._action("Recent activity", None)
+        self.recent_activity = self._action("Recent activity", self.recent_activity_requested.emit)
         self.pause = self._action("Pause syncing", lambda: self.pause_toggled.emit(True))
         self.resume = self._action("Resume syncing", lambda: self.pause_toggled.emit(False))
-        self.settings = self._action("Settings", None)
+        self.settings = self._action("Settings", self.settings_requested.emit)
         self._menu.addSeparator()
         self.quit = self._action("Quit", self.quit_requested.emit)
         self._icon.setContextMenu(self._menu)
@@ -49,13 +50,9 @@ class Tray(QObject):
         accessibility.contrastPreferenceChanged.connect(lambda _: self._refresh())
         self._refresh()
 
-    def _action(self, text: str, slot: Callable[[], object] | None) -> QAction:
+    def _action(self, text: str, slot: Callable[[], object]) -> QAction:
         action = self._menu.addAction(text)
-        if slot is not None:
-            action.triggered.connect(slot)
-        else:
-            action.setEnabled(False)
-            action.setToolTip("Coming in a later version")
+        action.triggered.connect(slot)
         return action
 
     def show(self) -> None:
@@ -93,7 +90,8 @@ class Tray(QObject):
         self.status_line.setText(status)
         self._icon.setToolTip(f"StateLife DropShare: {status}"[:_TOOLTIP_MAX])
         signed_in = self.state is not TrayState.SIGNED_OUT
-        self.open_folder.setEnabled(signed_in)
+        for action in (self.open_folder, self.recent_activity, self.settings):
+            action.setEnabled(signed_in)
         self.pause.setVisible(not self._paused)
         self.pause.setEnabled(signed_in)
         self.resume.setVisible(self._paused)

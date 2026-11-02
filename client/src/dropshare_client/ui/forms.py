@@ -2,7 +2,14 @@
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAccessible, QAccessibleEvent
-from PySide6.QtWidgets import QFormLayout, QLabel, QLineEdit, QMessageBox, QWidget
+from PySide6.QtWidgets import (
+    QAbstractButton,
+    QFormLayout,
+    QLabel,
+    QLineEdit,
+    QMessageBox,
+    QWidget,
+)
 
 
 def message_label(object_name: str) -> QLabel:
@@ -70,3 +77,11 @@ def confirm(parent: QWidget, title: str, text: str, action: str) -> bool:
     box.setEscapeButton(cancel)
     box.exec()
     return box.clickedButton() is go
+
+
+def set_available(button: QAbstractButton, available: bool, why: str) -> None:
+    """Enable or disable, with the reason (when off) as tooltip and screen-reader
+    description, so a disabled action says why (ui.md §5)."""
+    button.setEnabled(available)
+    button.setToolTip(why)
+    button.setAccessibleDescription(why)

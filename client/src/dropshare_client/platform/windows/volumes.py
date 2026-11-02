@@ -4,8 +4,10 @@ Type-checked only when mypy runs on Windows (the bodies are unreachable for mypy
 """
 
 import ctypes
+import json
 import os
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 from dropshare_client.platform.base import VolumeInfo, VolumeKind
@@ -43,4 +45,25 @@ class WindowsVolumes:
     def other_sync_roots(self) -> list[Path]:
         roots = [Path(value) for name in _ONEDRIVE_VARIABLES if (value := os.environ.get(name))]
         roots += [Path.home() / folder for folder in _OTHER_TOOL_FOLDERS]
-        return roots
+        return roots + dropbox_roots(os.environ)
+
+
+def dropbox_roots(environ: Mapping[str, str]) -> list[Path]:
+    """Dropbox folders wherever the user put them: Dropbox lists its personal and business
+    folders in info.json, in roaming or local app data. Unreadable files are skipped."""
+    roots: list[Path] = []
+    for variable in ("APPDATA", "LOCALAPPDATA"):
+        base = environ.get(variable)
+        if not base:
+            continue
+        try:
+            info = json.loads((Path(base) / "Dropbox" / "info.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(info, dict):
+            continue
+        for account in info.values():
+            path = account.get("path") if isinstance(account, dict) else None
+            if isinstance(path, str) and path and Path(path) not in roots:
+                roots.append(Path(path))
+    return roots

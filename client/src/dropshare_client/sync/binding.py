@@ -100,3 +100,14 @@ def _write_owner(root: Path, owner: _Owner, attributes: FileAttributes) -> None:
         with contextlib.suppress(OSError):
             Path(temp_name).unlink()
         raise
+
+
+def rebind(index_path: Path, root: Path) -> None:
+    """The sync folder was moved to `root` (syncing stopped): the index keeps what it knows."""
+    if not index_path.exists():
+        return
+    index = Index(index_path)
+    try:
+        index.rebind(str(root))
+    finally:
+        index.close()

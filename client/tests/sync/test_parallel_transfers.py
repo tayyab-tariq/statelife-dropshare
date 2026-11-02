@@ -138,7 +138,7 @@ def test_at_most_four_files_move_at_once(device: Device, server: WireServer) -> 
 
 
 def test_the_limit_is_a_setting(device: Device, server: WireServer) -> None:
-    device.restart(max_transfers=2)  # as Settings will set it (M11)
+    device.restart(max_transfers=2)  # as Settings sets it (OQ-39)
     _files(device, 5)
     server.hold.set()
 
@@ -147,6 +147,21 @@ def test_the_limit_is_a_setting(device: Device, server: WireServer) -> None:
         server.release()
 
     assert server.most_on_wire == 2
+
+
+def test_changing_the_limit_applies_while_syncing(device: Device, server: WireServer) -> None:
+    device.restart(max_transfers=2)
+    _files(device, 10)
+    server.hold.set()
+
+    with _syncing(device, server):
+        server.wait_until(lambda: len(server.on_wire) == 2)
+        device.core.set_max_transfers(4)  # Settings, while files are moving
+        server.wait_until(lambda: len(server.on_wire) == 4)
+        server.release()
+
+    assert server.most_on_wire == 4
+    assert len(server.tree()) == 10
 
 
 def test_small_files_pass_a_large_one_that_is_still_moving(

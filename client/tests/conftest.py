@@ -5,18 +5,31 @@ from pathlib import Path
 
 import httpx
 import pytest
-from client_fakes import Client, FakeEngines, FakeServer, FakeVolumes, MemoryCredentials
+from client_fakes import (
+    Client,
+    FakeAutostart,
+    FakeEngines,
+    FakeServer,
+    FakeVolumes,
+    MemoryCredentials,
+)
 from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import QAbstractButton, QLabel, QWidget
 from pytestqt.qtbot import QtBot
 
 from dropshare_client.controllers.browser_controller import BrowserController
+from dropshare_client.controllers.devices_controller import DevicesController
+from dropshare_client.controllers.diagnostics_controller import DiagnosticsController
 from dropshare_client.controllers.file_actions_controller import FileActionsController
+from dropshare_client.controllers.folder_move_controller import FolderMoveController
+from dropshare_client.controllers.notification_controller import NotificationController
 from dropshare_client.controllers.session_controller import SessionController
+from dropshare_client.controllers.settings_controller import SettingsController
 from dropshare_client.controllers.share_controller import ShareController
 from dropshare_client.controllers.shared_controller import SharedController
 from dropshare_client.controllers.sync_controller import SyncController
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
+from dropshare_client.controllers.sync_log_controller import ActivityController, CantSyncController
 from dropshare_client.controllers.transfers_controller import TransfersController
 from dropshare_client.controllers.trash_controller import TrashController
 from dropshare_client.controllers.upload_controller import UploadController
@@ -24,12 +37,15 @@ from dropshare_client.platform.macos.recycle_bin import MacTrash
 from dropshare_client.services.api_client import ApiClient
 from dropshare_client.services.auth import AuthService, Device
 from dropshare_client.services.config import ConfigStore
+from dropshare_client.services.devices import Devices
 from dropshare_client.services.files import RemoteFiles
 from dropshare_client.services.importer import Importer
 from dropshare_client.services.local_files import LocalFiles
 from dropshare_client.services.sharing import Sharing
 from dropshare_client.services.tokens import TokenStore
 from dropshare_client.services.trash import Trash
+from dropshare_client.sync import binding
+from dropshare_client.sync.folder_move import FolderMover
 from dropshare_client.ui.app_shell import AppShell
 
 # Headless Qt so tests run without a display (CI, SSH sessions). Visual checks on the Windows
@@ -111,6 +127,16 @@ def make_client(
         sync = SyncController(config, engines, engines.forget)
         transfers = TransfersController(sync)
         revealed: list[Path] = []
+        index_path = tmp_path / "app-data" / "index.db"
+        autostart = FakeAutostart()
+
+        def switch_folder(root: Path) -> None:  # as app.main does
+            binding.rebind(index_path, root)
+            config.update(sync_root=root)
+
+        def local_files(root: Path) -> LocalFiles:
+            return LocalFiles(root, MacTrash(trash), revealed.append)
+
         sharing = Sharing(api, RemoteFiles(api))
         return Client(
             server=server,
@@ -133,7 +159,7 @@ def make_client(
             ),
             file_actions=FileActionsController(
                 config,
-                lambda root: LocalFiles(root, MacTrash(trash), revealed.append),
+                local_files,
                 sync,
                 tmp_path / "app-data" / "index.db",
             ),
@@ -144,6 +170,24 @@ def make_client(
             share=ShareController(sharing),
             shared=SharedController(sharing),
             trashed=TrashController(Trash(api)),
+            notifications=NotificationController(config, auth.current_user),
+            activity=ActivityController(config, sync, index_path, local_files),
+            cant_sync=CantSyncController(config, sync, index_path, local_files),
+            settings=SettingsController(config, autostart, sync, "0.3.0"),
+            devices=DevicesController(Devices(api)),
+            diagnostics=DiagnosticsController(config, tmp_path / "app-data" / "logs", "0.3.0"),
+            folder_move=FolderMoveController(
+                FolderMover(
+                    tmp_path / "app-data" / "folder-move.json",
+                    MacTrash(trash),
+                    switch_folder,
+                ),
+                sync,
+                config,
+                FakeVolumes(tmp_path),
+                tmp_path / "app-data",
+            ),
+            autostart=autostart,
             engines=engines,
             trash=trash,
             app_data=tmp_path / "app-data",
@@ -175,6 +219,13 @@ def make_shell(qtbot: QtBot) -> Iterator[MakeShell]:
             share=client.share,
             shared=client.shared,
             trash=client.trashed,
+            notifications=client.notifications,
+            activity=client.activity,
+            cant_sync=client.cant_sync,
+            settings=client.settings,
+            devices=client.devices,
+            folder_move=client.folder_move,
+            diagnostics=client.diagnostics,
             tray_available=tray_available,
         )
         qtbot.addWidget(shell.window)
@@ -185,6 +236,8 @@ def make_shell(qtbot: QtBot) -> Iterator[MakeShell]:
     yield make
     for shell in shells:
         shell.tray.hide()
+        # Its timers (the 30 s offline retry) must not fire into a later test's widgets.
+        shell.deleteLater()
     # pytest-qt has deleted the widgets by now: silence what still arrives for them.
     for client in clients:
         for controller in (
@@ -195,6 +248,13 @@ def make_shell(qtbot: QtBot) -> Iterator[MakeShell]:
             client.uploads,
             client.session,
             client.folders,
+            client.notifications,
+            client.activity,
+            client.cant_sync,
+            client.settings,
+            client.devices,
+            client.folder_move,
+            client.diagnostics,
         ):
             controller.blockSignals(True)
         client.sync.shutdown()

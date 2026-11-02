@@ -66,6 +66,7 @@ class Spacing:
 
 
 SPACE = Spacing()
+DEVICES_TABLE_MIN_HEIGHT = 180  # Settings: a few computers show without scrolling
 DIALOG_WIDTH = 400  # sign-in and the dialogs that share its frame
 BRAND_STRIP_HEIGHT = 4
 LOGO_HEIGHT = 64

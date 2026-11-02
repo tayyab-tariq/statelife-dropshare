@@ -408,3 +408,199 @@ CONFIRM_EMPTY_TRASH = (
 def some_failed(failed: int, reason: str) -> str:
     what = "1 item" if failed == 1 else f"{failed} items"
     return f"{what} couldn't be done. {reason}"
+
+
+# --- notifications (FR-CLIENT-02) -----------------------------------------------------------
+
+NOTICE_NEW_SHARE = "Shared with you"
+NOTICE_CONFLICTS = "Conflicting changes"
+NOTICE_CANT_SYNC = "Can't sync"
+NOTICE_QUOTA_NEARLY_FULL = "Storage almost full"
+NOTICE_QUOTA_FULL = "Storage full"
+
+
+def cant_sync_notice(paths: list[str]) -> str:
+    if len(paths) == 1:
+        name = paths[0].rpartition("/")[2]
+        return (
+            f"“{name}” can't be synced. Open Can't sync in DropShare to see why and how to fix it."
+        )
+    return (
+        f"{len(paths)} items can't be synced. Open Can't sync in DropShare to see why and how "
+        "to fix them."
+    )
+
+
+def quota_notice(used: int, quota: int) -> str:
+    if used >= quota:
+        return (
+            "Your DropShare storage is full, so new and changed files don't upload. Delete files "
+            "you no longer need and empty the trash to make room."
+        )
+    percent = min(99, used * 100 // quota)
+    return (
+        f"Your DropShare storage is {percent}% full ({size_text(used)} of {size_text(quota)}). "
+        "Delete files you no longer need and empty the trash to make room."
+    )
+
+
+# --- Activity and Can't sync (FR-CLIENT-03, FR-SYNC-07) -------------------------------------
+
+ACTIVITY = "Activity"
+ACTIVITY_EMPTY = "Nothing synced yet. Files you add to your DropShare folder show up here."
+CANT_SYNC = "Can't sync"
+CANT_SYNC_EMPTY = "Everything can be synced."
+LOADING_ACTIVITY = "Loading activity…"
+LOADING_CANT_SYNC = "Loading items that can't be synced…"
+RETRYING = "Trying again…"
+
+
+def activity_text(kind: str, detail: str) -> tuple[str, str]:
+    """What happened, and more about it, for one sync event (FR-CLIENT-03)."""
+    other = detail.rpartition("/")[2]
+    match kind:
+        case "uploaded":
+            return "Uploaded", ""
+        case "downloaded":
+            return "Downloaded", ""
+        case "folder_added":
+            return "Folder uploaded", ""
+        case "conflict":
+            return "Conflict", f"Your version was saved as “{other}”."
+        case "deleted_here":
+            return "Deleted", "Deleted on another computer or in the app; moved to the Recycle Bin."
+        case "deleted_on_server":
+            return "Deleted", "Moved to the DropShare trash."
+        case "moved_here" | "moved_on_server":
+            return "Moved or renamed", f"Was “{detail}”." if detail else ""
+        case "kept_instead_of_recycled":
+            return (
+                "Kept",
+                f"Deleted on the server, but couldn't go to the Recycle Bin: kept in {detail}.",
+            )
+        case "cant_sync":
+            return "Can't sync", detail
+        case "kept_shared_folder":
+            return "Shared folder kept", detail
+        case "move_refused":
+            return "Move undone", (
+                "Only the owner can move items out of a shared folder. Yours was kept as a copy "
+                "where you moved it."
+            )
+        case "restored_view_only":
+            return "Change undone", "This shared folder is view only, so it was put back."
+        case "shared_folder_removed":
+            return "Shared folder removed", detail
+    return kind.replace("_", " ").capitalize(), detail
+
+
+# --- Settings (FR-CLIENT-04, FR-AUTH-07) ----------------------------------------------------
+
+SETTINGS = "Settings"
+SETTINGS_NOT_SAVED = (
+    "Your settings couldn't be saved. Check there's free space on this computer, then try again."
+)
+AUTOSTART_FAILED = (
+    "DropShare couldn't change whether it starts when you sign in to Windows. Try again, and "
+    "if it keeps happening, export diagnostics."
+)
+AUTOSTART_UNAVAILABLE = "Available in the installed app."
+DEVICES_EMPTY = "No other computers are signed in."
+LOADING_DEVICES = "Loading your devices…"
+THIS_DEVICE = "This computer"
+USE_SIGN_OUT_HERE = "Use Sign out for this computer."
+
+
+def device_signed_out(name: str) -> str:
+    return f"“{name}” was signed out. It stops syncing the next time it connects."
+
+
+def confirm_device_sign_out(name: str) -> str:
+    return (
+        f"Sign out “{name}”? It stops syncing and asks for your password the next time it "
+        "connects. Files already on it stay there."
+    )
+
+
+# --- moving the sync folder (FR-CLIENT-04) --------------------------------------------------
+
+MOVE_FOLDER_INTRO = (
+    "Choose a new or empty folder on a drive inside this computer. Syncing pauses while your "
+    "files move, then carries on from the new place."
+)
+MOVE_FOLDER_SAME = "That's where your DropShare folder already is. Choose another folder."
+WAIT_FOR_MOVE = "You can sign out once moving your DropShare folder has finished."
+CHECKING_FOLDER = "Checking that folder…"
+MOVING_FOLDER = "Moving your files… DropShare's syncing waits until they're in place."
+CANCELLING_MOVE = "Cancelling… Putting everything back where it was."
+MOVE_UNAVAILABLE = "Available once the current move of your DropShare folder has finished."
+
+
+def move_problem(problem: str, needed: int = 0) -> str:
+    """Why the folder didn't move (folder_move.MoveProblem): it is still where it was."""
+    return {
+        "no_space": f"There isn't enough free space there. Free up {size_text(needed)} on that "
+        "drive, or choose another one. Your folder hasn't moved.",
+        "in_use": "A file in your DropShare folder is open in another program. Close it, then "
+        "try again. Your folder hasn't moved.",
+        "has_links": "Your DropShare folder contains shortcuts or links, which can't be moved "
+        "to another drive. Remove them, or choose a folder on the same drive.",
+        "changing": "A file kept changing while it was copied. Close the program using it, then "
+        "try again. Your folder hasn't moved.",
+        "cancelled": "Cancelled. Your folder hasn't moved.",
+        "nested": "Choose a folder outside your DropShare folder, and not one that holds it.",
+        "missing": "Your DropShare folder can't be found. Check the drive is connected.",
+        "not_empty": "Something was put in that folder meanwhile. Choose a new or empty folder.",
+        "busy": "DropShare is still finishing what it was doing. Try moving the folder again in a "
+        "minute.",
+    }.get(
+        problem,
+        "Your folder couldn't be moved. Try again, and if it keeps happening, export diagnostics.",
+    )
+
+
+def folder_moved(root: str, old_kept: str | None) -> str:
+    if old_kept:
+        return (
+            f"Your DropShare folder is now {root}. The old folder couldn't go to the Recycle "
+            f"Bin, so it is still at {old_kept}; you can delete it."
+        )
+    return f"Your DropShare folder is now {root}. The old folder is in the Recycle Bin."
+
+
+# --- diagnostics (FR-CLIENT-06) -------------------------------------------------------------
+
+EXPORTING_DIAGNOSTICS = "Saving diagnostics…"
+DIAGNOSTICS_FAILED = (
+    "The diagnostics file couldn't be saved there. Choose another folder, such as Documents."
+)
+
+
+def diagnostics_saved(path: str) -> str:
+    return (
+        f"Diagnostics saved to {path}. It holds DropShare's logs and settings, never your "
+        "password or your files."
+    )
+
+
+def move_attention(folder: str) -> str:
+    return (
+        "Moving your DropShare folder couldn't be finished, so syncing is paused to keep your "
+        f"files safe. Some items may still be in {folder}. Close any program using them, then "
+        "restart DropShare to finish."
+    )
+
+
+def move_undone(root: str) -> str:
+    return (
+        f"Moving your DropShare folder was interrupted, so it was put back. It is still at {root}."
+    )
+
+
+def move_record_unreadable(path: str) -> str:
+    return (
+        "DropShare can't read its record of moving your DropShare folder, so syncing is paused "
+        "to keep your files safe. Check that both the old and the new folder hold your files, "
+        f"then delete {path} and restart DropShare. If you're unsure, export diagnostics and "
+        "contact your IT support."
+    )
