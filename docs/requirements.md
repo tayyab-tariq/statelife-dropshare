@@ -508,13 +508,13 @@ Acceptance:
 **FR-UPD-01 — Windows installer** `v1`
 Acceptance:
 
-- A signed installer installs per-user (no admin rights required) into `%LOCALAPPDATA%\Programs\StateLife DropShare`, creates Start-menu shortcuts and the start-at-sign-in entry, and registers the `statelife-dropshare://` link scheme (FR-SHARE-07).
-- Uninstall removes the app but keeps the sync folder and asks whether to remove local app data.
+- A signed installer installs per-user (no admin rights required) into `%LOCALAPPDATA%\Programs\StateLife DropShare`, creates Start-menu shortcuts, and registers the `statelife-dropshare://` link scheme (FR-SHARE-07). The start-at-sign-in entry is registered by the app, so the user's choice is kept (OQ-44); the installer only removes it on uninstall (OQ-49).
+- Uninstall removes the app but keeps the sync folder and asks whether to remove local app data; removing it also deletes the saved sign-in from Credential Manager (OQ-49).
 
 **FR-UPD-02 — Code signing** `v1`
 Acceptance:
 
-- The application executable and installer are Authenticode-signed with the organization's certificate (OQ-6). Builds without a valid signature are not published.
+- The application executable and installer are Authenticode-signed with the organization's certificate (OQ-6). Builds without a valid signature are not published: the release CLI checks the installer's signature and publisher and refuses anything else (OQ-49).
 
 **FR-UPD-03 — Auto-update** `v1`
 Acceptance:
@@ -532,6 +532,8 @@ Acceptance:
 Acceptance:
 
 - Admins publish a release via the server CLI (FR-ADMIN-01), or a CI step calls the same command, with version, channel (stable/beta), minimum supported version, release notes, installer, and checksum.
+- Admins can list releases and withdraw one, so clients are no longer offered it.
+- Each user is on the stable or beta channel, set via the CLI (default stable). Beta users are offered the newer of the latest beta and the latest stable release (OQ-49).
 
 ---
 
@@ -677,7 +679,7 @@ Every request sends `X-Client-Version`; every response includes `X-Request-ID`.
 | Sync               | `GET /namespaces/{id}/changes?cursor=&limit=`, `POST /changes/wait` (long-poll over several namespace cursors)                                                                              |
 | Trash              | `GET /trash`, `POST /trash/{node_id}/restore`, `DELETE /trash/{node_id}`, `DELETE /trash`                                                                                                   |
 | Sharing            | `GET /nodes/{id}/members`, `POST /nodes/{id}/members`, `PATCH /members/{id}`, `DELETE /members/{id}`, `GET /shared-with-me`, `POST /mounts`, `DELETE /mounts/{namespace_id}`, `GET /users/search?q=`, `GET /groups/search?q=` |
-| Client updates     | `GET /client/releases/latest?platform=&channel=`, `GET /client/releases/{id}/installer`                                                                                                     |
+| Client updates     | `GET /client/releases/latest?platform=` (channel from the user, OQ-49), `GET /client/releases/{id}/installer`                                                                                                     |
 | Admin              | None in v1 (administration is the server CLI). Phase 2: `/admin/users`, `/admin/groups`, `/admin/storage`, `/admin/audit-events`, `/admin/releases`.                                        |
 
 Error codes are stable SCREAMING_SNAKE_CASE strings defined in `shared/`, for example
@@ -851,6 +853,8 @@ These need an answer from the project owner. Items marked **Blocks** stop the na
 | OQ-45 | Devices (FR-AUTH-07): the list shows devices not revoked and seen within the refresh-token inactivity limit (30 days), most recent first, with this computer marked; "last seen" is updated at sign-in and each token refresh (about every 15 minutes). This computer is signed out with Sign out, not from the list (the server still accepts it). Revoking is audited as `auth.device_revoked`. | 2026-10-30 |
 | OQ-46 | Quotas (FR-ADMIN-01): `users set-quota` never sets a quota below what the user already stores, trash included (`used_bytes`); there is no override. It is checked under the same user-row lock uploads take, so a finishing upload can't slip past it; uploads still in progress aren't counted and are refused at completion if the new quota leaves no room. The storage report lists quota, usage, % used and trash per user, plus file-version and blob totals; byte totals come from the database (the storage interface doesn't report sizes), and only the blob count from storage. | 2026-11-02 |
 | OQ-47 | Reverse proxy (NFR-SEC-01/06): reference config and runbook in `docs/deploy/` (nginx). TLS 1.2+; one HSTS header `max-age=31536000` without `includeSubDomains` (other hosts on the organization's domain aren't ours); the app sends the same header as a fallback when reached over HTTPS directly or via a `TRUSTED_PROXIES` peer with `X-Forwarded-Proto: https`. Rate limits per source address, IPv6 grouped by /64: a global flood guard (100/s, burst 500, set above an initial sync's rate) and a stricter limit on sign-in and password change (20/min, burst 10); token refresh only falls under the global limit (refresh tokens can't be guessed and every device refreshes about every 15 minutes). Office egress ranges may be exempted from the global limit only. The proxy's 429 is in the API error envelope with `Retry-After` and `X-Request-ID`. | 2026-11-02 |
+| OQ-48 | Interim hosting: the server runs on **Windows** for now. D19 and NFR-COMPAT-06 stand (Linux in production, OS-neutral server code); Linux-specific work (nginx reference, cron jobs) waits until hosting moves. Windows-only server code, such as the Authenticode check, lives in one isolated module behind a protocol. | 2026-11-02 |
+| OQ-49 | Distribution (FR-UPD-01 … 05): the installer doesn't create the start-at-sign-in entry (OQ-44) but removes it on uninstall; removing app data at uninstall also deletes the Credential Manager entry. `releases publish` refuses an installer whose Authenticode signature or publisher doesn't verify (it runs on the Windows server, OQ-48); `releases list` and `releases withdraw` exist. The channel is per user (`users set-channel`, default stable) and reported by `GET /me`; the server picks it, the client doesn't pass it. `/auth/refresh` and `/client/releases/*` skip the minimum-version check (still signed in), so a client that is too old can fetch its update. The effective minimum version is the higher of `MIN_CLIENT_VERSION` and the minimum of the latest published stable release. Installers must be signed by `RELEASE_PUBLISHER` with a certificate whose SHA-256 is pinned (`RELEASE_CERT_SHA256` on the server, `cert_sha256` in the client build), and their version resource must equal the release version (audit 2026-11-02-0544). Clients from before the updater (0.2.0) are upgraded by hand; `--min-supported` stays at 0.2.0 until they are. | 2026-11-02 |
 
 ## 16. Glossary
 
