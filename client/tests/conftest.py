@@ -10,6 +10,7 @@ from client_fakes import (
     FakeAutostart,
     FakeEngines,
     FakeServer,
+    FakeUpdates,
     FakeVolumes,
     MemoryCredentials,
 )
@@ -32,6 +33,7 @@ from dropshare_client.controllers.sync_folder_controller import SyncFolderContro
 from dropshare_client.controllers.sync_log_controller import ActivityController, CantSyncController
 from dropshare_client.controllers.transfers_controller import TransfersController
 from dropshare_client.controllers.trash_controller import TrashController
+from dropshare_client.controllers.update_controller import UpdateController
 from dropshare_client.controllers.upload_controller import UploadController
 from dropshare_client.platform.macos.recycle_bin import MacTrash
 from dropshare_client.services.api_client import ApiClient
@@ -191,6 +193,8 @@ def make_client(
             engines=engines,
             trash=trash,
             app_data=tmp_path / "app-data",
+            updater=(updater := FakeUpdates(tmp_path / "app-data" / "updates")),
+            updates=UpdateController(updater),
         )
 
     yield make
@@ -226,6 +230,7 @@ def make_shell(qtbot: QtBot) -> Iterator[MakeShell]:
             devices=client.devices,
             folder_move=client.folder_move,
             diagnostics=client.diagnostics,
+            updates=client.updates,
             tray_available=tray_available,
         )
         qtbot.addWidget(shell.window)

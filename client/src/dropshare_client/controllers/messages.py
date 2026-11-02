@@ -417,6 +417,11 @@ NOTICE_CONFLICTS = "Conflicting changes"
 NOTICE_CANT_SYNC = "Can't sync"
 NOTICE_QUOTA_NEARLY_FULL = "Storage almost full"
 NOTICE_QUOTA_FULL = "Storage full"
+NOTICE_UPDATE = "Update available"
+
+
+def update_notice(version: str) -> str:
+    return f"DropShare {version} is ready to install. Open Settings in DropShare to install it."
 
 
 def cant_sync_notice(paths: list[str]) -> str:
@@ -604,3 +609,55 @@ def move_record_unreadable(path: str) -> str:
         f"then delete {path} and restart DropShare. If you're unsure, export diagnostics and "
         "contact your IT support."
     )
+
+
+# --- updates (FR-UPD-03, FR-UPD-04, OQ-41) ----------------------------------------------------
+
+UPDATES = "Updates"
+UPDATE_NOT_CHECKED = "Not checked yet."
+UPDATE_CHECKING = "Checking for updates…"
+UPDATE_UP_TO_DATE = "DropShare is up to date."
+UPDATE_ALREADY_READY = "An update is ready to install."
+UPDATE_PREPARING = "Checking the update before installing it…"
+UPDATE_NONE_AVAILABLE = (
+    "No update is available for it yet. Contact your administrator, and try again later."
+)
+UPDATE_REQUIRED_DOWNLOADING = "Downloading the update; you can install it when it's ready."
+UPDATE_CANT_CHECK_NOW = (
+    "The update couldn't be checked because the certificate servers can't be reached. It's "
+    "kept; try again when this computer is connected to the internet."
+)
+UPDATE_CHECK_OFFLINE = (
+    "Couldn't check for updates because the DropShare server can't be reached. Try again later."
+)
+UPDATE_NOT_VERIFIED = (
+    "The update couldn't be verified, so it was deleted and not installed. Choose Check for "
+    "updates to download it again; if this keeps happening, contact your administrator."
+)
+UPDATE_NOT_SAVED = (
+    "The update couldn't be prepared. Check there's free space on this computer, then try again."
+)
+INSTALLING_UPDATE = (
+    "Installing the DropShare update. DropShare opens again when it's done; your files keep "
+    "syncing after that."
+)
+UPDATE_REQUIRED = (
+    "This version of DropShare is no longer supported, so syncing has stopped. Install the "
+    "update to continue."
+)
+
+
+def update_downloading(version: str, percent: int) -> str:
+    return f"Downloading version {version}… {percent}%"
+
+
+def update_ready(version: str) -> str:
+    return f"Version {version} is ready to install."
+
+
+def update_on_restart(version: str) -> str:
+    return f"Version {version} will be installed the next time DropShare starts."
+
+
+def update_from_source(version: str) -> str:
+    return f"Version {version} is available. This copy runs from source, so it isn't updated."

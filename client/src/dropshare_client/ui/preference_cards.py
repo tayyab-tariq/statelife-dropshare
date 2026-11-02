@@ -18,6 +18,7 @@ _NOTIFICATIONS = (
     (Notice.CONFLICTS, "A file was changed in two places (conflicts)"),
     (Notice.CANT_SYNC, "Items can't be synced"),
     (Notice.QUOTA, "My storage is almost full or full"),
+    (Notice.UPDATE_AVAILABLE, "An update is ready to install"),
 )
 
 

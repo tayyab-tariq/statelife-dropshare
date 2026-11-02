@@ -1,11 +1,13 @@
 """Client settings: server address rules (OQ-12, FR-CLIENT-05) and atomic storage."""
 
+import json
 from pathlib import Path
 
 import pytest
 
 from dropshare_client.services.config import (
     DEFAULT_MAX_TRANSFERS,
+    DEFAULT_SERVER_URL,
     MAX_TRANSFERS_LIMIT,
     ClientConfig,
     ConfigStore,
@@ -55,6 +57,25 @@ def test_settings_survive_a_restart(tmp_path: Path) -> None:
 
     assert loaded == ClientConfig(server_url="https://dropshare.example.com", sync_root=tmp_path)
     assert [p.name for p in tmp_path.iterdir()] == ["config.json"]  # no temp files left
+
+
+def test_the_built_in_server_address_is_not_saved(tmp_path: Path) -> None:
+    """A later build's address applies; an address the user chose stays (FR-CLIENT-05)."""
+    path = tmp_path / "config.json"
+    ConfigStore(path).update(server_url=DEFAULT_SERVER_URL, sync_root=tmp_path)
+
+    assert "server_url" not in json.loads(path.read_text(encoding="utf-8"))
+    assert ConfigStore(path).config.server_url == DEFAULT_SERVER_URL
+
+
+def test_once_an_account_signed_in_the_address_is_kept(tmp_path: Path) -> None:
+    """So a later build with another built-in address doesn't move this client off the server
+    its sync folder belongs to (audit 2026-11-02-0544 S5)."""
+    path = tmp_path / "config.json"
+    ConfigStore(path).update(server_url=DEFAULT_SERVER_URL, keep_server_url=True)
+
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert (saved["server_url"], saved["keep_server_url"]) == (DEFAULT_SERVER_URL, True)
 
 
 def test_unreadable_settings_fall_back_to_defaults(tmp_path: Path) -> None:

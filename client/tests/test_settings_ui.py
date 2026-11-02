@@ -43,7 +43,7 @@ def client(make_client: MakeClient) -> Client:
 
 
 def _view(qtbot: QtBot, client: Client) -> SettingsView:
-    view = SettingsView(client.settings, client.devices, client.diagnostics)
+    view = SettingsView(client.settings, client.devices, client.diagnostics, client.updates)
     view.devices_card.confirm = lambda title, text, action: True
     qtbot.addWidget(view)
     view.show()

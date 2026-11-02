@@ -27,6 +27,7 @@ from dropshare_client.controllers.sync_folder_controller import SyncFolderContro
 from dropshare_client.controllers.sync_log_controller import ActivityController, CantSyncController
 from dropshare_client.controllers.transfers_controller import TransfersController
 from dropshare_client.controllers.trash_controller import TrashController
+from dropshare_client.controllers.update_controller import UpdateController
 from dropshare_client.controllers.upload_controller import UploadController
 from dropshare_client.platform.base import VolumeInfo, VolumeKind
 from dropshare_client.platform.macos.attributes import MacFileAttributes
@@ -34,6 +35,7 @@ from dropshare_client.services.api_client import ApiClient
 from dropshare_client.services.auth import AuthService
 from dropshare_client.services.config import ConfigStore
 from dropshare_client.services.tokens import TokenStore
+from dropshare_client.services.updater import ReadyUpdate
 from dropshare_client.store.index import Index
 from dropshare_client.sync import binding
 from dropshare_client.sync.engine import SyncListener, SyncState
@@ -41,6 +43,7 @@ from dropshare_shared.naming import normalize_name
 from dropshare_shared.schemas.devices import DeviceOut
 from dropshare_shared.schemas.envelope import DataResponse, ListResponse, Meta, PageQuery
 from dropshare_shared.schemas.nodes import NodeKind, NodeOut
+from dropshare_shared.schemas.releases import ReleaseOut
 from dropshare_shared.schemas.sharing import (
     GroupHit,
     MemberIn,
@@ -796,3 +799,69 @@ class Client:
     engines: FakeEngines
     trash: Path
     app_data: Path
+    updater: "FakeUpdates"
+    updates: UpdateController
+
+
+def release_out(version: str, notes: str = "Faster uploads.") -> ReleaseOut:
+    return ReleaseOut(
+        id=uuid.uuid4(),
+        version=version,
+        channel="stable",
+        min_supported_version="0.1.0",
+        notes=notes,
+        size_bytes=4 * 1024**3,  # past 2 GB: progress must not wrap (Signal(object))
+        sha256="0" * 64,
+        published_at=datetime.now(UTC),
+    )
+
+
+class FakeUpdates:
+    """The updater as UpdateController uses it: a release to offer, and a record of what was
+    downloaded, verified and remembered. `gate` holds a download until set."""
+
+    def __init__(self, folder: Path) -> None:
+        self.folder = folder
+        self.release: ReleaseOut | None = None
+        self.can_install = True
+        self.check_error: Exception | None = None
+        self.download_error: Exception | None = None
+        self.verify_error: Exception | None = None
+        self.remember_error: Exception | None = None
+        self.gate: threading.Event | None = None
+        self.checks = 0
+        self.downloaded: list[str] = []
+        self.verified: list[str] = []
+        self.remembered: list[str] = []
+        self.forgotten = 0
+
+    def newer_release(self) -> ReleaseOut | None:
+        self.checks += 1
+        if self.check_error is not None:
+            raise self.check_error
+        return self.release
+
+    def download(
+        self, release: ReleaseOut, stop: threading.Event, progress: Callable[[int], None]
+    ) -> ReadyUpdate:
+        progress(release.size_bytes // 2)
+        if self.gate is not None:
+            self.gate.wait(5)
+        if self.download_error is not None:
+            raise self.download_error
+        progress(release.size_bytes)
+        self.downloaded.append(release.version)
+        return ReadyUpdate(release, self.folder / f"DropShare-{release.version}-setup.exe")
+
+    def verify(self, update: ReadyUpdate) -> None:
+        if self.verify_error is not None:
+            raise self.verify_error
+        self.verified.append(update.release.version)
+
+    def remember(self, update: ReadyUpdate) -> None:
+        if self.remember_error is not None:
+            raise self.remember_error
+        self.remembered.append(update.release.version)
+
+    def forget(self) -> None:
+        self.forgotten += 1
