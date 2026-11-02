@@ -7,6 +7,7 @@ from typing import Literal, Self
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from dropshare_shared.signing import ExpectedSigner, normalize_thumbprint
 from dropshare_shared.version import parse_version
 
 # server/.env for local development; production sets real environment variables instead.
@@ -51,8 +52,14 @@ class Settings(DatabaseSettings):
     lockout_threshold: int = Field(default=5, ge=1)
     lockout_minutes: int = Field(default=15, ge=1)
 
-    # Clients below this version get 426 UPGRADE_REQUIRED (FR-UPD-04).
+    # Clients below this version get 426 UPGRADE_REQUIRED (FR-UPD-04). A published stable
+    # release can raise the minimum further (its --min-supported, OQ-49), never lower it.
     min_client_version: str = "0.2.0"  # 0.2.0: sharing (OQ-34)
+    # Who must have signed every published installer (FR-UPD-02, OQ-49): the certificate's
+    # name, and the SHA-256 of one of these certificates (several while one is renewed). Either
+    # empty: nothing can be published. The organization's certificate once OQ-6 is settled.
+    release_publisher: str = ""
+    release_cert_sha256: list[str] = []
     default_quota_bytes: int = Field(default=50 * _GIB, ge=0)  # NFR-SCALE-03
 
     # Files and transfers (FR-XFER-01, NFR-SCALE-01, requirements §7.2).
@@ -97,6 +104,14 @@ class Settings(DatabaseSettings):
                 "db_max_overflow": 0,
             }
         )
+
+    @field_validator("release_cert_sha256")
+    @classmethod
+    def _thumbprints(cls, values: list[str]) -> list[str]:
+        return [normalize_thumbprint(value) for value in values]
+
+    def release_signer(self) -> ExpectedSigner:
+        return ExpectedSigner.of(self.release_publisher, self.release_cert_sha256)
 
     @field_validator("min_client_version")
     @classmethod

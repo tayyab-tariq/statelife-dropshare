@@ -3,6 +3,7 @@
 from dropshare_server.models.audit_event import AuditEvent
 from dropshare_server.models.base import Base
 from dropshare_server.models.change import Change
+from dropshare_server.models.client_release import ClientRelease
 from dropshare_server.models.device import Device
 from dropshare_server.models.file_version import FileVersion
 from dropshare_server.models.group import Group, GroupMember
@@ -18,6 +19,7 @@ __all__ = [
     "AuditEvent",
     "Base",
     "Change",
+    "ClientRelease",
     "Device",
     "FileShare",
     "FileVersion",

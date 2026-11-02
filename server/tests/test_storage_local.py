@@ -55,6 +55,17 @@ def test_commit_assembles_chunks_in_order_and_measures_them(storage_root: Path) 
     assert list(storage.staged_upload_ids()) == []
 
 
+def test_a_blob_written_from_a_stream_is_measured_and_stages_nothing(storage_root: Path) -> None:
+    storage = LocalFilesystemBackend(storage_root)
+    key = new_blob_key()
+
+    stored = storage.write_blob(key, iter([b"setup", b".exe"]))
+
+    assert stored == CommitResult(size_bytes=9, sha256=hashlib.sha256(b"setup.exe").hexdigest())
+    assert b"".join(storage.open_range(key, 0, 8)) == b"setup.exe"
+    assert list(storage.staged_upload_ids()) == []
+
+
 def test_no_temporary_files_are_left_behind(storage_root: Path) -> None:
     storage = LocalFilesystemBackend(storage_root)
     upload_id, key = uuid.uuid4(), new_blob_key()

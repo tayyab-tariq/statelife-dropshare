@@ -1,8 +1,6 @@
 """Namespaces, folders, delete to trash and download (FR-FILE-04, FR-TRASH-01, FR-XFER-02)."""
 
 import uuid
-from collections.abc import Iterator
-from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy.orm import Session
@@ -19,6 +17,7 @@ from dropshare_server.services import access
 from dropshare_server.services import audit as audit_service
 from dropshare_server.services import changes as change_service
 from dropshare_server.services.audit import AuditDetails, AuditTarget
+from dropshare_server.services.content import Content, resolve_range
 from dropshare_server.services.context import CallContext
 from dropshare_server.storage.base import StorageBackend
 from dropshare_shared.errors import ErrorCode
@@ -27,7 +26,6 @@ from dropshare_shared.schemas.audit import AuditAction
 from dropshare_shared.schemas.envelope import Meta, PageQuery
 from dropshare_shared.schemas.error_details import (
     NameConflictDetails,
-    RangeNotSatisfiableDetails,
     RevisionConflictDetails,
 )
 from dropshare_shared.schemas.nodes import (
@@ -477,19 +475,6 @@ def _own_shared_contents(
     return found
 
 
-@dataclass(frozen=True)
-class Content:
-    """A file's bytes start..end (inclusive), ready to stream."""
-
-    name: str
-    size_bytes: int
-    sha256: str
-    start: int
-    end: int
-    partial: bool
-    chunks: Iterator[bytes]
-
-
 def open_content(
     session: Session,
     storage: StorageBackend,
@@ -507,7 +492,7 @@ def open_content(
         raise RuntimeError(f"Node {node.id} points to a missing version")
 
     size = version.size_bytes
-    start, end = (0, size - 1) if byte_range is None else _resolve_range(byte_range, size)
+    start, end = (0, size - 1) if byte_range is None else resolve_range(byte_range, size)
     chunks = storage.open_range(version.blob_key, start, end) if size else iter(())
     audit_service.record(
         session,
@@ -524,25 +509,4 @@ def open_content(
         end=end,
         partial=byte_range is not None,
         chunks=chunks,
-    )
-
-
-def _resolve_range(byte_range: tuple[int | None, int | None], size: int) -> tuple[int, int]:
-    first, last = byte_range
-    if first is None:  # suffix: the last `last` bytes
-        if not last or size == 0:
-            raise _unsatisfiable(size)
-        return max(0, size - last), size - 1
-    if first >= size:
-        raise _unsatisfiable(size)
-    return first, size - 1 if last is None else min(last, size - 1)
-
-
-def _unsatisfiable(size: int) -> AppError:
-    return AppError(
-        416,
-        ErrorCode.RANGE_NOT_SATISFIABLE,
-        "The requested range is outside the file.",
-        RangeNotSatisfiableDetails(size_bytes=size).model_dump(mode="json"),
-        headers={"Content-Range": f"bytes */{size}"},
     )

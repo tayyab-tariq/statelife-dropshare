@@ -7,6 +7,8 @@ from typing import Annotated
 
 from pydantic import BaseModel, Field
 
+from dropshare_shared.schemas.releases import ReleaseChannel, TolerantReleaseChannel
+
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9._-]{3,64}$")
 EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 EMAIL_MAX_LENGTH = 320
@@ -34,3 +36,5 @@ class UserOut(BaseModel):
     # Includes trashed items (FR-TRASH-01). Defaults to 0 for servers from before it was sent;
     # the server's own quota check at upload start is what's enforced.
     used_bytes: int = 0
+    # Which releases this user is offered (OQ-49); stable for servers from before it was sent.
+    update_channel: TolerantReleaseChannel = ReleaseChannel.STABLE

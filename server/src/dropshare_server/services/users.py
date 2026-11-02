@@ -20,6 +20,7 @@ from dropshare_shared.errors import ErrorCode
 from dropshare_shared.naming import normalize_name
 from dropshare_shared.schemas.audit import AuditAction
 from dropshare_shared.schemas.nodes import NamespaceKind, NodeKind
+from dropshare_shared.schemas.releases import ReleaseChannel
 from dropshare_shared.schemas.users import (
     DISPLAY_NAME_MAX_LENGTH,
     EMAIL_MAX_LENGTH,
@@ -192,6 +193,24 @@ def set_quota(session: Session, ctx: CallContext, username: str, quota_bytes: in
         AuditAction.USER_QUOTA_CHANGED,
         target=user_target(user),
         details={"old_quota_bytes": old_quota, "quota_bytes": quota_bytes},
+    )
+    return to_out(user)
+
+
+def set_update_channel(
+    session: Session, ctx: CallContext, username: str, channel: ReleaseChannel
+) -> UserOut:
+    """Which client releases the user is offered (FR-UPD-05, OQ-49)."""
+    user = _require(session, username)
+    old_channel = user.update_channel
+    user.update_channel = channel
+    user.updated_at = datetime.now(UTC)
+    audit_service.record(
+        session,
+        ctx,
+        AuditAction.USER_CHANNEL_CHANGED,
+        target=user_target(user),
+        details={"old_channel": old_channel.value, "channel": channel.value},
     )
     return to_out(user)
 

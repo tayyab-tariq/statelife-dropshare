@@ -2,7 +2,7 @@
 
 import re
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
@@ -37,6 +37,10 @@ class StorageBackend(Protocol):
         The staged chunks are kept: the caller discards them once the database has recorded the
         blob, so a failure in between leaves the upload retryable.
         """
+
+    def write_blob(self, blob_key: str, pieces: Iterable[bytes]) -> CommitResult:
+        """Store a new durable blob straight from a stream, without staging (client installers,
+        FR-UPD-05: staged chunks no upload session owns are swept by expire-uploads)."""
 
     def open_range(self, blob_key: str, start: int, end: int) -> Iterator[bytes]:
         """Stream bytes start..end (inclusive) of a blob, without loading it into memory."""
