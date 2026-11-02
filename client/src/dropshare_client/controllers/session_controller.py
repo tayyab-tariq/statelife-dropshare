@@ -7,8 +7,10 @@ store a new refresh token after the old one was forgotten (audit B6).
 
 import logging
 from collections.abc import Callable
+from enum import StrEnum
 from pathlib import Path
 
+from pydantic import ValidationError
 from PySide6.QtCore import QObject, Signal
 
 from dropshare_client.controllers import messages
@@ -26,6 +28,7 @@ from dropshare_client.services.errors import (
 )
 from dropshare_shared.errors import ErrorCode
 from dropshare_shared.schemas.auth import PASSWORD_MAX_LENGTH, PASSWORD_MIN_LENGTH
+from dropshare_shared.schemas.envelope import ValidationIssue
 from dropshare_shared.schemas.users import EMAIL_MAX_LENGTH
 
 logger = logging.getLogger(__name__)
@@ -40,7 +43,7 @@ class SessionController(QObject):
     offline = Signal(str)  # couldn't reach the server; the saved sign-in is kept
     upgrade_required = Signal(str)
     password_changed = Signal()  # done; `signed_in` follows once the account is loaded
-    password_change_failed = Signal(str)
+    password_change_failed = Signal(str, object)  # message, and the PasswordField to fix
     signed_out = Signal(str)  # anything the user should know, or ""
 
     def __init__(
@@ -126,7 +129,7 @@ class SessionController(QObject):
     def change_password(self, current: str, new: str, confirm: str) -> bool:
         problem = _new_password_problem(current, new, confirm)
         if problem:
-            self.password_change_failed.emit(problem)
+            self.password_change_failed.emit(*problem)
             return False
         return self._run(
             lambda: self._auth.change_password(current, new),
@@ -143,7 +146,7 @@ class SessionController(QObject):
         if isinstance(exc, SessionExpiredError):
             self.needs_sign_in.emit(messages.message_for(exc))
         else:
-            self.password_change_failed.emit(messages.message_for(exc))
+            self.password_change_failed.emit(messages.message_for(exc), _field_to_fix(exc))
 
     def sign_out(self, remove_files: bool) -> bool:
         """End the session (FR-AUTH-04); with `remove_files`, the sync folder goes to the
@@ -241,16 +244,43 @@ def _sign_in_problem(login: str, password: str) -> str | None:
     return None
 
 
-def _new_password_problem(current: str, new: str, confirm: str) -> str | None:
-    """NFR-SEC-04 length rules, checked before sending (the server checks again)."""
+class PasswordField(StrEnum):
+    CURRENT = "current"
+    NEW = "new"
+    CONFIRM = "confirm"
+
+
+def _new_password_problem(current: str, new: str, confirm: str) -> tuple[str, PasswordField] | None:
+    """NFR-SEC-04 length rules, checked before sending (the server checks again and also
+    refuses common passwords); the message and the field to fix."""
     if not current:
-        return "Enter your current password."
+        return "Enter your current password.", PasswordField.CURRENT
     if len(current) > PASSWORD_MAX_LENGTH:
-        return "Your current password is incorrect."
+        return "Your current password is incorrect.", PasswordField.CURRENT
     if len(new) < PASSWORD_MIN_LENGTH:
-        return f"Use at least {PASSWORD_MIN_LENGTH} characters for the new password."
+        message = f"Use at least {PASSWORD_MIN_LENGTH} characters for the new password."
+        return message, PasswordField.NEW
     if len(new) > PASSWORD_MAX_LENGTH:
-        return f"Use at most {PASSWORD_MAX_LENGTH} characters for the new password."
+        message = f"Use at most {PASSWORD_MAX_LENGTH} characters for the new password."
+        return message, PasswordField.NEW
     if new != confirm:
-        return "The new passwords don't match."
+        return "The new passwords don't match.", PasswordField.CONFIRM
     return None
+
+
+def _field_to_fix(exc: Exception) -> PasswordField:
+    """The new password when the server refused that one (reused, too common), else the
+    current password."""
+    if (
+        isinstance(exc, ApiError)
+        and exc.code == ErrorCode.VALIDATION_ERROR
+        and isinstance(exc.details, list)
+        and exc.details
+    ):
+        try:
+            loc = ValidationIssue.model_validate(exc.details[0]).loc
+        except ValidationError:
+            return PasswordField.CURRENT
+        if loc and loc[-1] == "new_password":
+            return PasswordField.NEW
+    return PasswordField.CURRENT

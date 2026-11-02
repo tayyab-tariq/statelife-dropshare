@@ -57,6 +57,7 @@ from dropshare_shared.version import Version, parse_version
 SERVER_URL = "http://127.0.0.1:8000"
 USER_PASSWORD = "correct-horse-battery"
 NEW_PASSWORD = "a-brand-new-password-42"
+COMMON_PASSWORD = "PasswordPassword"  # on the server's common-password list (NFR-SEC-04)
 
 
 LOCKOUT_THRESHOLD = 5
@@ -581,19 +582,21 @@ class FakeServer:
         body = json.loads(request.content)
         account = self.accounts[username]
         if body["current_password"] != account.password:
-            issue = {
-                "loc": ["body", "current_password"],
-                "msg": "Your current password is incorrect.",
-                "type": "password_incorrect",
-            }
-            return _error(400, "VALIDATION_ERROR", "The request is not valid", [issue])
+            return _field_error(
+                "current_password", "Your current password is incorrect.", "password_incorrect"
+            )
         if body["new_password"] == body["current_password"]:
-            issue = {
-                "loc": ["body", "new_password"],
-                "msg": "Choose a password different from the current one.",
-                "type": "password_reused",
-            }
-            return _error(400, "VALIDATION_ERROR", "The request is not valid", [issue])
+            return _field_error(
+                "new_password",
+                "Choose a password different from the current one.",
+                "password_reused",
+            )
+        if normalize_name(body["new_password"]) == normalize_name(COMMON_PASSWORD):
+            return _field_error(
+                "new_password",
+                "This password is too common and easy to guess. Choose another.",
+                "password_common",
+            )
         account.password, account.must_change = body["new_password"], False
         self.access = {t: u for t, u in self.access.items() if u != username}
         self.refresh = {t: u for t, u in self.refresh.items() if u != username}
@@ -616,6 +619,12 @@ def _data(data: dict[str, object] | list[object]) -> httpx.Response:
 def _error(status: int, code: str, message: str, details: object = None) -> httpx.Response:
     body = {"error": {"code": code, "message": message, "details": details}}
     return httpx.Response(status, json=body, headers={"X-Request-ID": "req-1"})
+
+
+def _field_error(field: str, message: str, error_type: str) -> httpx.Response:
+    """As server/services/auth.py `_field_error`: the issue's message is the top-level one."""
+    issue = {"loc": ["body", field], "msg": message, "type": error_type}
+    return _error(400, "VALIDATION_ERROR", message, [issue])
 
 
 class MemoryCredentials:
