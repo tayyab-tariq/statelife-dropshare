@@ -43,16 +43,45 @@ def _is_this_computer(host: str) -> bool:
         return False
 
 
+# Files moving at once (FR-XFER-03, OQ-39): the default and the range Settings offers.
+DEFAULT_MAX_TRANSFERS = 4
+MAX_TRANSFERS_LIMIT = 8
+
+
+class NotificationSettings(BaseModel):
+    """Which notifications are shown (FR-CLIENT-02); each can be turned off in Settings.
+    "Update available" arrives with the updater (M13)."""
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+    new_share: bool = True
+    conflicts: bool = True
+    cant_sync: bool = True
+    quota: bool = True
+
+
 class ClientConfig(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True)
 
     server_url: str = DEFAULT_SERVER_URL
     sync_root: Path | None = None
+    notifications: NotificationSettings = NotificationSettings()
+    # Start at Windows sign-in (FR-CLIENT-04). None until decided: turned on at the first
+    # sign-in (default on), and from then on whatever the user chose.
+    autostart: bool | None = None
+    max_transfers: int = DEFAULT_MAX_TRANSFERS
 
     @field_validator("server_url")
     @classmethod
     def _valid_url(cls, value: str) -> str:
         return check_server_url(value)
+
+    @field_validator("max_transfers")
+    @classmethod
+    def _in_range(cls, value: int) -> int:
+        # Clamped, not refused: one bad value must not make the whole file unreadable, which
+        # would forget the sync folder.
+        return min(max(value, 1), MAX_TRANSFERS_LIMIT)
 
 
 class ConfigStore:

@@ -30,6 +30,7 @@ from dropshare_client.services.auth import AuthService, Device
 from dropshare_client.services.tokens import TokenStore
 
 if TYPE_CHECKING:
+    from dropshare_client.store.records import Problem
     from dropshare_client.sync.engine import SyncEngine
 
 RESULTS = Path(__file__).resolve().parents[2] / "docs" / "perf-results.md"
@@ -256,6 +257,13 @@ class QuietListener:
 
     def transfer(self, event: object) -> None:
         return None
+
+    def activity(self, item: object) -> None:
+        return None
+
+    def problems(self, items: "list[Problem]") -> None:
+        if items:
+            say(f"{len(items)} item(s) can't be synced")
 
 
 def make_engine(

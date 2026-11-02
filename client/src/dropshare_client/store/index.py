@@ -10,7 +10,8 @@ import json
 import logging
 import sqlite3
 import uuid
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from sqlite3 import Connection as SqliteConnection
@@ -30,8 +31,8 @@ from sqlalchemy import (
     or_,
     select,
 )
-from sqlalchemy.engine import URL
-from sqlalchemy.exc import OperationalError
+from sqlalchemy.engine import URL, Connection
+from sqlalchemy.exc import DBAPIError, OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 from sqlalchemy.pool import ConnectionPoolEntry
 from sqlalchemy.sql.elements import ColumnElement
@@ -222,21 +223,34 @@ def _remote_row(node: RemoteNode) -> _RemoteNode:
 _READ_BATCH = 500  # well under SQLite's bound-variable limit
 
 
-def read_entries(path: Path, node_ids: Iterable[uuid.UUID]) -> dict[uuid.UUID, Entry]:
-    """The synced entries for these nodes, read from another thread than the engine's
-    (the file browser's sync column). Opens the file read-only, so it never creates,
-    migrates or locks it for writing; WAL lets it read while the engine writes. Empty when
-    there is no index (yet), or it is mid-rebuild."""
+@contextmanager
+def _read_only(path: Path) -> Iterator[Connection | None]:
+    """A read-only connection from another thread than the engine's (the file browser, the
+    Activity and Can't sync views): it never creates, migrates or locks the file for writing,
+    and WAL lets it read while the engine writes. None when there is no index (yet)."""
     if not path.exists():
-        return {}
+        yield None
+        return
     # The path as a proper file: URI (percent-encoded: a "#" or "%" in a user name stays part
     # of the path), opened read-only by sqlite3 itself.
     uri = f"{path.resolve().as_uri()}?mode=ro"
     engine = create_engine("sqlite://", creator=lambda: sqlite3.connect(uri, uri=True))
+    try:
+        with engine.connect() as connection:
+            yield connection
+    finally:
+        engine.dispose()
+
+
+def read_entries(path: Path, node_ids: Iterable[uuid.UUID]) -> dict[uuid.UUID, Entry]:
+    """The synced entries for these nodes (the file browser's sync column). Empty when there
+    is no index (yet), or it is mid-rebuild."""
     wanted = list(node_ids)
     found: dict[uuid.UUID, Entry] = {}
     try:
-        with engine.connect() as connection:
+        with _read_only(path) as connection:
+            if connection is None:
+                return {}
             for start in range(0, len(wanted), _READ_BATCH):
                 rows = connection.execute(
                     select(_Entry).where(_Entry.node_id.in_(wanted[start : start + _READ_BATCH]))
@@ -247,9 +261,27 @@ def read_entries(path: Path, node_ids: Iterable[uuid.UUID]) -> dict[uuid.UUID, E
     except OperationalError:
         logger.info("The index can't be read right now; showing no sync states")
         return {}
-    finally:
-        engine.dispose()
     return found
+
+
+def read_activity(path: Path, limit: int) -> list[Activity]:
+    """The latest sync events, newest first (FR-CLIENT-03). OperationalError if the index
+    can't be read right now (the caller offers a retry); empty when there is none yet."""
+    with _read_only(path) as connection:
+        if connection is None:
+            return []
+        rows = connection.execute(select(_Activity).order_by(_Activity.id.desc()).limit(limit))
+        return [Activity(row.at, row.kind, row.path, row.detail) for row in rows]
+
+
+def read_problems(path: Path) -> list[Problem]:
+    """Items that can't be synced, by path (FR-SYNC-07). OperationalError if the index can't
+    be read right now; empty when there is none yet."""
+    with _read_only(path) as connection:
+        if connection is None:
+            return []
+        rows = connection.execute(select(_Problem).order_by(_Problem.key))
+        return [Problem(row.key, row.path, row.reason) for row in rows]
 
 
 class Index:
@@ -313,6 +345,18 @@ class Index:
                 user_id=binding.user_id,
                 sync_root=binding.sync_root,
             ).model_dump_json()
+            session.merge(_Meta(key="binding", value=value))
+
+    def rebind(self, sync_root: str) -> None:
+        """The same files, now in another folder (the sync folder was moved): entries are
+        relative to it, so only the binding changes."""
+        current = self.binding()
+        if current is None or current.sync_root == sync_root:
+            return
+        value = _BindingData(
+            server_url=current.server_url, user_id=current.user_id, sync_root=sync_root
+        ).model_dump_json()
+        with self._sessions.begin() as session:
             session.merge(_Meta(key="binding", value=value))
 
     # --- entries (the base) --------------------------------------------------------------
@@ -513,15 +557,17 @@ class Index:
 
     # --- activity and problems -----------------------------------------------------------
 
-    def add_activity(self, kind: str, path: str, detail: str = "") -> None:
+    def add_activity(self, kind: str, path: str, detail: str = "") -> Activity:
+        item = Activity(datetime.now(UTC), kind, path, detail)
         with self._sessions.begin() as session:
-            session.add(_Activity(at=datetime.now(UTC), kind=kind, path=path, detail=detail))
+            session.add(_Activity(at=item.at, kind=kind, path=path, detail=detail))
             session.flush()
             oldest_kept = session.scalar(
                 select(_Activity.id).order_by(_Activity.id.desc()).offset(_ACTIVITY_KEPT - 1)
             )
             if oldest_kept is not None:
                 session.execute(delete(_Activity).where(_Activity.id < oldest_kept))
+        return item
 
     def recent_activity(self, limit: int = 100) -> list[Activity]:
         with self._sessions() as session:
@@ -536,6 +582,15 @@ class Index:
         """Forget the problems at and below `key`: they are looked at again."""
         with self._sessions.begin() as session:
             session.execute(delete(_Problem).where(_under(_Problem.key, key)))
+
+    def problems_if_readable(self) -> list[Problem] | None:
+        """`problems()` for reporting: None, logged, when the index can't be read right now
+        (locked past the busy timeout, an I/O error), so a report never fails a cycle."""
+        try:
+            return self.problems()
+        except DBAPIError:
+            logger.warning("Couldn't read the items that can't be synced", exc_info=True)
+            return None
 
     def problems(self) -> list[Problem]:
         with self._sessions() as session:

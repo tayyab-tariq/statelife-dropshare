@@ -17,12 +17,18 @@ from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from dropshare_client import platform
 from dropshare_client.controllers.browser_controller import BrowserController
+from dropshare_client.controllers.devices_controller import DevicesController
+from dropshare_client.controllers.diagnostics_controller import DiagnosticsController
 from dropshare_client.controllers.file_actions_controller import FileActionsController
+from dropshare_client.controllers.folder_move_controller import FolderMoveController
+from dropshare_client.controllers.notification_controller import NotificationController
 from dropshare_client.controllers.session_controller import SessionController
+from dropshare_client.controllers.settings_controller import SettingsController
 from dropshare_client.controllers.share_controller import ShareController
 from dropshare_client.controllers.shared_controller import SharedController
 from dropshare_client.controllers.sync_controller import SyncController
 from dropshare_client.controllers.sync_folder_controller import SyncFolderController
+from dropshare_client.controllers.sync_log_controller import ActivityController, CantSyncController
 from dropshare_client.controllers.transfers_controller import TransfersController
 from dropshare_client.controllers.trash_controller import TrashController
 from dropshare_client.controllers.upload_controller import UploadController
@@ -30,6 +36,8 @@ from dropshare_client.platform.base import Paths
 from dropshare_client.services.api_client import ApiClient
 from dropshare_client.services.auth import AuthService, this_device
 from dropshare_client.services.config import ConfigStore
+from dropshare_client.services.devices import Devices
+from dropshare_client.services.diagnostics import LOG_NAME, RedactingFormatter
 from dropshare_client.services.files import RemoteFiles
 from dropshare_client.services.importer import Importer
 from dropshare_client.services.local_files import LocalFiles
@@ -39,6 +47,7 @@ from dropshare_client.services.trash import Trash
 from dropshare_client.single_instance import SingleInstance, instance_name
 from dropshare_client.sync import binding
 from dropshare_client.sync.engine import SyncEngine, SyncListener
+from dropshare_client.sync.folder_move import FolderMover
 from dropshare_client.ui.app_shell import AppShell
 from dropshare_client.ui.theme import Theme
 
@@ -49,25 +58,6 @@ _LOG_FILE_COUNT = 5
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 _QUIT_WAIT_MS = 15_000
 _PROFILE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
-# Bearer values, JWTs and JSON token fields: never written to a log (architecture.md §5).
-_SECRETS = re.compile(
-    r"(Bearer\s+)\S+"
-    r"|eyJ[\w-]+\.[\w-]+\.[\w-]+"
-    r"|(\"(?:access_token|refresh_token|password|current_password|new_password)\"\s*:\s*\")[^\"]*",
-    re.IGNORECASE,
-)
-
-
-def redact(text: str) -> str:
-    return _SECRETS.sub(lambda m: (m.group(1) or m.group(2) or "") + "[redacted]", text)
-
-
-class RedactingFormatter(logging.Formatter):
-    """Redacts the whole formatted record, tracebacks included: an exception's text can
-    carry a secret even when the log message doesn't."""
-
-    def format(self, record: logging.LogRecord) -> str:
-        return redact(super().format(record))
 
 
 def configure_logging(paths: Paths) -> None:
@@ -81,7 +71,7 @@ def configure_logging(paths: Paths) -> None:
         log_dir = paths.app_data_dir() / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         handler: logging.Handler = RotatingFileHandler(
-            log_dir / "dropshare.log",
+            log_dir / LOG_NAME,
             maxBytes=_LOG_FILE_BYTES,
             backupCount=_LOG_FILE_COUNT,
             encoding="utf-8",
@@ -192,11 +182,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             listener,
             display_name=name,
             max_path=platform.max_path_length(),
+            max_transfers=config.config.max_transfers,
         )
 
+    def switch_folder(root: Path) -> None:
+        binding.rebind(index_path, root)
+        config.update(sync_root=root)
+
+    mover = FolderMover(
+        app_data / "folder-move.json",
+        system.recycle_bin,
+        switch_folder,
+        hide=system.file_attributes.hide,
+    )
     sync = SyncController(config, make_engine, lambda: binding.forget(index_path))
     transfers = TransfersController(sync)
     trash = TrashController(Trash(api))
+
+    def local_files(root: Path) -> LocalFiles:
+        return LocalFiles(root, system.recycle_bin, platform.reveal)
+
     shell = AppShell(
         session,
         folders,
@@ -205,7 +210,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         BrowserController(files, index_path, transfers),
         FileActionsController(
             config,
-            lambda root: LocalFiles(root, system.recycle_bin, platform.reveal),
+            local_files,
             sync,
             index_path,
         ),
@@ -215,6 +220,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         share=ShareController(sharing),
         shared=SharedController(sharing),
         trash=trash,
+        notifications=NotificationController(config, auth.current_user),
+        activity=ActivityController(config, sync, index_path, local_files),
+        cant_sync=CantSyncController(config, sync, index_path, local_files),
+        settings=SettingsController(config, system.autostart, sync, client_version),
+        devices=DevicesController(Devices(api)),
+        folder_move=FolderMoveController(mover, sync, config, system.volumes, app_data),
+        diagnostics=DiagnosticsController(config, app_data / "logs", client_version),
         background=args.background,
         tray_available=QSystemTrayIcon.isSystemTrayAvailable(),
     )

@@ -21,7 +21,8 @@ from dropshare_shared.naming import (
 
 # FR-SYNC-07, compared case-insensitively.
 _IGNORED_NAMES = frozenset({"desktop.ini", "thumbs.db", ".ds_store", TEMP_DIR})
-_IGNORED_PATTERNS = ("~$*", "*.tmp", ".~lock.*")
+# The last one: DropShare's own copies while the sync folder moves (sync/folder_move.py).
+_IGNORED_PATTERNS = ("~$*", "*.tmp", ".~lock.*", "*.dropshare-move")
 _CONFLICT_MARK = "conflicted copy"
 _DASH = "\N{EN DASH}"  # en dash, as in FR-CONF-01
 # Kept short enough that the conflicted-copy label and extension always fit in 255.

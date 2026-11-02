@@ -9,11 +9,12 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 
 from dropshare_client.controllers import messages
 from dropshare_client.controllers.worker import Worker
 from dropshare_client.services.config import ConfigStore
+from dropshare_client.store.records import Activity, Problem
 from dropshare_client.sync.binding import ForeignFolderError
 from dropshare_client.sync.engine import SyncListener, SyncProblem, SyncState
 from dropshare_client.sync.transfers import TransferEvent
@@ -22,6 +23,8 @@ from dropshare_shared.schemas.users import UserOut
 logger = logging.getLogger(__name__)
 
 _QUIT_SECONDS = 10.0
+_LINGER_CHECK_MS = 2_000
+_LINGER_STOP_SECONDS = 5.0
 _QUIT_WAIT_MS = 15_000
 _PROBLEMS = {
     SyncProblem.ROOT_MISSING: messages.SYNC_FOLDER_MISSING,
@@ -70,6 +73,8 @@ class Engine(Protocol):
 
     def retry_now(self, key: str) -> None: ...
 
+    def set_max_transfers(self, count: int) -> None: ...
+
     def local_changed(self, path: str) -> None: ...
 
 
@@ -95,6 +100,8 @@ class _Relay(QObject):
     expiry_reported = Signal()
     progress_reported = Signal(int)
     transfer_reported = Signal(object)  # TransferEvent
+    activity_reported = Signal(object)  # Activity
+    problems_reported = Signal(object)  # list[Problem]
 
     def state_changed(self, state: SyncState, problem: SyncProblem | None) -> None:
         self.state_reported.emit(state.value, problem.value if problem else "")
@@ -114,15 +121,25 @@ class _Relay(QObject):
     def transfer(self, event: TransferEvent) -> None:
         self.transfer_reported.emit(event)
 
+    def activity(self, item: Activity) -> None:
+        self.activity_reported.emit(item)
+
+    def problems(self, items: list[Problem]) -> None:
+        self.problems_reported.emit(items)
+
 
 class SyncController(QObject):
     status_changed = Signal(str, str)  # SyncStatus value, message ("" when all is well)
-    conflict = Signal(str)  # a notification for the tray (OQ-15 until the Activity view)
+    conflict = Signal(str)  # a notification (FR-CONF-01, FR-CLIENT-02)
     deletes_need_confirmation = Signal(str)  # what would be deleted (FR-SYNC-08)
     session_expired = Signal(str)
     folder_rejected = Signal(str)  # the folder holds another account's files
     start_failed = Signal(str)  # syncing couldn't start; offer to try again
     transfer_reported = Signal(object)  # TransferEvent, for the Transfers view (FR-CLIENT-08)
+    activity_added = Signal(object)  # Activity, for the Activity view (FR-CLIENT-03)
+    # list[Problem]: what can't be synced, when syncing starts and whenever it changes
+    # (FR-SYNC-07)
+    problems_changed = Signal(object)
 
     def __init__(
         self,
@@ -143,7 +160,12 @@ class SyncController(QObject):
         self._paused = False
         self._last_status = (SyncStatus.STOPPED, "")
         self._stop_requested: list[Callable[[], None]] = []  # waiting for a start to finish
-        self._start_requested: UserOut | None = None  # waiting for a stop to finish
+        self._start_requested: UserOut | None = None  # waiting for a stop or a hold to end
+        self._held = False  # the sync folder is being moved: nothing may start meanwhile
+        self._released = True  # whether the last engine stopped, letting go of the folder
+        # An engine that didn't stop in time: nothing starts until it has (it still uses the
+        # folder and index). Checked again every few seconds.
+        self._lingering: Engine | None = None
         # The engine the pool started, until the GUI thread hears of it (for shutdown).
         self._opened: Engine | None = None
         self._opened_lock = threading.Lock()
@@ -152,8 +174,27 @@ class SyncController(QObject):
     def running(self) -> bool:
         return self._phase is not _Phase.IDLE
 
+    @property
+    def released(self) -> bool:
+        """Whether the last stop finished: no engine is still using the folder or index."""
+        return self._released
+
+    def hold(self) -> None:
+        """Nothing starts syncing until `release` (the folder is being moved); a start asked
+        for meanwhile waits for it."""
+        self._held = True
+
+    def release(self) -> None:
+        self._held = False
+        user, self._start_requested = self._start_requested, None
+        if user is not None and self._phase is _Phase.IDLE:
+            self.start(user)
+
     def start(self, user: UserOut) -> None:
         """Start syncing the configured folder for `user`, if it isn't running already."""
+        if self._held or self._lingering is not None:
+            self._start_requested = user
+            return
         root = self._config.config.sync_root
         if root is None or self._phase in (_Phase.STARTING, _Phase.RUNNING):
             return
@@ -191,6 +232,12 @@ class SyncController(QObject):
         )
         relay.transfer_reported.connect(
             lambda event: self._transfer_reported(generation, event), queued
+        )
+        relay.activity_reported.connect(
+            lambda item: self._activity_reported(generation, item), queued
+        )
+        relay.problems_reported.connect(
+            lambda items: self._problems_reported(generation, items), queued
         )
         self._relay = relay
         return relay
@@ -250,6 +297,12 @@ class SyncController(QObject):
             for path in paths:
                 self._engine.local_changed(path)
 
+    def set_max_transfers(self, count: int) -> None:
+        """Files moving at once (OQ-39): saved by the caller, applied to the running engine;
+        a new engine reads it from the settings."""
+        if self._engine is not None:
+            self._engine.set_max_transfers(count)
+
     def retry(self, key: str) -> None:
         """Try a transfer again now: the Transfers view's Retry (FR-CLIENT-08)."""
         if self._engine is not None:
@@ -283,7 +336,11 @@ class SyncController(QObject):
                 self._forget_index()
             return stopped
 
-        def done(_: object) -> None:
+        def done(stopped: object) -> None:
+            self._released = stopped is True
+            if not self._released and engine is not None:
+                self._lingering = engine
+                QTimer.singleShot(_LINGER_CHECK_MS, self._check_lingering)
             self._phase = _Phase.IDLE
             self._emit_status(SyncStatus.STOPPED, "")
             if then is not None:
@@ -297,17 +354,36 @@ class SyncController(QObject):
 
         def failed(exc: Exception) -> None:
             logger.error("Stopping sync failed", exc_info=exc)
-            done(None)
+            done(False)
 
         self._worker.submit(stop_engine, done, failed)
+
+    def _check_lingering(self) -> None:
+        engine = self._lingering
+        if engine is None:
+            return
+
+        def stopped(done: bool) -> None:
+            if not done:
+                QTimer.singleShot(_LINGER_CHECK_MS, self._check_lingering)
+                return
+            logger.info("The sync engine that was slow to stop has stopped")
+            self._lingering = None
+            self._released = True
+            if not self._held:
+                self.release()  # a start asked for meanwhile goes ahead
+
+        self._worker.submit(
+            lambda: engine.stop(_LINGER_STOP_SECONDS), stopped, lambda exc: stopped(False)
+        )
 
     def shutdown(self) -> None:
         """At quit, after the event loop has ended: let started work finish, then stop
         whatever engine is running, here and now."""
         self._worker.wait(_QUIT_WAIT_MS)
         with self._opened_lock:
-            engine = self._engine or self._opened
-            self._opened = None
+            engine = self._engine or self._opened or self._lingering
+            self._opened = self._lingering = None
         self._engine = None
         self._phase = _Phase.IDLE
         if engine is not None and not engine.stop(_QUIT_SECONDS):
@@ -337,6 +413,14 @@ class SyncController(QObject):
     def _transfer_reported(self, generation: int, event: TransferEvent) -> None:
         if self._current(generation):
             self.transfer_reported.emit(event)
+
+    def _activity_reported(self, generation: int, item: Activity) -> None:
+        if self._current(generation):
+            self.activity_added.emit(item)
+
+    def _problems_reported(self, generation: int, items: list[Problem]) -> None:
+        if self._current(generation):
+            self.problems_changed.emit(items)
 
     def _emit_status(self, status: SyncStatus, message: str) -> None:
         self._last_status = (status, message)

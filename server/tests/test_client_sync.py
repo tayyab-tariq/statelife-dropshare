@@ -20,6 +20,7 @@ from dropshare_client.services.errors import OfflineError
 from dropshare_client.services.files import RemoteFiles
 from dropshare_client.services.tokens import TokenStore
 from dropshare_client.store.index import Index
+from dropshare_client.store.records import Activity, Problem
 from dropshare_client.sync.core import CycleResult, SyncCore
 from dropshare_client.sync.engine import SyncEngine, SyncProblem, SyncState
 from dropshare_client.sync.transfers import TransferEvent
@@ -329,6 +330,12 @@ class _States:
         return None
 
     def transfer(self, event: TransferEvent) -> None:
+        return None
+
+    def activity(self, item: Activity) -> None:
+        return None
+
+    def problems(self, items: list[Problem]) -> None:
         return None
 
 

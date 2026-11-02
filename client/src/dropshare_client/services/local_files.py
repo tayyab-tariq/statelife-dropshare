@@ -108,6 +108,11 @@ class LocalFiles:
         """Open Explorer at the item, selected (FR-FILE-05)."""
         self._reveal(self._existing(path))
 
+    def locate(self, path: str) -> Path:
+        """The item on disk, to open it in its program (FR-CLIENT-03); FileActionError GONE
+        if it isn't there any more."""
+        return self._existing(path)
+
     def relative(self, folder: Path) -> str:
         """`folder` (chosen on disk) as a path in the sync folder; for "Move to…"."""
         root = self._root.resolve()

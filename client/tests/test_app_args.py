@@ -5,7 +5,8 @@ import sys
 
 import pytest
 
-from dropshare_client.app import RedactingFormatter, parse_args
+from dropshare_client.app import parse_args
+from dropshare_client.services.diagnostics import RedactingFormatter
 
 
 def test_profile_and_background_flags() -> None:

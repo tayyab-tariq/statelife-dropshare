@@ -39,6 +39,23 @@ class CredentialStore(Protocol):
         ...
 
 
+class Autostart(Protocol):
+    """Start the app (in the tray) when the user signs in to Windows (FR-CLIENT-04)."""
+
+    def available(self) -> bool:
+        """Whether this build can be started at sign-in: an installed (frozen) build on
+        Windows. Running from source, there is nothing stable to register."""
+        ...
+
+    def is_enabled(self) -> bool:
+        """Whether it is registered now; False when unavailable or it can't be read."""
+        ...
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Register or unregister; OSError if that fails. Does nothing when unavailable."""
+        ...
+
+
 class RecycleBin(Protocol):
     def move_to_recycle_bin(self, path: Path) -> None:
         """Move a file or folder where the user can restore it (FR-SYNC-09); raise OSError if

@@ -5,7 +5,6 @@ section's page."""
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
-    QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -19,53 +18,14 @@ from PySide6.QtWidgets import (
 )
 
 from dropshare_client.ui import theme
+from dropshare_client.ui.cards import Value, card
+from dropshare_client.ui.forms import set_available
 from dropshare_client.ui.stateful_view import StatefulView
 from dropshare_shared.schemas.users import UserOut
 
 OVERVIEW = "Overview"
 _PAUSE = "&Pause syncing"
 _RESUME = "&Resume syncing"
-
-
-class _Value(QLabel):
-    """A value next to a visible row label. Its accessible name says both ("Server:
-    https://…"), so a screen reader announces the value with what it is."""
-
-    def __init__(self, caption: str) -> None:
-        super().__init__()
-        self._caption = caption
-        self.setWordWrap(True)
-        self.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-
-    def set_value(self, value: str) -> None:
-        self.setText(value)
-        self.setAccessibleName(f"{self._caption}: {value}" if value else self._caption)
-
-
-def _caption(text: str) -> QLabel:
-    label = QLabel(text)
-    label.setProperty("textRole", "caption")
-    return label
-
-
-def _card(heading: str, rows: list[tuple[str, QWidget]]) -> tuple[QFrame, QVBoxLayout]:
-    """A titled card of caption/value rows; returns its layout for anything added below."""
-    space = theme.SPACE
-    card = QFrame()
-    card.setProperty("card", True)
-    title = QLabel(heading)
-    title.setProperty("textRole", "subtitle")
-    form = QFormLayout()
-    form.setHorizontalSpacing(space.xl)
-    form.setVerticalSpacing(space.md)
-    for caption, value in rows:
-        form.addRow(_caption(caption), value)
-    layout = QVBoxLayout(card)
-    layout.setContentsMargins(space.xl, space.lg, space.xl, space.xl)
-    layout.setSpacing(space.lg)
-    layout.addWidget(title)
-    layout.addLayout(form)
-    return card, layout
 
 
 class MainWindow(QMainWindow):
@@ -87,16 +47,16 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(theme.MAIN_WINDOW_MIN_SIZE)
         space = theme.SPACE
 
-        self._account = _Value("Signed in as")
-        self._server = _Value("Server")
-        self._folder = _Value("Sync folder")
-        self._status = _Value("Status")
+        self._account = Value("Signed in as")
+        self._server = Value("Server")
+        self._folder = Value("Sync folder")
+        self._status = Value("Status")
         self._open_folder = QPushButton("&Open sync folder")
         self._open_folder.setProperty("variant", "primary")
         self._pause = QPushButton(_PAUSE)
         self._paused = False
 
-        sync_card, sync_layout = _card(
+        sync_card, sync_layout = card(
             "Sync", [("Status", self._status), ("Sync folder", self._folder)]
         )
         folder_actions = QHBoxLayout()
@@ -105,7 +65,7 @@ class MainWindow(QMainWindow):
         folder_actions.addWidget(self._pause)
         folder_actions.addStretch()
         sync_layout.addLayout(folder_actions)
-        account_card, _ = _card(
+        account_card, _ = card(
             "Account", [("Signed in as", self._account), ("Server", self._server)]
         )
 
@@ -236,10 +196,11 @@ class MainWindow(QMainWindow):
         self._paused = paused
         self._pause.setText(_RESUME if paused else _PAUSE)
 
-    def set_actions_enabled(self, enabled: bool) -> None:
-        """Off while a sign-in, password change or sign-out is in progress."""
-        for button in (self._change_password, self._sign_out):
-            button.setEnabled(enabled)
+    def set_actions_enabled(self, enabled: bool, sign_out_blocked: str = "") -> None:
+        """Off while a sign-in, password change or sign-out is in progress. Sign out is also
+        off, saying why (`sign_out_blocked`), while the sync folder is being moved."""
+        self._change_password.setEnabled(enabled)
+        set_available(self._sign_out, enabled and not sign_out_blocked, sign_out_blocked)
 
     def bring_to_front(self) -> None:
         self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)

@@ -26,7 +26,7 @@ def is_link(path: Path) -> bool:
 # Standard per-user folders that hold the user's own files.
 _SHELL_FOLDERS = ("Desktop", "Documents", "Downloads", "Music", "Pictures", "Videos")
 # Left by the OS in otherwise empty folders; they don't make a folder "in use".
-_OS_LITTER = frozenset({".ds_store", "desktop.ini", "thumbs.db"})
+OS_LITTER = frozenset({".ds_store", "desktop.ini", "thumbs.db"})
 
 
 def _normal(path: Path) -> Path:
@@ -42,6 +42,15 @@ def _key(path: Path) -> str:
 def _is_inside(path: Path, folder: Path) -> bool:
     child, parent = _key(path), _key(folder)
     return child == parent or child.startswith(parent.rstrip(os.sep) + os.sep)
+
+
+def same_folder(a: Path, b: Path) -> bool:
+    return _key(a) == _key(b)
+
+
+def nested(a: Path, b: Path) -> bool:
+    """Whether either folder is inside the other (or they are the same)."""
+    return _is_inside(a, b) or _is_inside(b, a)
 
 
 def unsafe_to_remove(path: Path, app_data: Path) -> str | None:
@@ -71,7 +80,7 @@ def problem_with(path: Path, volumes: Volumes, app_data: Path) -> str | None:
         return unsafe
     if path.exists() and not path.is_dir():
         return "There's a file with that name. Choose a folder."
-    if path.is_dir() and any(entry.name.lower() not in _OS_LITTER for entry in path.iterdir()):
+    if path.is_dir() and any(entry.name.lower() not in OS_LITTER for entry in path.iterdir()):
         return "Choose an empty folder or a new one: DropShare needs a folder of its own."
     volume = volumes.describe(path)
     if volume.kind is VolumeKind.NETWORK:
@@ -106,5 +115,5 @@ def holds_files(path: Path) -> bool:
     """Whether the folder has anything in it besides OS litter and DropShare's own temp folder."""
     if not path.is_dir():
         return False
-    ignored = _OS_LITTER | {TEMP_DIR}
+    ignored = OS_LITTER | {TEMP_DIR}
     return any(entry.name.lower() not in ignored for entry in path.iterdir())

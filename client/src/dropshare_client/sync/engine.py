@@ -22,6 +22,7 @@ from dropshare_client.services.errors import (
     UpgradeRequiredError,
 )
 from dropshare_client.store.index import Index
+from dropshare_client.store.records import Activity, Problem
 from dropshare_client.sync import paths
 from dropshare_client.sync.core import MAX_TRANSFERS, NoPersonalFolderError, SyncCore
 from dropshare_client.sync.errors import SyncRootMissingError, SyncStoppedError
@@ -82,6 +83,15 @@ class SyncListener(Protocol):
         """An upload or download was queued, moved bytes (at most ~4 times a second), or
         ended (FR-CLIENT-08). Called on the engine's thread, and on transfer threads for
         bytes moved (FR-XFER-03): implementations must be thread-safe."""
+        ...
+
+    def activity(self, item: Activity) -> None:
+        """A sync event was recorded for the Activity view (FR-CLIENT-03)."""
+        ...
+
+    def problems(self, items: list[Problem]) -> None:
+        """What can't be synced now (FR-SYNC-07): once when the engine starts, then whenever
+        a cycle changed it."""
         ...
 
 
@@ -147,6 +157,8 @@ class SyncEngine:
         self._confirming = False
         self._state: tuple[SyncState, SyncProblem | None] | None = None
         self._cursors: dict[uuid.UUID, int] = {}
+        # As last reported; None until the first report (what earlier runs left). Engine thread.
+        self._problems: list[Problem] | None = None
         self._thread = threading.Thread(target=self._run, name="sync-engine", daemon=True)
         self._poller = threading.Thread(target=self._poll, name="sync-long-poll", daemon=True)
 
@@ -221,6 +233,10 @@ class SyncEngine:
         if not approved:
             self.pause()
 
+    def set_max_transfers(self, count: int) -> None:
+        """The Settings' "files transferred at once" (OQ-39), for transfers started from now on."""
+        self._core.set_max_transfers(count)
+
     def retry_now(self, key: str) -> None:
         """Look at `key` again in the next cycle, without waiting for its backoff: the
         Transfers view's Retry (FR-CLIENT-08). An item listed as can't sync is planned
@@ -243,12 +259,20 @@ class SyncEngine:
     # --- ActivityLog for the executor ----------------------------------------------------
 
     def activity(self, kind: str, path: str, detail: str = "") -> None:
-        self._index.add_activity(kind, path, detail)
+        self._listener.activity(self._index.add_activity(kind, path, detail))
 
     def conflict(self, path: str, copy_path: str) -> None:
         self._listener.conflict(path, copy_path)
 
     # --- the engine thread ---------------------------------------------------------------
+
+    def _report_problems(self) -> None:
+        """Tell the listener what can't be synced, when that changed. Never raises: a failed
+        read is tried again after the next cycle."""
+        problems = self._index.problems_if_readable()
+        if problems is not None and problems != self._problems:
+            self._problems = problems
+            self._listener.problems(problems)
 
     def _run(self) -> None:
         delay = 1.0
@@ -337,6 +361,8 @@ class SyncEngine:
 
     def _sync(self, dirty: set[str], full: bool) -> bool:
         """One cycle. True if it asked for another one right away."""
+        if self._problems is None:
+            self._report_problems()  # what earlier runs left, before this one changes it
         if not self._core.connected:
             self._core.connect()
             self._remove_stale_partials()
@@ -347,7 +373,10 @@ class SyncEngine:
             dirty = {""}
         if dirty:
             self._set_state(SyncState.SCANNING if "" in dirty else SyncState.SYNCING)
-            result = self._core.cycle(dirty)
+            try:
+                result = self._core.cycle(dirty)
+            finally:  # also after a pause or going offline mid-cycle
+                self._report_problems()
         else:
             result = None
         now = time.monotonic()

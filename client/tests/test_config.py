@@ -4,7 +4,16 @@ from pathlib import Path
 
 import pytest
 
-from dropshare_client.services.config import ClientConfig, ConfigStore, check_server_url
+from dropshare_client.services.config import (
+    DEFAULT_MAX_TRANSFERS,
+    MAX_TRANSFERS_LIMIT,
+    ClientConfig,
+    ConfigStore,
+    NotificationSettings,
+    check_server_url,
+)
+from dropshare_client.sync.core import MAX_TRANSFERS
+from dropshare_client.sync.core import MAX_TRANSFERS_LIMIT as ENGINE_LIMIT
 
 
 @pytest.mark.parametrize(
@@ -63,3 +72,43 @@ def test_invalid_change_is_refused_and_nothing_is_saved(tmp_path: Path) -> None:
 
     assert store.config == ClientConfig()
     assert not (tmp_path / "config.json").exists()
+
+
+def test_settings_from_an_older_version_get_the_new_defaults(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text('{"server_url": "https://dropshare.example.com", "sync_root": "/x"}')
+
+    config = ConfigStore(path).config
+
+    assert config.sync_root == Path("/x")
+    assert config.notifications == NotificationSettings()  # all on (FR-CLIENT-02)
+    assert config.autostart is None  # not decided yet: turned on at the first sign-in
+    assert config.max_transfers == DEFAULT_MAX_TRANSFERS
+
+
+@pytest.mark.parametrize(("saved", "loaded"), [(0, 1), (3, 3), (99, MAX_TRANSFERS_LIMIT)])
+def test_transfers_at_once_out_of_range_is_clamped_not_lost(
+    tmp_path: Path, saved: int, loaded: int
+) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(f'{{"sync_root": "/x", "max_transfers": {saved}}}')
+
+    config = ConfigStore(path).config
+
+    assert (config.max_transfers, config.sync_root) == (loaded, Path("/x"))
+
+
+def test_notification_and_startup_choices_survive_a_restart(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    ConfigStore(path).update(
+        notifications=NotificationSettings(conflicts=False), autostart=False, max_transfers=2
+    )
+
+    loaded = ConfigStore(path).config
+
+    assert loaded.notifications == NotificationSettings(conflicts=False)
+    assert (loaded.autostart, loaded.max_transfers) == (False, 2)
+
+
+def test_the_settings_range_matches_what_the_engine_allows() -> None:
+    assert (DEFAULT_MAX_TRANSFERS, MAX_TRANSFERS_LIMIT) == (MAX_TRANSFERS, ENGINE_LIMIT)
