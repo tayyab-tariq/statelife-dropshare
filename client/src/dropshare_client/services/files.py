@@ -410,71 +410,87 @@ class RemoteFiles:
         progress: Progress = no_progress,
     ) -> None:
         """Fetch the content into `part`, resuming from what is already there, and verify it
-        (FR-SYNC-06, FR-XFER-02). A mismatch starts once more from scratch, then gives up."""
-        if stop.is_set():  # paused before its turn came: nothing is fetched
-            raise TransferCancelledError()
-        for attempt in (1, 2):
-            digest = self._fetch(node_id, sha256, size, part, stop, progress)
-            if digest == sha256 and part.stat().st_size == size:
-                return
-            logger.warning("Download of %s didn't verify (attempt %d)", node_id, attempt)
-            part.unlink(missing_ok=True)
-        raise ContentMismatchError(str(node_id))
+        (FR-SYNC-06, FR-XFER-02)."""
+        download_verified(
+            self._api, f"/api/v1/nodes/{node_id}/content", sha256, size, part, stop, progress
+        )
 
-    def _fetch(
-        self,
-        node_id: uuid.UUID,
-        sha256: str,
-        size: int,
-        part: Path,
-        stop: threading.Event,
-        progress: Progress,
-    ) -> str:
-        """The SHA-256 of `part` once the rest of the file is appended."""
-        offset = part.stat().st_size if part.exists() else 0
-        if offset > size:
-            part.unlink()
-            offset = 0
-        digest = hashlib.sha256()
-        if offset:
-            with part.open("rb") as existing:
-                while chunk := existing.read(_READ_SIZE):
-                    digest.update(chunk)
-        if offset >= size:
-            part.touch()
-            return digest.hexdigest()
-        headers = {"Range": f"bytes={offset}-"} if offset else None
-        try:
-            with self._api.stream("GET", f"/api/v1/nodes/{node_id}/content", headers=headers) as (
-                response
-            ):
-                etag = response.headers.get("ETag", "").strip('"')
-                if etag and etag != sha256:
-                    raise RemoteContentChangedError(str(node_id))
-                if offset and response.status_code != 206:  # whole file sent: start over
-                    offset = 0
-                    digest = hashlib.sha256()
-                with part.open("ab" if offset else "wb") as out:
-                    written = offset
-                    progress(written)
-                    for chunk in response.iter_bytes(_READ_SIZE):
-                        if stop.is_set():
-                            raise TransferCancelledError()
-                        written += len(chunk)
-                        if written > size:  # more than the file holds: it can't verify
-                            return ""
-                        out.write(chunk)
-                        digest.update(chunk)
-                        progress(written)
-                    out.flush()
-                    os.fsync(out.fileno())
-        except httpx.TransportError as exc:
-            raise OfflineError("The download was interrupted") from exc
-        except ApiError as exc:
-            if exc.code != ErrorCode.RANGE_NOT_SATISFIABLE:
-                raise
-            part.unlink(missing_ok=True)  # the file got shorter: the next attempt starts over
+
+def download_verified(
+    api: ApiClient,
+    url: str,
+    sha256: str,
+    size: int,
+    part: Path,
+    stop: threading.Event,
+    progress: Progress = no_progress,
+) -> None:
+    """Fetch `url` into `part`, resuming from what is already there, and verify its size and
+    SHA-256 (FR-XFER-02). A mismatch starts once more from scratch, then gives up. File
+    downloads and client updates (FR-UPD-03) both use it."""
+    if stop.is_set():  # paused before its turn came: nothing is fetched
+        raise TransferCancelledError()
+    for attempt in (1, 2):
+        digest = _fetch(api, url, sha256, size, part, stop, progress)
+        if digest == sha256 and part.stat().st_size == size:
+            return
+        logger.warning("Download of %s didn't verify (attempt %d)", url, attempt)
+        part.unlink(missing_ok=True)
+    raise ContentMismatchError(url)
+
+
+def _fetch(
+    api: ApiClient,
+    url: str,
+    sha256: str,
+    size: int,
+    part: Path,
+    stop: threading.Event,
+    progress: Progress,
+) -> str:
+    """The SHA-256 of `part` once the rest of the file is appended."""
+    offset = part.stat().st_size if part.exists() else 0
+    if offset > size:
+        part.unlink()
+        offset = 0
+    digest = hashlib.sha256()
+    if offset:
+        with part.open("rb") as existing:
+            while chunk := existing.read(_READ_SIZE):
+                digest.update(chunk)
+    if offset >= size:
+        part.touch()
         return digest.hexdigest()
+    headers = {"Range": f"bytes={offset}-"} if offset else None
+    try:
+        with api.stream("GET", url, headers=headers) as response:
+            etag = response.headers.get("ETag", "").strip('"')
+            if etag and etag != sha256:
+                raise RemoteContentChangedError(url)
+            if offset and response.status_code != 206:  # whole file sent: start over
+                offset = 0
+                digest = hashlib.sha256()
+            with part.open("ab" if offset else "wb") as out:
+                written = offset
+                progress(written)
+                for chunk in response.iter_bytes(_READ_SIZE):
+                    if stop.is_set():
+                        raise TransferCancelledError()
+                    written += len(chunk)
+                    if written > size:  # more than the file holds: it can't verify
+                        return ""
+                    out.write(chunk)
+                    digest.update(chunk)
+                    progress(written)
+                out.flush()
+                os.fsync(out.fileno())
+    except httpx.TransportError as exc:
+        raise OfflineError("The download was interrupted") from exc
+    except ApiError as exc:
+        if exc.code != ErrorCode.RANGE_NOT_SATISFIABLE:
+            raise
+        part.unlink(missing_ok=True)  # the file got shorter: the next attempt starts over
+    return digest.hexdigest()
 
 
 def file_sha256(path: Path, stop: threading.Event) -> str:

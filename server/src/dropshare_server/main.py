@@ -16,6 +16,7 @@ from dropshare_server.core.error_handlers import error_response, register_error_
 from dropshare_server.core.logging import configure_logging, request_id_var
 from dropshare_server.dependencies.context import is_https
 from dropshare_server.dependencies.resources import AppResources
+from dropshare_server.services.releases import MinimumVersion
 from dropshare_server.storage.factory import create_storage_backend
 from dropshare_shared.errors import ErrorCode
 
@@ -34,11 +35,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         resolved = settings or Settings()
         configure_logging(resolved.log_level)
         engine = create_db_engine(resolved)
+        session_factory = create_session_factory(engine)
         app.state.resources = AppResources(
             settings=resolved,
             engine=engine,
-            session_factory=create_session_factory(engine),
+            session_factory=session_factory,
             storage=create_storage_backend(resolved),
+            minimum_version=MinimumVersion(resolved.min_client_version, session_factory),
         )
         try:
             yield

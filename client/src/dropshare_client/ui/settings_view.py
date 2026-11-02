@@ -1,6 +1,6 @@
 """Settings (FR-CLIENT-04): account, sync folder (with its move), signed-in computers
-(devices_card.py), preferences (preference_cards.py), and about with export diagnostics; one
-line for problems above the sections and one for confirmations below them."""
+(devices_card.py), preferences (preference_cards.py), and about with updates (OQ-41) and export
+diagnostics; one line for problems above the sections and one for confirmations below them."""
 
 from collections.abc import Callable
 from pathlib import Path
@@ -23,6 +23,7 @@ from dropshare_client.controllers.diagnostics_controller import DiagnosticsContr
 from dropshare_client.controllers.settings_controller import (
     SettingsController,
 )
+from dropshare_client.controllers.update_controller import UpdateController, UpdateState
 from dropshare_client.ui import theme
 from dropshare_client.ui.cards import Value, button_row, card
 from dropshare_client.ui.devices_card import DevicesCard
@@ -42,16 +43,21 @@ class SettingsView(QScrollArea):
     change_password_requested = Signal()
     sign_out_requested = Signal()
     move_folder_requested = Signal()
+    install_update_requested = Signal()  # show the update dialog
 
     def __init__(
         self,
         settings: SettingsController,
         devices: DevicesController,
         diagnostics: DiagnosticsController,
+        updates: UpdateController,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._settings = settings
+        self._updates = updates
+        self._update_error = ""
+        self._user_check = False
         self._devices = devices
         space = theme.SPACE
         self._diagnostics = diagnostics
@@ -96,6 +102,7 @@ class SettingsView(QScrollArea):
         self.setWidget(content)
         self._connect_controllers()
         self._show_about()
+        self._show_updates()
 
     # --- sections ------------------------------------------------------------------------
 
@@ -121,15 +128,29 @@ class SettingsView(QScrollArea):
     def _about_card(self) -> QFrame:
         self._version = Value("Version")
         self._server = Value("Server")
-        about, layout = card("About", [("Version", self._version), ("Server", self._server)])
+        self._update_status = Value(messages.UPDATES)
+        about, layout = card(
+            "About",
+            [
+                ("Version", self._version),
+                ("Server", self._server),
+                (messages.UPDATES, self._update_status),
+            ],
+        )
+        self._check_updates = QPushButton("Check for &updates")
+        self._install_update = QPushButton("&Install update…")
         self._export_button = QPushButton("&Export diagnostics…")
         self._export_button.setToolTip("Save DropShare's logs and settings in a zip, for support")
+        layout.addLayout(button_row(self._check_updates, self._install_update))
         layout.addLayout(button_row(self._export_button))
+        self._check_updates.clicked.connect(self._check_for_updates)
+        self._install_update.clicked.connect(self.install_update_requested)
         self._export_button.clicked.connect(self._export)
         return about
 
     def _connect_controllers(self) -> None:
         self._settings.changed.connect(self._show_about)
+        self._updates.changed.connect(self._show_updates)
         self._settings.failed.connect(self._show_error)
         self._devices.action_failed.connect(self._show_error)
         self._devices.revoked.connect(self._announce)
@@ -184,6 +205,33 @@ class SettingsView(QScrollArea):
     def _show_about(self) -> None:
         self._version.set_value(self._settings.version)
         self._server.set_value(self._settings.server_url)
+
+    def _check_for_updates(self) -> None:
+        self._user_check = True  # its result is announced; background checks stay quiet
+        self._show_error("")
+        self._updates.check()
+
+    def _show_updates(self) -> None:
+        """The four states (NFR-UX-01): checking or downloading, a failure saying what to do
+        (Check for updates tries again), up to date, and an update ready to install. Check for
+        updates stays enabled while busy (pressing it again does nothing), so focus stays put."""
+        updates = self._updates
+        status = updates.status
+        self._update_status.set_value(status)
+        ready = updates.state is UpdateState.READY
+        had_focus = self._check_updates.hasFocus()
+        self._install_update.setVisible(ready)
+        set_available(
+            self._check_updates, not ready, messages.UPDATE_ALREADY_READY if ready else ""
+        )
+        if ready and had_focus:
+            self._install_update.setFocus()
+        if self._user_check and not updates.busy:
+            self._user_check = False
+            self._announce(status)
+        if ready and updates.error and updates.error != self._update_error:
+            self._show_error(updates.error)  # installing it failed; it's still ready
+        self._update_error = updates.error
 
     def _exporting(self, busy: bool) -> None:
         self._export_button.setEnabled(not busy)

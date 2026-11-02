@@ -34,6 +34,7 @@ class Notice(StrEnum):
     CONFLICTS = "conflicts"
     CANT_SYNC = "cant_sync"
     QUOTA = "quota"
+    UPDATE_AVAILABLE = "update_available"
 
 
 def _enabled(settings: NotificationSettings, notice: Notice) -> bool:
@@ -122,6 +123,11 @@ class NotificationController(QObject):
                 gap_ms,
             ),
             Notice.QUOTA: _Gatherer(lambda _: self._quota_notice(), 0, gap_ms),
+            Notice.UPDATE_AVAILABLE: _Gatherer(
+                lambda versions: (messages.NOTICE_UPDATE, messages.update_notice(versions[-1])),
+                0,
+                gap_ms,
+            ),
         }
         for gatherer in self._gatherers.values():
             gatherer.setParent(self)
@@ -160,6 +166,10 @@ class NotificationController(QObject):
         for problem in problems:
             if problem.key not in known:
                 self._add(Notice.CANT_SYNC, problem.path)
+
+    def update_ready(self, version: str) -> None:
+        """An update was downloaded and verified (FR-CLIENT-02, FR-UPD-03)."""
+        self._add(Notice.UPDATE_AVAILABLE, version)
 
     def activity_added(self, item: Activity) -> None:
         if item.kind == "uploaded":

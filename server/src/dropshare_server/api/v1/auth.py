@@ -1,7 +1,11 @@
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Depends, Response
 
 from dropshare_server.dependencies.auth import AnySession
-from dropshare_server.dependencies.client_version import ClientVersion
+from dropshare_server.dependencies.client_version import (
+    AnyClientVersion,
+    ClientVersion,
+    require_client_version,
+)
 from dropshare_server.dependencies.context import Context
 from dropshare_server.dependencies.resources import DbSession, Resources
 from dropshare_server.services import auth as auth_service
@@ -21,13 +25,14 @@ def login(
 
 @router.post("/refresh", response_model=DataResponse[TokenPairOut])
 def refresh(
-    body: RefreshIn, db: DbSession, resources: Resources, ctx: Context, version: ClientVersion
+    body: RefreshIn, db: DbSession, resources: Resources, ctx: Context, version: AnyClientVersion
 ) -> DataResponse[TokenPairOut]:
+    """Any version: a client too old to sync keeps its session to fetch the update (OQ-49)."""
     pair = auth_service.refresh(db, resources.settings, ctx, body.refresh_token, version)
     return DataResponse(data=pair)
 
 
-@router.post("/logout", status_code=204)
+@router.post("/logout", status_code=204, dependencies=[Depends(require_client_version)])
 def logout(current: AnySession, db: DbSession, ctx: Context) -> Response:
     auth_service.logout(db, ctx.as_actor(current.actor), current)
     return Response(status_code=204)

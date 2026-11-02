@@ -6,6 +6,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from dropshare_server.models.base import Base
 from dropshare_server.models.types import Flag, UtcDateTime, string_enum
+from dropshare_shared.schemas.releases import ReleaseChannel
 from dropshare_shared.schemas.users import UserRole, UserStatus
 
 
@@ -26,6 +27,10 @@ class User(Base):
     # Current versions of the files in the user's own namespaces, trashed ones included until
     # purged (FR-TRASH-04). Changed only with the user row locked (database.md §7).
     used_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    # Which client releases this user is offered (FR-UPD-05, OQ-49).
+    update_channel: Mapped[ReleaseChannel] = mapped_column(
+        string_enum(ReleaseChannel), default=ReleaseChannel.STABLE
+    )
     failed_login_count: Mapped[int] = mapped_column(Integer, default=0)
     locked_until: Mapped[datetime | None] = mapped_column(UtcDateTime())
     must_change_password: Mapped[bool] = mapped_column(Flag())

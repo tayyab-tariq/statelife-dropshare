@@ -18,6 +18,7 @@ from dropshare_client.platform.common import (
     ProfilePaths,
     StatFileIdentity,
 )
+from dropshare_shared.signing import SignatureVerifier, system_verifier
 
 _CREDENTIAL_SERVICE = "StateLife DropShare"
 
@@ -31,6 +32,7 @@ class Platform:
     file_attributes: FileAttributes
     volumes: Volumes
     autostart: Autostart
+    signatures: SignatureVerifier  # Authenticode, for updates (FR-UPD-03); refuses off Windows
 
 
 def paths() -> Paths:
@@ -77,6 +79,35 @@ def reveal(path: Path) -> None:
         finder_reveal(path)
     else:
         raise RuntimeError(f"Unsupported platform: {sys.platform}")
+
+
+def launch_installer(installer: Path) -> None:
+    """Start a verified update installer silently, detached from this process, which then
+    quits; the installer replaces the app and starts it again (FR-UPD-03). OSError on failure."""
+    if sys.platform == "win32":
+        from dropshare_client.platform.windows.installer import launch
+
+        launch(installer)
+    else:
+        raise RuntimeError("Updates are installed on Windows only")
+
+
+def wait_for_setup() -> None:
+    """While DropShare is being installed or updated, wait (at most a few minutes) instead of
+    starting: Setup replaces these very files, and starts the app again when done."""
+    if sys.platform == "win32":
+        from dropshare_client.platform.windows.running import wait_for_setup as windows_wait
+
+        windows_wait()
+
+
+def mark_running() -> None:
+    """Tell Setup DropShare is running, until this process ends: an update waits for it to
+    quit (FR-UPD-03). OSError if that fails. Nothing to do elsewhere."""
+    if sys.platform == "win32":
+        from dropshare_client.platform.windows.running import mark_running as windows_mark
+
+        windows_mark()
 
 
 def allow_foreground_handover() -> None:
@@ -129,4 +160,5 @@ def current(profile: str | None = None) -> Platform:
         file_attributes=attributes,
         volumes=volumes,
         autostart=autostart,
+        signatures=system_verifier(),
     )

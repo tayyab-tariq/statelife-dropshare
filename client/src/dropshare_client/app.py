@@ -1,6 +1,7 @@
 """Application wiring: arguments, logging, single instance, services, controllers, windows."""
 
 import argparse
+import contextlib
 import logging
 import re
 import sys
@@ -16,6 +17,7 @@ from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from dropshare_client import platform
+from dropshare_client.build_info import BUILD
 from dropshare_client.controllers.browser_controller import BrowserController
 from dropshare_client.controllers.devices_controller import DevicesController
 from dropshare_client.controllers.diagnostics_controller import DiagnosticsController
@@ -31,9 +33,11 @@ from dropshare_client.controllers.sync_folder_controller import SyncFolderContro
 from dropshare_client.controllers.sync_log_controller import ActivityController, CantSyncController
 from dropshare_client.controllers.transfers_controller import TransfersController
 from dropshare_client.controllers.trash_controller import TrashController
+from dropshare_client.controllers.update_controller import UpdateController
 from dropshare_client.controllers.upload_controller import UploadController
 from dropshare_client.platform.base import Paths
 from dropshare_client.services.api_client import ApiClient
+from dropshare_client.services.app_data import remove_app_data
 from dropshare_client.services.auth import AuthService, this_device
 from dropshare_client.services.config import ConfigStore
 from dropshare_client.services.devices import Devices
@@ -44,11 +48,17 @@ from dropshare_client.services.local_files import LocalFiles
 from dropshare_client.services.sharing import Sharing
 from dropshare_client.services.tokens import TokenStore
 from dropshare_client.services.trash import Trash
+from dropshare_client.services.updater import (
+    UpdateDeferredError,
+    Updater,
+    UpdateVerificationError,
+)
 from dropshare_client.single_instance import SingleInstance, instance_name
 from dropshare_client.sync import binding
 from dropshare_client.sync.engine import SyncEngine, SyncListener
 from dropshare_client.sync.folder_move import FolderMover
 from dropshare_client.ui.app_shell import AppShell
+from dropshare_client.ui.installing_notice import InstallingNotice
 from dropshare_client.ui.theme import Theme
 
 logger = logging.getLogger(__name__)
@@ -101,6 +111,46 @@ def _log_unhandled_in_thread(args: threading.ExceptHookArgs) -> None:
         )
 
 
+def _install_pending(updater: Updater) -> bool:
+    """ "Update on next restart" (FR-UPD-03): installed before the main window shows or syncing
+    starts, so the check runs on this thread (no event loop yet) with a small window saying
+    what's happening. One attempt per remembered update, so an installer that keeps failing
+    can't stop DropShare starting; one that couldn't be fully checked (offline) is kept for the
+    next start. Whatever goes wrong, DropShare then starts as usual."""
+    try:
+        update = updater.pending() if updater.can_install else None
+        if update is None:
+            return False
+        updater.forget()
+    except OSError:
+        logger.warning("Couldn't read the update remembered for this start", exc_info=True)
+        return False
+    notice = InstallingNotice()
+    try:
+        updater.verify(update)
+    except UpdateDeferredError:
+        logger.warning("The update remembered for this start can't be checked now; kept")
+        with contextlib.suppress(OSError):
+            updater.remember(update)
+        return False
+    except (UpdateVerificationError, OSError):
+        logger.warning("The update remembered for this start didn't verify", exc_info=True)
+        return False
+    finally:
+        notice.close()
+    return _launch_installer(update.installer)
+
+
+def _launch_installer(installer: Path) -> bool:
+    try:
+        platform.launch_installer(installer)
+    except OSError:
+        logger.warning("Couldn't start the update installer", exc_info=True)
+        return False
+    logger.info("Started the update installer %s", installer.name)
+    return True
+
+
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="dropshare")
     parser.add_argument(
@@ -111,6 +161,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         nargs="?",
         help="A statelife-dropshare:// link to open (passed by Windows when one is clicked)",
     )
+    # Run by the uninstaller when the user chooses to remove local data (OQ-49).
+    parser.add_argument("--remove-app-data", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--profile",
         help="Development only: run a separate client with its own data and sign-in (OQ-13)",
@@ -130,6 +182,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     threading.excepthook = _log_unhandled_in_thread
     args = parse_args(sys.argv[1:] if argv is None else argv)
     system = platform.current(args.profile)
+    if args.remove_app_data:  # before logging opens a file there
+        remove_app_data(system.paths.app_data_dir(), system.credentials)
+        return 0
     configure_logging(system.paths)
 
     app = QApplication(sys.argv[:1])
@@ -138,6 +193,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     app.setQuitOnLastWindowClosed(False)  # closing the window hides it to the tray
     Theme(app)  # before any window, so every widget is polished with it
 
+    # An update installing now replaces this app and starts it again when done (FR-UPD-03).
+    platform.wait_for_setup()
     app_data = system.paths.app_data_dir()
     instance = SingleInstance(
         instance_name(args.profile),
@@ -147,6 +204,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not instance.claim(args.link):
         logger.info("Already running; asked the running instance to show its window")
         return 0
+    try:
+        platform.mark_running()
+    except OSError:
+        logger.warning("Couldn't mark DropShare as running for Setup", exc_info=True)
 
     client_version = version("dropshare-client")
     config = ConfigStore(app_data / "config.json")
@@ -157,6 +218,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         client_version=client_version,
         user_agent=f"DropShare/{client_version} ({sys.platform})",
     )
+    updater = Updater(
+        api, client_version, app_data / "updates", system.signatures, BUILD.update_signer()
+    )
+    if _install_pending(updater):
+        api.close()
+        instance.release()
+        return 0
     auth = AuthService(api, tokens, this_device())
     session = SessionController(auth, config, system.recycle_bin, app_data)
     folders = SyncFolderController(
@@ -202,6 +270,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     def local_files(root: Path) -> LocalFiles:
         return LocalFiles(root, system.recycle_bin, platform.reveal)
 
+    updates = UpdateController(updater)
     shell = AppShell(
         session,
         folders,
@@ -227,6 +296,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         devices=DevicesController(Devices(api)),
         folder_move=FolderMoveController(mover, sync, config, system.volumes, app_data),
         diagnostics=DiagnosticsController(config, app_data / "logs", client_version),
+        updates=updates,
         background=args.background,
         tray_available=QSystemTrayIcon.isSystemTrayAvailable(),
     )
@@ -244,9 +314,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         sync.shutdown()  # at a safe point: the journal and index are consistent
         trash.cancel()  # a long restore or delete stops after the item in progress
+        updates.shutdown()  # a download stops; it resumes next time
         # Let running requests finish before their HTTP client goes away (architecture §2).
         if not QThreadPool.globalInstance().waitForDone(_QUIT_WAIT_MS):
             logger.warning("Quit while work was still running")
         api.close()
         instance.release()
+        if updates.installer_to_run is not None:  # "Restart and update", once syncing stopped
+            _launch_installer(updates.installer_to_run)
         logger.info("Client stopped")

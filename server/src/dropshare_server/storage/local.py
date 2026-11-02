@@ -44,21 +44,29 @@ class LocalFilesystemBackend:
 
     def commit(self, upload_id: uuid.UUID, chunk_count: int, blob_key: str) -> CommitResult:
         staging = self._staging(upload_id)
-        digest = hashlib.sha256()
-        size = 0
 
         def pieces() -> Iterator[bytes]:
-            nonlocal size
             for index in range(chunk_count):
                 with (staging / f"{index:06d}").open("rb") as chunk:
                     while piece := chunk.read(_READ_SIZE):
-                        digest.update(piece)
-                        size += len(piece)
                         yield piece
+
+        return self.write_blob(blob_key, pieces())
+
+    def write_blob(self, blob_key: str, pieces: Iterable[bytes]) -> CommitResult:
+        digest = hashlib.sha256()
+        size = 0
+
+        def measured() -> Iterator[bytes]:
+            nonlocal size
+            for piece in pieces:
+                digest.update(piece)
+                size += len(piece)
+                yield piece
 
         target = self._blob_path(blob_key)
         self._make_dirs(target.parent)
-        self._write_atomically(target, pieces())
+        self._write_atomically(target, measured())
         return CommitResult(size_bytes=size, sha256=digest.hexdigest())
 
     def open_range(self, blob_key: str, start: int, end: int) -> Iterator[bytes]:

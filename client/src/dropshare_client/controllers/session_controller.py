@@ -77,7 +77,20 @@ class SessionController(QObject):
     def resume(self) -> bool:
         """Continue the saved session without asking for the password (FR-AUTH-02). False if
         another session operation is still running."""
-        return self._run(self._auth.resume, self._resumed, self._load_failed)
+
+        def resume() -> Session | None:
+            session = self._auth.resume()
+            if session is not None:
+                self._keep_server(self._config.config.server_url)
+            return session
+
+        return self._run(resume, self._resumed, self._load_failed)
+
+    def _keep_server(self, url: str) -> None:
+        """Signed in on `url`: always saved from now on (on the pool: it writes the file)."""
+        config = self._config.config
+        if url != config.server_url or not config.keep_server_url:
+            self._config.update(server_url=url, keep_server_url=True)
 
     def _resumed(self, session: Session | None) -> None:
         if session is None:
@@ -110,8 +123,7 @@ class SessionController(QObject):
 
         def sign_in() -> Session:
             session = self._auth.sign_in(url, login, password)
-            if url != self._config.config.server_url:
-                self._config.update(server_url=url)
+            self._keep_server(url)
             return session
 
         return self._run(sign_in, self._deliver, self._sign_in_failed)

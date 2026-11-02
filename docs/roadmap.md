@@ -22,7 +22,7 @@ Every milestone starts with `/plan` and ends with `/audit` and `/commit`.
 | M10 Transfer robustness | ✅ Done (full-scale perf and Windows checks deferred, see below) |
 | M11 App completeness | ✅ Done (Windows pass deferred, see below) |
 | M12 Admin and security | ✅ Done (staging, Oracle and Windows checks deferred, see below) |
-| M13 Distribution | Planned |
+| M13 Distribution | In progress |
 | M14 Ops and go-live | Planned |
 
 ### Deferred checks (run once the app is complete)
@@ -219,7 +219,19 @@ Acceptance:
 
 ### M13 — Distribution · large
 
-**Requirements:** FR-UPD-01 … FR-UPD-05 (installer with link-scheme registration, signing per OQ-6, auto-update, releases via the CLI)
+**Requirements:** FR-UPD-01 … FR-UPD-05 (installer with link-scheme registration, signing per OQ-6, auto-update, releases via the CLI), FR-CLIENT-02 (update available), FR-CLIENT-04/OQ-41 (Check for updates), FR-CLIENT-05 (built-in server URL). Decisions OQ-48, OQ-49.
+
+**Blocked for real distribution:** OQ-6 (signing certificate) and OQ-8 (production DNS name and TLS). Until then, builds are signed with a self-signed test certificate and published to the dev server.
+
+**Scope:**
+- **Server:** `client_releases` table with installers in the `StorageBackend` (gc-blobs keeps them); `releases publish|list|withdraw` and `users set-channel` CLI; `GET /client/releases/latest` and `/{id}/installer` (ranged); version-check exemptions and the effective minimum version (OQ-49).
+- **Client:** build info (server URL, expected publisher); Authenticode check in `platform/windows`; updater service (resumable download, SHA-256 and signature check); update controller (startup + every 6 h); Check for updates in Settings, the update-available notification, Install now / On next restart, Update on the 426 screen.
+- **Packaging:** PyInstaller spec, Inno Setup script (per-user, scheme, `AppMutex`, uninstall prompt), `scripts/build_client.ps1`. Replaces `scripts/dev/register_link_scheme.ps1`.
+
+**Done when:**
+- Server tests cover publish rules (higher version, checksum, signature refused), withdrawn releases hidden, the channel per user, ranged installer download, and a too-old client still reaching the release endpoints.
+- Updater tests cover resume, a hash mismatch, a bad signature, and the check repeated just before install; pytest-qt covers the update UI states.
+- On Windows: install an older test-signed build, publish a newer one, and the client updates with sync state intact; uninstall keeps the sync folder.
 
 ### M14 — Ops and go-live · medium
 

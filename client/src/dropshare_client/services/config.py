@@ -12,10 +12,12 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
 
+from dropshare_client.build_info import BUILD
+
 logger = logging.getLogger(__name__)
 
-# Replaced by the production address when installer builds exist (FR-CLIENT-05, roadmap F7).
-DEFAULT_SERVER_URL = "http://127.0.0.1:8000"
+# Built into installer builds (FR-CLIENT-05); the local server when running from source.
+DEFAULT_SERVER_URL = BUILD.server_url
 _LOCAL_HOSTS = frozenset({"localhost"})
 
 
@@ -49,8 +51,7 @@ MAX_TRANSFERS_LIMIT = 8
 
 
 class NotificationSettings(BaseModel):
-    """Which notifications are shown (FR-CLIENT-02); each can be turned off in Settings.
-    "Update available" arrives with the updater (M13)."""
+    """Which notifications are shown (FR-CLIENT-02); each can be turned off in Settings."""
 
     model_config = ConfigDict(extra="ignore", frozen=True)
 
@@ -58,12 +59,17 @@ class NotificationSettings(BaseModel):
     conflicts: bool = True
     cant_sync: bool = True
     quota: bool = True
+    update_available: bool = True
 
 
 class ClientConfig(BaseModel):
     model_config = ConfigDict(extra="ignore", frozen=True)
 
     server_url: str = DEFAULT_SERVER_URL
+    # Set once an account signs in: from then on the address is always saved, so a later build
+    # with another built-in address doesn't move this client off the server its sync folder
+    # belongs to (FR-UPD-03: sync state survives the update).
+    keep_server_url: bool = False
     sync_root: Path | None = None
     notifications: NotificationSettings = NotificationSettings()
     # Start at Windows sign-in (FR-CLIENT-04). None until decided: turned on at the first
@@ -120,7 +126,7 @@ class ConfigStore:
         handle, temp_name = tempfile.mkstemp(dir=self._path.parent, prefix=".config-")
         try:
             with os.fdopen(handle, "w", encoding="utf-8") as out:
-                out.write(config.model_dump_json(indent=2))
+                out.write(_to_json(config))
                 out.flush()
                 os.fsync(out.fileno())
             Path(temp_name).replace(self._path)
@@ -128,3 +134,10 @@ class ConfigStore:
             with contextlib.suppress(OSError):
                 Path(temp_name).unlink()
             raise
+
+
+def _to_json(config: ClientConfig) -> str:
+    """Until an account signs in, the built-in server address isn't saved, so a later build's
+    address applies; one the user chose (FR-CLIENT-05) is."""
+    built_in = config.server_url == DEFAULT_SERVER_URL and not config.keep_server_url
+    return config.model_dump_json(indent=2, exclude={"server_url"} if built_in else None)

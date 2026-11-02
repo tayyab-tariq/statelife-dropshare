@@ -21,17 +21,23 @@ from dropshare_server.core.errors import AppError
 from dropshare_server.services import audit as audit_service
 from dropshare_server.services import blobs as blob_service
 from dropshare_server.services import groups as group_service
+from dropshare_server.services import releases as release_service
 from dropshare_server.services import storage_report as storage_report_service
 from dropshare_server.services import trash as trash_service
 from dropshare_server.services import uploads as upload_service
 from dropshare_server.services import users as user_service
 from dropshare_server.services.audit import AuditTarget
 from dropshare_server.services.context import CallContext, cli_context
+from dropshare_server.services.releases import NewRelease
 from dropshare_server.storage.factory import create_storage_backend
+from dropshare_shared.errors import ErrorCode
 from dropshare_shared.schemas.audit import AuditAction, AuditOutcome
+from dropshare_shared.schemas.releases import ReleaseChannel, ReleasePlatform
 from dropshare_shared.schemas.users import UserRole
+from dropshare_shared.signing import system_verifier
 
 _GIB = 1024**3
+_MIB = 1024**2
 _MAX_QUOTA_GB = 1024**2  # 1 PiB: far above any real quota, well inside a 64-bit byte count
 
 type Handler = Callable[[argparse.Namespace, sessionmaker[Session], Settings, CallContext], int]
@@ -110,6 +116,98 @@ def _list_users(
             f"{user.username:<24} {user.email:<32} {user.role:<6} {status.value:<9} "
             f"{user.quota_bytes / _GIB:g}"
         )
+    return 0
+
+
+def _set_channel(
+    args: argparse.Namespace, sessions: sessionmaker[Session], _: Settings, ctx: CallContext
+) -> int:
+    with sessions.begin() as session:
+        user = user_service.set_update_channel(
+            session, ctx, args.username, ReleaseChannel(args.channel)
+        )
+    _out(f"'{user.username}' is now offered {args.channel} releases.")
+    return 0
+
+
+def _publish_release(
+    args: argparse.Namespace, sessions: sessionmaker[Session], settings: Settings, ctx: CallContext
+) -> int:
+    """Checks the installer's signature here (FR-UPD-02), so it runs on Windows (OQ-48)."""
+    try:
+        notes = args.notes_file.read_text(encoding="utf-8").strip() if args.notes_file else ""
+    except (OSError, UnicodeDecodeError) as exc:
+        raise AppError(
+            400, ErrorCode.VALIDATION_ERROR, f"Couldn't read the notes as UTF-8 text: {exc}"
+        ) from exc
+    release = NewRelease(
+        platform=ReleasePlatform(args.platform),
+        channel=ReleaseChannel(args.channel),
+        version=args.release_version,
+        min_supported_version=args.min_supported,
+        notes=notes,
+        sha256=args.sha256,
+    )
+    try:
+        with sessions.begin() as session:
+            published = release_service.publish(
+                session,
+                create_storage_backend(settings),
+                system_verifier(),
+                settings.release_signer(),
+                ctx,
+                release,
+                args.installer,
+            )
+    except OSError as exc:
+        raise AppError(
+            500,
+            ErrorCode.INTERNAL_ERROR,
+            f"Couldn't read the installer or store it ({type(exc).__name__}: {exc.strerror}); "
+            "nothing was published.",
+        ) from exc
+    _out(
+        f"Published {args.platform} {published.channel} {published.version} "
+        f"({published.size_bytes / _MIB:.1f} MB, minimum supported "
+        f"{published.min_supported_version})."
+    )
+    return 0
+
+
+def _list_releases(
+    _args: argparse.Namespace, sessions: sessionmaker[Session], _: Settings, __: CallContext
+) -> int:
+    with sessions() as session:
+        releases = release_service.list_releases(session)
+    _out(
+        f"{'PLATFORM':<12} {'CHANNEL':<8} {'VERSION':<10} {'MIN':<10} {'SIZE_MB':>8}  "
+        f"{'PUBLISHED':<16} STATUS"
+    )
+    for release in releases:
+        status = "withdrawn" if release.withdrawn_at else "available"
+        _out(
+            f"{release.platform.value:<12} {release.channel.value:<8} {release.version:<10} "
+            f"{release.min_supported_version:<10} {release.size_bytes / _MIB:>8.1f}  "
+            f"{release.published_at:%Y-%m-%d %H:%M} {status}"
+        )
+    return 0
+
+
+def _withdraw_release(
+    args: argparse.Namespace, sessions: sessionmaker[Session], _: Settings, ctx: CallContext
+) -> int:
+    with sessions.begin() as session:
+        release_service.withdraw(
+            session,
+            ctx,
+            ReleasePlatform(args.platform),
+            ReleaseChannel(args.channel),
+            args.release_version,
+        )
+    _out(
+        f"Withdrew {args.platform} {args.channel} {args.release_version}; "
+        "clients are no longer offered it."
+    )
     return 0
 
 
@@ -315,6 +413,13 @@ def _quota_bytes(text: str) -> int:
     return int(value * _GIB)
 
 
+def _existing_file(text: str) -> Path:
+    path = Path(text)
+    if not path.is_file():
+        raise argparse.ArgumentTypeError(f"no such file: {text}")
+    return path
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dropshare-server", description="StateLife DropShare administration"
@@ -360,6 +465,12 @@ def _build_parser() -> argparse.ArgumentParser:
     set_quota.add_argument("username")
     set_quota.add_argument("--quota-gb", dest="quota_bytes", type=_quota_bytes, required=True)
     set_quota.set_defaults(handler=_set_quota, audit_action=AuditAction.USER_QUOTA_CHANGED)
+    set_channel = users.add_parser(
+        "set-channel", help="Choose which client releases a user is offered (default stable)"
+    )
+    set_channel.add_argument("username")
+    set_channel.add_argument("channel", choices=[channel.value for channel in ReleaseChannel])
+    set_channel.set_defaults(handler=_set_channel, audit_action=AuditAction.USER_CHANNEL_CHANGED)
     users.add_parser("list", help="List all users").set_defaults(
         handler=_list_users, audit_action=AuditAction.USER_LISTED
     )
@@ -417,6 +528,37 @@ def _build_parser() -> argparse.ArgumentParser:
         "report", help="Quota and usage per user, and totals of what is stored"
     ).set_defaults(handler=_storage_report, audit_action=AuditAction.STORAGE_REPORTED)
 
+    releases = groups.add_parser("releases", help="Desktop client releases").add_subparsers(
+        dest="command", required=True
+    )
+    channels = [channel.value for channel in ReleaseChannel]
+    platforms = [platform.value for platform in ReleasePlatform]
+    publish = releases.add_parser(
+        "publish", help="Publish a signed installer; checks its signature (Windows only)"
+    )
+    publish.add_argument(
+        "--version", dest="release_version", metavar="VERSION", required=True, help="1.2.3"
+    )
+    publish.add_argument("--channel", choices=channels, required=True)
+    publish.add_argument(
+        "--min-supported",
+        required=True,
+        help="Older clients must update before they can sync (FR-UPD-04)",
+    )
+    publish.add_argument("--installer", type=_existing_file, required=True)
+    publish.add_argument("--sha256", required=True, help="The installer's SHA-256, in hex")
+    publish.add_argument("--notes-file", type=_existing_file, help="Release notes, UTF-8 text")
+    publish.add_argument("--platform", choices=platforms, default=ReleasePlatform.WINDOWS_X64)
+    publish.set_defaults(handler=_publish_release, audit_action=AuditAction.RELEASE_PUBLISHED)
+    releases.add_parser("list", help="List releases, newest first").set_defaults(
+        handler=_list_releases, audit_action=None
+    )
+    withdraw = releases.add_parser("withdraw", help="Stop offering a release to clients")
+    withdraw.add_argument("release_version", metavar="VERSION")
+    withdraw.add_argument("--channel", choices=channels, required=True)
+    withdraw.add_argument("--platform", choices=platforms, default=ReleasePlatform.WINDOWS_X64)
+    withdraw.set_defaults(handler=_withdraw_release, audit_action=AuditAction.RELEASE_WITHDRAWN)
+
     jobs = groups.add_parser("jobs", help="Scheduled maintenance jobs").add_subparsers(
         dest="command", required=True
     )
@@ -440,8 +582,12 @@ def _record_failure(
         return
     username: str | None = getattr(args, "username", None)
     group_name: str | None = getattr(args, "group_name", None)
+    release_version: str | None = getattr(args, "release_version", None)
     target = None
-    if group_name:
+    if release_version:
+        name = f"{args.platform} {args.channel} {release_version}"
+        target = AuditTarget(type="release", id=name, name=name)
+    elif group_name:
         target = AuditTarget(type="group", id=group_name, name=group_name)
     elif username:
         target = AuditTarget(type="user", id=username, name=username)
@@ -483,6 +629,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             # Two admins creating the same user at once: the database's unique index caught it.
             _record_failure(sessions, ctx, args, "NAME_CONFLICT")
             _err("That username or email is already in use.")
+            return 1
+        if "UQ_CLIENT_RELEASES_" in str(exc.orig).upper():
+            _record_failure(sessions, ctx, args, "VERSION_CONFLICT")
+            _err("That release was just published by someone else.")
             return 1
         if "UQ_GROUPS_" in str(exc.orig).upper() or "PK_GROUP_MEMBERS" in str(exc.orig).upper():
             _record_failure(sessions, ctx, args, "NAME_CONFLICT")

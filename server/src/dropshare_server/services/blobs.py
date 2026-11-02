@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session, sessionmaker
 
 from dropshare_server.repositories import nodes as node_repository
+from dropshare_server.repositories import releases as release_repository
 from dropshare_server.storage.base import StorageBackend
 
 logger = logging.getLogger(__name__)
@@ -113,4 +114,5 @@ def _unknown(session_factory: sessionmaker[Session], keys: list[str]) -> list[st
         return []
     with session_factory() as session:
         known = node_repository.known_blob_keys(session, keys)
+        known |= release_repository.known_blob_keys(session, keys)  # client installers
     return [key for key in keys if key not in known]

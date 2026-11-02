@@ -1,6 +1,7 @@
 # Development only: make statelife-dropshare:// links open the client run from this checkout
-# (FR-SHARE-07). The installer registers the scheme for real in M13; this does the same for the
-# current Windows user only (HKCU, no admin rights), pointing at `uv run` in this repository.
+# (FR-SHARE-07). The installer registers the scheme for installed builds (installer/dropshare.iss);
+# this does the same for the current Windows user (HKCU, no admin rights), pointing at `uv run`
+# in this repository. Installing a build replaces it, and uninstalling removes it.
 #
 #   pwsh scripts/dev/register_link_scheme.ps1             # register
 #   pwsh scripts/dev/register_link_scheme.ps1 -Remove     # remove again

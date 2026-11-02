@@ -29,6 +29,7 @@ from dropshare_client.controllers.sync_log_controller import (
 )
 from dropshare_client.controllers.transfers_controller import TransfersController
 from dropshare_client.controllers.trash_controller import TrashController
+from dropshare_client.controllers.update_controller import UpdateController, UpdateState
 from dropshare_client.controllers.upload_controller import UploadController
 from dropshare_client.ui.browser_view import BrowserView
 from dropshare_client.ui.change_password_dialog import ChangePasswordDialog
@@ -46,6 +47,7 @@ from dropshare_client.ui.theme import TrayState
 from dropshare_client.ui.transfers_view import TransfersView
 from dropshare_client.ui.trash_view import TrashView
 from dropshare_client.ui.tray import Tray
+from dropshare_client.ui.update_dialog import UpdateDialog
 from dropshare_shared.schemas.users import UserOut
 
 logger = logging.getLogger(__name__)
@@ -90,6 +92,7 @@ class AppShell(QObject):
         devices: DevicesController,
         folder_move: FolderMoveController,
         diagnostics: DiagnosticsController,
+        updates: UpdateController,
         background: bool = False,
         tray_available: bool = True,
     ) -> None:
@@ -129,7 +132,9 @@ class AppShell(QObject):
         self.window.add_page(messages.CANT_SYNC, self.cant_sync_view, 5)
         self._settings = settings
         self._devices = devices
-        self.settings_view = SettingsView(settings, devices, diagnostics)
+        self._updates = updates
+        self.update_dialog: UpdateDialog | None = None
+        self.settings_view = SettingsView(settings, devices, diagnostics, updates)
         self.window.add_page(messages.SETTINGS, self.settings_view)
         self.window.show_page(messages.MY_FILES)
         self.tray = Tray()
@@ -196,6 +201,11 @@ class AppShell(QObject):
         self.browser_view.share_requested.connect(self.share_dialog.open_for)
         browser.shared_file_linked.connect(self._show_shared_item)
         shared.new_shares.connect(notifications.new_shares)
+        self.settings_view.install_update_requested.connect(self._show_update_dialog)
+        updates.prompt.connect(self._show_update_dialog)
+        updates.ready.connect(notifications.update_ready)
+        updates.install_requested.connect(self.quit)  # app.main runs the installer after
+        updates.urgent_status.connect(self.window.show_error)  # the server refused this version
 
     def start(self) -> None:
         if self._tray_available:
@@ -210,7 +220,12 @@ class AppShell(QObject):
         """Tray click, "Open DropShare", or a second launch (FR-CLIENT-07). Whatever the user
         was in the middle of comes to the front."""
         self._background = False
-        for dialog in (self.password_dialog, self.folder_dialog, self.delete_dialog):
+        for dialog in (
+            self.password_dialog,
+            self.folder_dialog,
+            self.delete_dialog,
+            self.update_dialog,
+        ):
             if dialog is not None:
                 _bring_forward(dialog)
                 return
@@ -248,6 +263,7 @@ class AppShell(QObject):
 
     def _forget_account(self) -> None:
         """Signed out, or the session ended: nothing of this account stays for the next."""
+        self._updates.stop()
         self._folder_move.signed_out()
         self._notifications.reset()
         self._activity.clear()
@@ -306,6 +322,7 @@ class AppShell(QObject):
         self._uploads.set_user(user)
         self._notifications.account_loaded(user)
         self._settings.apply_autostart()
+        self._updates.start()  # now, and every 6 hours (FR-UPD-03)
         if self._folders.current_folder is None:
             self._set_connection(TrayState.PAUSED, _NO_FOLDER)
         elif not self._sync.running:
@@ -381,6 +398,20 @@ class AppShell(QObject):
         self._set_connection(TrayState.ERROR, message)
         self.window.show_error(message)
         self.window.bring_to_front()
+        self._updates.check(urgent=True)  # offers the update once it is downloaded (FR-UPD-04)
+
+    def _show_update_dialog(self) -> None:
+        if self._updates.state is not UpdateState.READY:
+            return
+        if self.update_dialog is None:
+            dialog = UpdateDialog(self._updates, parent=self.window)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            dialog.finished.connect(self._update_dialog_closed)
+            self.update_dialog = dialog
+        _bring_forward(self.update_dialog)
+
+    def _update_dialog_closed(self, _: int) -> None:
+        self.update_dialog = None
 
     def _confirm_sign_out(self) -> None:
         # Sign-out may move the very folder being moved, or one a move hasn't finished with.

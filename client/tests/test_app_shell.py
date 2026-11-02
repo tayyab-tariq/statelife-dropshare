@@ -446,6 +446,10 @@ def test_unticking_the_other_server_signs_in_to_the_built_in_one(
     qtbot.waitUntil(lambda: shell.tray.state is SIGNED_IN_WITHOUT_FOLDER)
     assert client.server.hosts[-1] == "127.0.0.1:8000"
     assert client.config.config.server_url == client.session.default_server_url
+    # Signed in on it: kept from now on, whatever later builds have built in (audit S5).
+    saved = json.loads((client.app_data / "config.json").read_text(encoding="utf-8"))
+    assert saved["server_url"] == client.session.default_server_url
+    assert saved["keep_server_url"] is True
 
 
 def test_without_a_tray_closing_the_window_quits_the_app(
