@@ -123,7 +123,8 @@ if (-not $Unsigned) {
         }
     }
     # Clients and the release CLI also require the installer's own version to be the release's.
-    $fileVersion = (Get-Item $installer).VersionInfo.FileVersion
+    # Inno Setup pads the version string with spaces.
+    $fileVersion = (Get-Item $installer).VersionInfo.FileVersion.Trim()
     if ($fileVersion -notin @($version, "$version.0")) {
         throw "The installer's version is '$fileVersion', not $version."
     }
