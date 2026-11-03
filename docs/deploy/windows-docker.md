@@ -141,7 +141,8 @@ in `nginx.conf.example`.
 ## Deploying
 
 Merge a pull request into `main`. The workflow tests, then runs `docker compose up -d --build` on
-the server and checks `http://127.0.0.1:5009/health/ready`. To redeploy without a change:
+the server and checks `/health/ready` on port 5009 (at `DROPSHARE_API_BIND`, or `127.0.0.1` while
+it is unset). To redeploy without a change:
 Actions → Deploy DropShare → **Run workflow** (from `main`).
 
 ## Trusting the proxy
@@ -209,9 +210,9 @@ Keep that clone on the same commit as `main`, then:
 
 ## Windows checks after the first deploy
 
-1. The deploy is green and `http://127.0.0.1:5009/health/ready` reports database and storage `ok`.
+1. The deploy is green and `/health/ready` on port 5009 reports database and storage `ok`.
 2. Upload a file of several GB from a client (through the proxy, or on the server against
-   `http://127.0.0.1:5009`). It completes, and a new file appears under
+   `http://127.0.0.1:5009` while `DROPSHARE_API_BIND` is unset). It completes, and a new file appears under
    `E:\DropShareData\blobs`. This proves the folder mount handles chunk writes, `fsync` and the
    final rename. If uploads fail with permission or "access denied" errors on rename, look at
    antivirus scanning of `E:\DropShareData` before anything else.

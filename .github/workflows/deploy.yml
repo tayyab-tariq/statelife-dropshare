@@ -97,4 +97,6 @@ jobs:
       - name: Readiness check (database and storage)
         run: |
           $ErrorActionPreference = 'Stop'
-          Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:5009/health/ready' -TimeoutSec 10 | Out-Null
+          # The API listens only on DROPSHARE_API_BIND once that is set, not on loopback.
+          $apiHost = if ($env:DROPSHARE_API_BIND) { $env:DROPSHARE_API_BIND } else { '127.0.0.1' }
+          Invoke-WebRequest -UseBasicParsing -Uri "http://${apiHost}:5009/health/ready" -TimeoutSec 10 | Out-Null
