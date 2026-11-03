@@ -1,0 +1,99 @@
+name: Deploy DropShare
+
+# Every push to main is tested on Linux (NFR-COMPAT-06), then deployed to the Windows server
+# (requirements OQ-50). Runbook: docs/deploy/windows-docker.md.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dropshare-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: dropshare_test
+          POSTGRES_USER: dropshare
+          POSTGRES_PASSWORD: ci-only-password
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U dropshare -d dropshare_test"
+          --health-interval 5s --health-timeout 4s --health-retries 20
+    env:
+      TEST_DB_DIALECT: postgresql
+      TEST_DB_HOST: 127.0.0.1
+      TEST_DB_PORT: "5432"
+      TEST_DB_NAME: dropshare_test
+      TEST_DB_USER: dropshare
+      TEST_DB_PASSWORD: ci-only-password
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.5"
+      - run: uv sync --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy .
+      # Client tests need a Qt display and run on the developer machines (CLAUDE.md §2).
+      - run: uv run pytest shared/tests server/tests
+
+  deploy:
+    needs: test
+    # Only main deploys. This guards against a manual run on another branch by mistake; the real
+    # protection is the environment's branch rule (runbook, "Locking down GitHub").
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, Windows, X64, dropshare]
+    environment: dropshare-production
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      DROPSHARE_POSTGRES_PASSWORD: ${{ secrets.DROPSHARE_POSTGRES_PASSWORD }}
+      DROPSHARE_TOKEN_SECRET: ${{ secrets.DROPSHARE_TOKEN_SECRET }}
+      DROPSHARE_POSTGRES_USER: ${{ vars.DROPSHARE_POSTGRES_USER || 'dropshare' }}
+      DROPSHARE_POSTGRES_DB: ${{ vars.DROPSHARE_POSTGRES_DB || 'dropshare' }}
+      DROPSHARE_STORAGE_PATH: ${{ vars.DROPSHARE_STORAGE_PATH || 'E:\DropShareData' }}
+      DROPSHARE_API_BIND: ${{ vars.DROPSHARE_API_BIND }}
+      DROPSHARE_TRUSTED_PROXIES: ${{ vars.DROPSHARE_TRUSTED_PROXIES }}
+      DROPSHARE_RELEASE_PUBLISHER: ${{ vars.DROPSHARE_RELEASE_PUBLISHER }}
+      DROPSHARE_RELEASE_CERT_SHA256: ${{ vars.DROPSHARE_RELEASE_CERT_SHA256 }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check secrets and storage folder
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in 'DROPSHARE_POSTGRES_PASSWORD', 'DROPSHARE_TOKEN_SECRET') {
+            if (-not [Environment]::GetEnvironmentVariable($name)) { throw "Missing secret $name" }
+          }
+          if (-not (Test-Path -PathType Container $env:DROPSHARE_STORAGE_PATH)) {
+            throw "Storage folder $env:DROPSHARE_STORAGE_PATH doesn't exist (see the runbook)"
+          }
+
+      - name: Build and start the stack
+        run: |
+          & docker compose up -d --build --remove-orphans --wait --wait-timeout 240
+          if ($LASTEXITCODE) {
+            & docker compose ps -a
+            & docker compose logs --tail 100 api jobs
+            throw 'Deploy failed'
+          }
+
+      - name: Readiness check (database and storage)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Invoke-WebRequest -UseBasicParsing -Uri 'http://127.0.0.1:5009/health/ready' -TimeoutSec 10 | Out-Null

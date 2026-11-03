@@ -1,0 +1,146 @@
+# Production stack on the Windows server with Docker Desktop (requirements OQ-50).
+# Runbook: docs/deploy/windows-docker.md. Values come from the environment of whoever runs
+# `docker compose` (the deploy workflow sets them from GitHub secrets and variables).
+name: dropshare
+
+x-logging: &default-logging
+  driver: json-file
+  options: { max-size: "20m", max-file: "5" }
+
+# The API and the jobs runner share one image and one configuration.
+x-app: &app
+  image: dropshare/api:production
+  restart: unless-stopped
+  init: true
+  environment:
+    DB_DIALECT: postgresql
+    DB_HOST: postgres
+    DB_PORT: "5432"
+    DB_NAME: ${DROPSHARE_POSTGRES_DB:-dropshare}
+    DB_USER: ${DROPSHARE_POSTGRES_USER:-dropshare}
+    DB_PASSWORD: ${DROPSHARE_POSTGRES_PASSWORD:?set DROPSHARE_POSTGRES_PASSWORD}
+    TOKEN_SECRET: ${DROPSHARE_TOKEN_SECRET:?set DROPSHARE_TOKEN_SECRET}
+    STORAGE_LOCAL_ROOT: /data
+    # JSON lists, e.g. ["192.0.2.10"]. Empty until the proxy's address is known.
+    TRUSTED_PROXIES: ${DROPSHARE_TRUSTED_PROXIES:-[]}
+    RELEASE_PUBLISHER: ${DROPSHARE_RELEASE_PUBLISHER:-}
+    RELEASE_CERT_SHA256: ${DROPSHARE_RELEASE_CERT_SHA256:-[]}
+  volumes:
+    # Users' files. A Windows folder, not a Docker volume: the host's `releases publish` writes
+    # here too, and it survives a Docker Desktop reset. Never created by Docker: a missing folder
+    # must stop the deploy, not start on an empty one.
+    - type: bind
+      source: ${DROPSHARE_STORAGE_PATH:-E:\DropShareData}
+      target: /data
+      bind:
+        create_host_path: false
+  depends_on:
+    postgres: { condition: service_healthy }
+  networks: [dropshare-private]
+  logging: *default-logging
+  security_opt: [no-new-privileges:true]
+
+services:
+  # No selfheal label: after a crash PostgreSQL replays its WAL before it answers health checks,
+  # and a restart in the middle would start the replay over.
+  postgres:
+    image: postgres:16-alpine
+    init: true
+    restart: unless-stopped
+    # Defaults suit a metadata-only database (file content is in the storage folder). No
+    # idle-in-transaction timeout: completing an upload holds its transaction while the whole file
+    # (up to 10 GiB) is assembled and hashed.
+    command:
+      - postgres
+      - -c
+      - log_lock_waits=on
+    # Docker's default of 64 MB is too small for parallel queries.
+    shm_size: 1gb
+    # Docker's default 10 s can cut a shutdown short and force crash recovery on the next start.
+    stop_grace_period: 60s
+    environment:
+      POSTGRES_DB: ${DROPSHARE_POSTGRES_DB:-dropshare}
+      POSTGRES_USER: ${DROPSHARE_POSTGRES_USER:-dropshare}
+      # Only read when the volume is first created; changing it later needs ALTER USER.
+      POSTGRES_PASSWORD: ${DROPSHARE_POSTGRES_PASSWORD:?set DROPSHARE_POSTGRES_PASSWORD}
+    volumes:
+      - dropshare-postgres:/var/lib/postgresql/data
+    # Loopback only: for the host's admin CLI (`releases publish` runs on Windows, OQ-48).
+    ports:
+      - "127.0.0.1:${DROPSHARE_POSTGRES_HOST_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+    networks: [dropshare-private]
+    mem_limit: 4g
+    logging: *default-logging
+    security_opt: [no-new-privileges:true]
+
+  api:
+    <<: *app
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    # Plain HTTP. Loopback only until the Windows firewall allows port 5009 from the proxy alone;
+    # then DROPSHARE_API_BIND is set to the server's address (runbook, NFR-SEC-01).
+    ports:
+      - "${DROPSHARE_API_BIND:-127.0.0.1}:5009:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
+    mem_limit: 2g
+    labels:
+      dropshare.selfheal: "true"        # the watchdog restarts it when unhealthy
+
+  # Cleanup jobs (NFR-REL-05, OQ-38): once at start, then every JOBS_INTERVAL_SECONDS.
+  jobs:
+    <<: *app
+    pull_policy: never                   # the image is built by the api service
+    depends_on:
+      api: { condition: service_healthy }   # the API has run the migrations
+    command:
+      - /bin/sh
+      - -c
+      - |
+        while true; do
+          for job in expire-uploads purge-trash gc-blobs purge-audit; do
+            dropshare-server jobs run "$$job" || echo "Job $$job failed" >&2
+          done
+          sleep "$${JOBS_INTERVAL_SECONDS:-86400}"
+        done
+    mem_limit: 512m
+
+  watchdog:
+    image: dropshare/watchdog:production
+    build:
+      context: .
+      dockerfile: deploy/watchdog/Dockerfile
+    restart: unless-stopped
+    init: true
+    read_only: true
+    network_mode: none
+    environment:
+      WATCHDOG_PROJECT: dropshare       # must match `name:` at the top
+      WATCHDOG_LABEL: dropshare.selfheal=true
+      WATCHDOG_INTERVAL_SECONDS: "10"
+      WATCHDOG_RESTART_GRACE_SECONDS: "30"
+      WATCHDOG_RESTART_COOLDOWN_SECONDS: "60"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    tmpfs:
+      - /tmp:size=8m,mode=1777,noexec,nosuid,nodev
+    mem_limit: 256m
+    logging: *default-logging
+    security_opt: [no-new-privileges:true]
+
+volumes:
+  dropshare-postgres:
+
+networks:
+  dropshare-private:
+    driver: bridge

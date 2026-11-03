@@ -1,0 +1,27 @@
+# Build context is the repo root. Only what server/Dockerfile and deploy/watchdog/Dockerfile copy
+# is needed; above all, never send secrets or users' files into an image.
+**/.env
+**/.env.*
+*.pem
+*.pfx
+*.p12
+*.key
+var/
+.venv/
+**/__pycache__/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.pytest_cache/
+.git/
+.github/
+.claude/
+.vscode/
+build/
+dist/
+docs/
+installer/
+scripts/
+client/
+!client/pyproject.toml
+server/tests/
+shared/tests/
