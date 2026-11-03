@@ -12,6 +12,10 @@ The COM plumbing below is only defined on Windows, so mypy checks it only when r
 import os
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from _ctypes import _CDataType  # stub-only alias for every ctypes data type
 
 TSF_DELETE_RECYCLE_IF_POSSIBLE = 0x00000080
 
@@ -73,7 +77,7 @@ if sys.platform == "win32":
     _PERFORM_OPERATIONS = 21
     _GET_ANY_OPERATIONS_ABORTED = 22
 
-    def _method(obj: c_void_p, slot: int, *argtypes: object) -> Callable[..., object]:
+    def _method(obj: c_void_p, slot: int, *argtypes: "type[_CDataType]") -> Callable[..., object]:
         """Call COM method `slot` of `obj`; a failing HRESULT raises OSError."""
         vtable = ctypes.cast(obj, POINTER(POINTER(c_void_p)))[0]
         prototype = ctypes.WINFUNCTYPE(ctypes.HRESULT, c_void_p, *argtypes)
@@ -98,7 +102,7 @@ if sys.platform == "win32":
             ok = _S_OK
             proto = ctypes.WINFUNCTYPE
 
-            def query_interface(this: int, riid: object, ppv: object) -> int:
+            def query_interface(this: int, riid: int, ppv: int) -> int:
                 wanted = ctypes.cast(riid, POINTER(_GUID))[0]
                 out = ctypes.cast(ppv, POINTER(c_void_p))
                 if bytes(wanted) in (bytes(_IID_UNKNOWN), bytes(_IID_PROGRESS_SINK)):
