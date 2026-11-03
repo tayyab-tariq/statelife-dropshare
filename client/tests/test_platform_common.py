@@ -128,7 +128,7 @@ def _recycle_bin_item_count(path: Path) -> int:
         )
 
     info = _Info(cbSize=ctypes.sizeof(_Info))
-    result = ctypes.windll.shell32.SHQueryRecycleBinW(str(path.anchor), ctypes.byref(info))  # type: ignore[attr-defined]  # Windows-only API
+    result = ctypes.windll.shell32.SHQueryRecycleBinW(str(path.anchor), ctypes.byref(info))  # type: ignore[attr-defined, unused-ignore]  # windll exists only on Windows
     assert result == 0
     return int(info.i64NumItems)
 
