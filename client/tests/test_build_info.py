@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from dropshare_client import platform
+from dropshare_client import build_info, platform
 from dropshare_client.build_info import DEVELOPMENT, BuildInfo, BuildInfoError, load
 from dropshare_shared.signing import UnavailableVerifier
 
@@ -58,3 +58,8 @@ def test_an_installed_build_without_valid_values_refuses_to_start(
 @pytest.mark.skipif(sys.platform == "win32", reason="Windows checks signatures")
 def test_updates_are_never_verified_off_windows() -> None:
     assert isinstance(platform.current().signatures, UnavailableVerifier)
+
+
+def test_a_run_from_source_may_choose_its_server() -> None:
+    """FR-CLIENT-05: only development may; installer builds sign in to their own server."""
+    assert build_info.CAN_CHOOSE_SERVER

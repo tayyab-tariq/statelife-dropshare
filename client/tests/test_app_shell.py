@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 from client_fakes import COMMON_PASSWORD, NEW_PASSWORD, USER_PASSWORD, Client
+from conftest import MakeClient
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
@@ -26,7 +27,6 @@ from dropshare_client.ui.theme import TrayState
 from dropshare_shared.schemas.users import UserOut
 
 type FindByName = Callable[[QWidget, type[QWidget], str], QWidget]
-type MakeClient = Callable[[], Client]
 type MakeShell = Callable[..., AppShell]
 
 # Signed in, but nothing syncs until a folder is chosen.
@@ -450,6 +450,38 @@ def test_unticking_the_other_server_signs_in_to_the_built_in_one(
     saved = json.loads((client.app_data / "config.json").read_text(encoding="utf-8"))
     assert saved["server_url"] == client.session.default_server_url
     assert saved["keep_server_url"] is True
+
+
+def test_an_installer_build_offers_no_other_server(
+    qtbot: QtBot,
+    make_client: MakeClient,
+    make_shell: MakeShell,
+    find_by_name: FindByName,
+) -> None:
+    client = make_client(can_choose_server=False)
+    shell = make_shell(client)
+    shell.start()
+    qtbot.waitUntil(shell.sign_in_dialog.isVisible)
+
+    for name, kind in (("Use a different server", QCheckBox), ("Server address", QLineEdit)):
+        with pytest.raises(AssertionError, match="expected one"):
+            find_by_name(shell.sign_in_dialog, kind, name)
+    _sign_in(qtbot, find_by_name, shell, "alice", USER_PASSWORD)
+
+    qtbot.waitUntil(lambda: shell.tray.state is SIGNED_IN_WITHOUT_FOLDER)
+    assert client.server.hosts[-1] == "127.0.0.1:8000"  # the built-in server
+
+
+def test_an_installer_build_refuses_to_sign_in_elsewhere(
+    qtbot: QtBot, make_client: MakeClient
+) -> None:
+    client = make_client(can_choose_server=False)
+
+    with qtbot.waitSignal(client.session.sign_in_failed) as failed:
+        assert not client.session.sign_in("https://elsewhere.example.com", "alice", USER_PASSWORD)
+
+    assert failed.args == ["This version of DropShare signs in only to its own server."]
+    assert client.server.hosts == []
 
 
 def test_without_a_tray_closing_the_window_quits_the_app(
