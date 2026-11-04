@@ -13,6 +13,7 @@ from pathlib import Path
 from pydantic import ValidationError
 from PySide6.QtCore import QObject, Signal
 
+from dropshare_client.build_info import CAN_CHOOSE_SERVER
 from dropshare_client.controllers import messages
 from dropshare_client.controllers.worker import Worker
 from dropshare_client.platform.base import RecycleBin
@@ -53,6 +54,8 @@ class SessionController(QObject):
         recycle_bin: RecycleBin,
         app_data: Path,
         worker: Worker | None = None,
+        *,
+        can_choose_server: bool = CAN_CHOOSE_SERVER,
     ) -> None:
         super().__init__()
         self._auth = auth
@@ -60,6 +63,7 @@ class SessionController(QObject):
         self._recycle_bin = recycle_bin
         self._app_data = app_data
         self._worker = worker or Worker()
+        self._can_choose_server = can_choose_server
         self._busy = False
 
     @property
@@ -69,6 +73,11 @@ class SessionController(QObject):
     @property
     def default_server_url(self) -> str:
         return DEFAULT_SERVER_URL
+
+    @property
+    def can_choose_server(self) -> bool:
+        """Whether sign-in may name a server other than this client's own (development only)."""
+        return self._can_choose_server
 
     @property
     def busy(self) -> bool:
@@ -112,6 +121,8 @@ class SessionController(QObject):
     def sign_in(self, server_url: str, login: str, password: str) -> bool:
         try:
             url = check_server_url(server_url)
+            if url != self.server_url and not self._can_choose_server:
+                raise ValueError("This version of DropShare signs in only to its own server.")
         except ValueError as exc:
             self.sign_in_failed.emit(str(exc))
             return False

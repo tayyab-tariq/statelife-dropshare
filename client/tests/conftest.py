@@ -2,6 +2,7 @@ import os
 import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Protocol
 
 import httpx
 import pytest
@@ -100,7 +101,8 @@ def credentials() -> MemoryCredentials:
     return MemoryCredentials()
 
 
-type MakeClient = Callable[[], Client]
+class MakeClient(Protocol):
+    def __call__(self, *, can_choose_server: bool = True) -> Client: ...
 
 
 @pytest.fixture
@@ -108,12 +110,13 @@ def make_client(
     tmp_path: Path, server: FakeServer, credentials: MemoryCredentials
 ) -> Iterator[MakeClient]:
     """make_client(): a client sharing the server, credential store and app-data folder with any
-    other made here, like a relaunch of the same install."""
+    other made here, like a relaunch of the same install. `can_choose_server=False` makes it
+    behave as an installer build (FR-CLIENT-05)."""
     made: list[ApiClient] = []
     trash = tmp_path / "trash"
     trash.mkdir()
 
-    def make() -> Client:
+    def make(*, can_choose_server: bool = True) -> Client:
         config = ConfigStore(tmp_path / "app-data" / "config.json")
         tokens = TokenStore(credentials)
         api = ApiClient(
@@ -147,7 +150,13 @@ def make_client(
             tokens=tokens,
             api=api,
             auth=auth,
-            session=SessionController(auth, config, MacTrash(trash), tmp_path / "app-data"),
+            session=SessionController(
+                auth,
+                config,
+                MacTrash(trash),
+                tmp_path / "app-data",
+                can_choose_server=can_choose_server,
+            ),
             folders=SyncFolderController(
                 FakeVolumes(tmp_path),
                 config,

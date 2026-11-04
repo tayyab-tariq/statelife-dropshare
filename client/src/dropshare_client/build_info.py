@@ -66,3 +66,6 @@ def load(path: Path = _FILE, *, frozen: bool | None = None) -> BuildInfo:
 
 
 BUILD = load()
+# Only a run from source may sign in to another server (FR-CLIENT-05). Every installer build,
+# test builds included, signs in to the server built into it and nowhere else.
+CAN_CHOOSE_SERVER = BUILD is DEVELOPMENT

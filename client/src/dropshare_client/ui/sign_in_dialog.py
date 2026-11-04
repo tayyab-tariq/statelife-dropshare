@@ -44,23 +44,30 @@ class SignInDialog(QDialog):
 
         self._login = QLineEdit()
         self._password = password_field()
-        self._use_other_server = QCheckBox("Use a &different server")
-        self._use_other_server.setAccessibleDescription(
-            "For testing: sign in to a server other than the built-in one"
-        )
-        self._server = QLineEdit(controller.server_url)
-        # A saved override shows as such; unticking goes back to the built-in server.
-        self._use_other_server.setChecked(controller.server_url != controller.default_server_url)
         form = QFormLayout()
         form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapAllRows)  # labels above fields
         form.setVerticalSpacing(theme.SPACE.sm)
         add_field(form, "&Username or email", self._login)
         add_field(form, "&Password", self._password)
-        form.addRow(self._use_other_server)
-        add_field(form, "Server &address", self._server)
         self._form = form
-        self._use_other_server.toggled.connect(self._show_server)
-        self._show_server(self._use_other_server.isChecked())
+        # Choosing the server is for development only (FR-CLIENT-05): installer builds don't
+        # offer it and always sign in to their own server.
+        self._use_other_server: QCheckBox | None = None
+        self._server: QLineEdit | None = None
+        if controller.can_choose_server:
+            self._use_other_server = QCheckBox("Use a &different server")
+            self._use_other_server.setAccessibleDescription(
+                "For development: sign in to a server other than the built-in one"
+            )
+            self._server = QLineEdit(controller.server_url)
+            # A saved override shows as such; unticking goes back to the built-in server.
+            self._use_other_server.setChecked(
+                controller.server_url != controller.default_server_url
+            )
+            form.addRow(self._use_other_server)
+            add_field(form, "Server &address", self._server)
+            self._use_other_server.toggled.connect(self._show_server)
+            self._show_server(self._use_other_server.isChecked())
 
         # One full-width primary action, with Cancel quiet beneath it.
         self._sign_in = QPushButton("Sign in")
@@ -104,12 +111,16 @@ class SignInDialog(QDialog):
     def accept(self) -> None:
         """Sign in rather than close: the shell closes the dialog when the session is ready."""
         self.show_message("")
-        server = (
-            self._server.text()
-            if self._use_other_server.isChecked()
-            else self._controller.default_server_url
-        )
-        self._controller.sign_in(server, self._login.text(), self._password.text())
+        self._controller.sign_in(self._chosen_server(), self._login.text(), self._password.text())
+
+    def _chosen_server(self) -> str:
+        if self._use_other_server is None or self._server is None:
+            # The address this client is bound to: the built-in one, or the one an earlier
+            # build had built in, which its sync folder belongs to.
+            return self._controller.server_url
+        if self._use_other_server.isChecked():
+            return self._server.text()
+        return self._controller.default_server_url
 
     def reject(self) -> None:
         """Cancel and Escape do nothing while signing in: the result would arrive anyway."""
@@ -127,10 +138,12 @@ class SignInDialog(QDialog):
 
     def _set_busy(self, busy: bool) -> None:
         for widget in (self._login, self._password, self._server, self._use_other_server):
-            widget.setEnabled(not busy)
+            if widget is not None:
+                widget.setEnabled(not busy)
         self._sign_in.setEnabled(not busy)
         self._cancel.setEnabled(not busy)
         self._sign_in.setText("Signing in…" if busy else "Sign in")
 
     def _show_server(self, visible: bool) -> None:
-        self._form.setRowVisible(self._server, visible)
+        if self._server is not None:
+            self._form.setRowVisible(self._server, visible)
