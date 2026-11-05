@@ -49,7 +49,7 @@ services:
     restart: unless-stopped
     # Defaults suit a metadata-only database (file content is in the storage folder). No
     # idle-in-transaction timeout: completing an upload holds its transaction while the whole file
-    # (up to 10 GiB) is assembled and hashed.
+    # (up to 3 GiB) is assembled and hashed.
     command:
       - postgres
       - -c

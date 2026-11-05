@@ -5,7 +5,7 @@ from fastapi import APIRouter, Query
 
 from dropshare_server.dependencies.auth import ActiveSession
 from dropshare_server.dependencies.context import Context
-from dropshare_server.dependencies.resources import DbSession
+from dropshare_server.dependencies.resources import DbSession, Resources
 from dropshare_server.services import sharing as sharing_service
 from dropshare_shared.schemas.envelope import DataResponse, ListResponse, PageQuery
 from dropshare_shared.schemas.nodes import NodeOut
@@ -30,11 +30,16 @@ def get_members(
 
 @router.post("/nodes/{node_id}/members", status_code=201, response_model=DataResponse[MemberOut])
 def add_member(
-    node_id: uuid.UUID, body: MemberIn, current: ActiveSession, db: DbSession, ctx: Context
+    node_id: uuid.UUID,
+    body: MemberIn,
+    current: ActiveSession,
+    db: DbSession,
+    resources: Resources,
+    ctx: Context,
 ) -> DataResponse[MemberOut]:
     """Share a folder or file (FR-SHARE-01/03); only its owner may (FR-SHARE-04)."""
     member = sharing_service.add_member(
-        db, ctx.as_actor(current.actor), current.user.id, node_id, body
+        db, resources.file_types, ctx.as_actor(current.actor), current.user.id, node_id, body
     )
     return DataResponse(data=member)
 

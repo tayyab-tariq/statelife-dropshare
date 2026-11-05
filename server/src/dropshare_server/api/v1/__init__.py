@@ -8,6 +8,7 @@ from dropshare_server.api.v1 import (
     auth,
     changes,
     directory,
+    file_policy,
     me,
     namespaces,
     nodes,
@@ -33,4 +34,5 @@ router.include_router(changes.router, dependencies=_SUPPORTED)
 router.include_router(directory.router, dependencies=_SUPPORTED)
 router.include_router(sharing.router, dependencies=_SUPPORTED)
 router.include_router(trash.router, dependencies=_SUPPORTED)
+router.include_router(file_policy.router, dependencies=_SUPPORTED)
 router.include_router(releases.router)  # any version: an unsupported client fetches its update

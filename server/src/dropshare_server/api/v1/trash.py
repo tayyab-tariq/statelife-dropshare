@@ -5,7 +5,7 @@ from fastapi import APIRouter, BackgroundTasks, Query, Response
 
 from dropshare_server.dependencies.auth import ActiveSession
 from dropshare_server.dependencies.context import Context
-from dropshare_server.dependencies.resources import DbSession, Storage
+from dropshare_server.dependencies.resources import DbSession, Resources, Storage
 from dropshare_server.services import blobs as blob_service
 from dropshare_server.services import trash as trash_service
 from dropshare_shared.schemas.envelope import DataResponse, ListResponse, PageQuery
@@ -25,10 +25,12 @@ def list_trash(
 
 @router.post("/{node_id}/restore", response_model=DataResponse[NodeOut])
 def restore(
-    node_id: uuid.UUID, current: ActiveSession, db: DbSession, ctx: Context
+    node_id: uuid.UUID, current: ActiveSession, db: DbSession, resources: Resources, ctx: Context
 ) -> DataResponse[NodeOut]:
     """Put an item back where it was (FR-TRASH-02)."""
-    node = trash_service.restore(db, ctx.as_actor(current.actor), current.user.id, node_id)
+    node = trash_service.restore(
+        db, resources.file_types, ctx.as_actor(current.actor), current.user.id, node_id
+    )
     return DataResponse(data=node)
 
 

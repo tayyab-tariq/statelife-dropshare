@@ -7,7 +7,7 @@ from fastapi.responses import StreamingResponse
 from dropshare_server.api.v1._content import content_response, parse_range
 from dropshare_server.dependencies.auth import ActiveSession
 from dropshare_server.dependencies.context import Context
-from dropshare_server.dependencies.resources import DbSession, Storage
+from dropshare_server.dependencies.resources import DbSession, Resources, Storage
 from dropshare_server.services import nodes as node_service
 from dropshare_shared.schemas.envelope import DataResponse, ListResponse, PageQuery
 from dropshare_shared.schemas.nodes import FolderCreateIn, NodeDeleteQuery, NodeOut, NodeUpdateIn
@@ -41,10 +41,17 @@ def list_children(
 
 @router.patch("/{node_id}", response_model=DataResponse[NodeOut])
 def update_node(
-    node_id: uuid.UUID, body: NodeUpdateIn, current: ActiveSession, db: DbSession, ctx: Context
+    node_id: uuid.UUID,
+    body: NodeUpdateIn,
+    current: ActiveSession,
+    db: DbSession,
+    resources: Resources,
+    ctx: Context,
 ) -> DataResponse[NodeOut]:
     """Rename and/or move (FR-FILE-04, FR-SYNC-10)."""
-    node = node_service.move_node(db, ctx.as_actor(current.actor), current.user.id, node_id, body)
+    node = node_service.move_node(
+        db, resources.file_types, ctx.as_actor(current.actor), current.user.id, node_id, body
+    )
     return DataResponse(data=node)
 
 

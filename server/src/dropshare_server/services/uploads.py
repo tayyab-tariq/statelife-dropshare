@@ -7,7 +7,9 @@ transaction that makes it visible commits. A blob whose commit fails is left for
 
 import hashlib
 import hmac
+import logging
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import NoReturn
@@ -27,6 +29,8 @@ from dropshare_server.services import changes as change_service
 from dropshare_server.services import nodes as node_service
 from dropshare_server.services.audit import AuditTarget
 from dropshare_server.services.context import CallContext
+from dropshare_server.services.file_policy import FileTypePolicy
+from dropshare_server.services.file_types import executable_kind
 from dropshare_server.storage.base import CommitResult, StorageBackend, new_blob_key
 from dropshare_shared.errors import ErrorCode
 from dropshare_shared.schemas.audit import AuditAction, AuditOutcome
@@ -40,6 +44,8 @@ from dropshare_shared.schemas.uploads import (
     UploadOut,
     UploadStatus,
 )
+
+logger = logging.getLogger(__name__)
 
 _MISSING_CHUNKS_SHOWN = 1000
 _EXPIRE_BATCH = 500
@@ -84,7 +90,12 @@ def _check_quota(owner: User, needed: int, reserved: int) -> None:
 
 
 def start(
-    session: Session, settings: Settings, user_id: uuid.UUID, body: UploadCreateIn
+    session: Session,
+    settings: Settings,
+    file_types: FileTypePolicy,
+    ctx: CallContext,
+    user_id: uuid.UUID,
+    body: UploadCreateIn,
 ) -> UploadOut:
     if body.size_bytes > settings.max_file_size_bytes:
         raise AppError(
@@ -100,6 +111,9 @@ def start(
             raise invalid("Only files can get new content.", "not_a_file", ["body", "node_id"])
         if node.revision != body.base_revision:
             raise node_service.revision_conflict(node.revision)
+        # A file stored before its type was banned keeps its content, but gets no new one
+        # (OQ-57). Checked before anything is locked or created, so no content is ever sent.
+        file_types.check_name(session, ctx, node.name or "", audit_service.node_target(node))
         namespace_id, parent_id, name = node.namespace_id, None, None
     elif body.parent_id is not None and body.name is not None:
         name, normalized = node_service.valid_name(body.name, ["body", "name"])
@@ -107,6 +121,7 @@ def start(
             session, user_id, body.parent_id, write=True, follow_mount=True
         )
         node_service.require_folder(parent)
+        file_types.check_name(session, ctx, name, _new_file_target(parent, name))
         existing = node_repository.get_live_child(
             session, parent.namespace_id, parent.id, normalized
         )
@@ -205,6 +220,8 @@ def chunk_limit(session: Session, user_id: uuid.UUID, upload_id: uuid.UUID, inde
 def put_chunk(
     session: Session,
     storage: StorageBackend,
+    file_types: FileTypePolicy,
+    ctx: CallContext,
     user_id: uuid.UUID,
     upload_id: uuid.UUID,
     index: int,
@@ -228,6 +245,16 @@ def put_chunk(
         raise AppError(
             400, ErrorCode.CHUNK_HASH_MISMATCH, "The chunk arrived corrupted; send it again."
         )
+    if index == 0:
+        # A program is refused as soon as its start arrives, so the rest is never sent. The
+        # check at completion still decides: it also sees a PE header beyond this chunk.
+        kind = executable_kind(lambda offset, length: data[offset : offset + length])
+        if kind is not None:
+            target = AuditTarget(type="upload", id=str(upload.id), name=upload.name)
+            locked = _require_upload(session, user_id, upload_id, lock=True)
+            _require_pending(locked, datetime.now(UTC))  # not completed or cancelled meanwhile
+            _cancel(session, storage, locked, None)
+            raise file_types.refuse_executable(session, ctx, target, kind)
     storage.write_chunk(upload.id, index, data)
 
 
@@ -235,6 +262,7 @@ def complete(
     session: Session,
     session_factory: sessionmaker[Session],
     storage: StorageBackend,
+    file_types: FileTypePolicy,
     ctx: CallContext,
     user_id: uuid.UUID,
     upload_id: uuid.UUID,
@@ -260,6 +288,12 @@ def complete(
             UploadIncompleteDetails(missing_chunks=missing[:_MISSING_CHUNKS_SHOWN]).model_dump(),
         )
     node, parent = _target(session, user_id, upload, lock=False)  # fail early, before assembling
+    target = _upload_target(upload, node, parent)
+    extension = file_types.banned_extension(target.name or "")
+    if extension is not None:
+        # The list may have changed since the upload started: no retry can succeed.
+        _cancel(session, storage, upload, None)
+        raise file_types.refuse_extension(session, ctx, target, extension)
     previous_size = node.size_bytes if node is not None else 0
     _check_quota(
         _owner(session, _namespace_of(node, parent), lock=False),
@@ -271,6 +305,10 @@ def complete(
     stored = storage.commit(upload.id, upload.chunk_count, blob_key)
     if stored.sha256 != upload.sha256 or stored.size_bytes != upload.size_bytes:
         _reject_mismatch(session, session_factory, storage, ctx, upload, blob_key, stored)
+    kind = executable_kind(_reader(storage, blob_key, stored.size_bytes))
+    if kind is not None:  # a program, whatever its name (FR-SAFE-02): the old version stays
+        _cancel(session, storage, upload, blob_key)
+        raise file_types.refuse_executable(session, ctx, target, kind)
     try:
         result = _record_version(session, ctx, user_id, upload, blob_key, stored, now)
     except AppError:
@@ -364,12 +402,7 @@ def _reject_mismatch(
 ) -> NoReturn:
     """Every chunk was verified, so the declared whole-file hash is wrong (the file changed
     while uploading): no retry can succeed. Cancel for good, then clean up."""
-    upload.status = UploadStatus.CANCELLED
-    # Committed here: the error raised below rolls back the request transaction, and a separate
-    # transaction would wait forever on the upload row lock this one holds.
-    session.commit()
-    storage.delete_blob(blob_key)
-    storage.discard_upload(upload.id)
+    _cancel(session, storage, upload, blob_key)
     audit_service.record_now(
         session_factory,
         ctx,
@@ -385,6 +418,50 @@ def _reject_mismatch(
         "start the upload again.",
         audited=True,
     )
+
+
+def _cancel(
+    session: Session, storage: StorageBackend, upload: UploadSession, blob_key: str | None
+) -> None:
+    """Cancel an upload no retry can complete, and remove what it stored.
+
+    Committed here: the error raised next rolls back the request transaction, and a separate
+    transaction (the audit row) would wait forever on the locks this one holds. Removing the
+    bytes is best effort: if it fails, gc-blobs and expire-uploads remove them later, and the
+    caller still reports why the upload was refused.
+    """
+    upload.status = UploadStatus.CANCELLED
+    session.commit()
+    try:
+        if blob_key is not None:
+            storage.delete_blob(blob_key)
+        storage.discard_upload(upload.id)
+    except OSError:
+        logger.warning("Couldn't remove the data of cancelled upload %s", upload.id, exc_info=True)
+
+
+def _new_file_target(parent: Node, name: str) -> AuditTarget:
+    """A file that doesn't exist yet is recorded by its folder and name (FR-AUDIT-02)."""
+    return AuditTarget(type="folder", id=str(parent.id), name=name)
+
+
+def _upload_target(upload: UploadSession, node: Node | None, parent: Node | None) -> AuditTarget:
+    if node is not None:
+        return audit_service.node_target(node)
+    assert parent is not None and upload.name is not None  # noqa: S101 - set by _target
+    return _new_file_target(parent, upload.name)
+
+
+def _reader(storage: StorageBackend, blob_key: str, size: int) -> Callable[[int, int], bytes]:
+    """`read(offset, length)` over a stored blob, for `executable_kind`."""
+
+    def read(offset: int, length: int) -> bytes:
+        end = min(offset + length, size) - 1
+        if offset >= size or end < offset:
+            return b""
+        return b"".join(storage.open_range(blob_key, offset, end))
+
+    return read
 
 
 def _record_version(
@@ -449,7 +526,7 @@ def _record_version(
         session,
         ctx,
         AuditAction.FILE_UPLOADED,
-        target=node_service.node_target(node),
+        target=audit_service.node_target(node),
         details={
             "size_bytes": stored.size_bytes,
             "new_version": change_type == ChangeType.MODIFIED,

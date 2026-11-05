@@ -11,7 +11,7 @@ from typing import TextIO
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
-from dropshare_server.models import AuditEvent, User
+from dropshare_server.models import AuditEvent, Node, User
 from dropshare_server.repositories import audit as audit_repository
 from dropshare_server.repositories import audit_retention as audit_retention_repository
 from dropshare_server.services.context import CallContext
@@ -28,6 +28,10 @@ class AuditTarget:
     type: str
     id: str
     name: str | None = None
+
+
+def node_target(node: Node) -> AuditTarget:
+    return AuditTarget(type="node", id=str(node.id), name=node.name)
 
 
 def user_target(user: User) -> AuditTarget:

@@ -9,6 +9,7 @@ from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from dropshare_server.core.config import Settings
+from dropshare_server.services.file_policy import FileTypePolicy
 from dropshare_server.services.releases import MinimumVersion
 from dropshare_server.storage.base import StorageBackend
 
@@ -20,6 +21,7 @@ class AppResources:
     session_factory: sessionmaker[Session]
     storage: StorageBackend
     minimum_version: MinimumVersion  # the effective minimum client version (FR-UPD-04)
+    file_types: FileTypePolicy  # banned file types (FR-SAFE-02)
 
 
 def get_resources(request: Request) -> AppResources:

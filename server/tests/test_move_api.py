@@ -14,6 +14,7 @@ from dropshare_server.core.errors import AppError
 from dropshare_server.models import AuditEvent, Change
 from dropshare_server.services import nodes as node_service
 from dropshare_server.services.context import Actor, CallContext
+from dropshare_server.services.file_policy import FileTypePolicy
 from dropshare_shared.schemas.audit import AuditAction, AuditActorType
 from dropshare_shared.schemas.nodes import NodeUpdateIn
 
@@ -288,6 +289,7 @@ def test_opposite_moves_at_the_same_time_cant_make_a_folder_cycle(
     b = _mkdir(api, alice, root, "B")
     b1 = _mkdir(api, alice, str(b["id"]), "b1")
     ctx = CallContext(Actor(AuditActorType.USER, user_id=user_id))
+    file_types = FileTypePolicy(frozenset(), session_factory)
     second: list[object] = []
 
     def move_b_into_a1() -> None:
@@ -295,6 +297,7 @@ def test_opposite_moves_at_the_same_time_cant_make_a_folder_cycle(
             try:
                 node_service.move_node(
                     session,
+                    file_types,
                     ctx,
                     user_id,
                     uuid.UUID(str(b["id"])),
@@ -309,6 +312,7 @@ def test_opposite_moves_at_the_same_time_cant_make_a_folder_cycle(
     with session_factory() as first:
         node_service.move_node(
             first,
+            file_types,
             ctx,
             user_id,
             uuid.UUID(str(a["id"])),

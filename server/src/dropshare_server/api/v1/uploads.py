@@ -17,9 +17,17 @@ router = APIRouter(prefix="/uploads", tags=["uploads"])
 
 @router.post("", status_code=201, response_model=DataResponse[UploadOut])
 def start_upload(
-    body: UploadCreateIn, current: ActiveSession, db: DbSession, resources: Resources
+    body: UploadCreateIn, current: ActiveSession, db: DbSession, resources: Resources, ctx: Context
 ) -> DataResponse[UploadOut]:
-    return DataResponse(data=upload_service.start(db, resources.settings, current.user.id, body))
+    upload = upload_service.start(
+        db,
+        resources.settings,
+        resources.file_types,
+        ctx.as_actor(current.actor),
+        current.user.id,
+        body,
+    )
+    return DataResponse(data=upload)
 
 
 @router.get("/{upload_id}", response_model=DataResponse[UploadOut])
@@ -36,7 +44,8 @@ async def put_chunk(
     request: Request,
     current: ActiveSession,
     db: DbSession,
-    storage: Storage,
+    resources: Resources,
+    ctx: Context,
 ) -> Response:
     """Raw chunk bytes in the body, their SHA-256 in X-Chunk-SHA256. Re-sending is safe."""
     user_id = current.user.id
@@ -50,7 +59,9 @@ async def put_chunk(
     await run_in_threadpool(
         upload_service.put_chunk,
         db,
-        storage,
+        resources.storage,
+        resources.file_types,
+        ctx.as_actor(current.actor),
         user_id,
         upload_id,
         index,
@@ -72,6 +83,7 @@ def complete_upload(
         db,
         resources.session_factory,
         resources.storage,
+        resources.file_types,
         ctx.as_actor(current.actor),
         current.user.id,
         upload_id,

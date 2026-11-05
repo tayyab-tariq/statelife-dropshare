@@ -3,7 +3,7 @@
 
 import hashlib
 import uuid
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import datetime
 
 from sqlalchemy import ColumnElement, Select, and_, delete, exists, func, or_, select, update
@@ -11,6 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
 from dropshare_server.models import FileVersion, Namespace, Node
+from dropshare_shared.schemas.nodes import NodeKind
 
 _LIVE_KEY_CONSTRAINT = "uq_nodes_live_key"
 _MOUNT_KEY_CONSTRAINT = "uq_nodes_mount_key"
@@ -173,6 +174,52 @@ def lock_live_descendant_ids(session: Session, node_id: uuid.UUID) -> list[uuid.
         found.extend(next_level)
         level = next_level
     return found
+
+
+def live_file_names_ending_with(
+    session: Session, folder_id: uuid.UUID, endings: Collection[str], limit: int
+) -> list[str]:
+    """Up to `limit` names of live files anywhere below `folder_id` whose normalized name ends
+    with one of `endings` (also normalized), one level at a time. Only matching files are read,
+    never every file of a large folder. Mounts aren't followed: their contents belong to the
+    shared folder, which a mount's move doesn't change."""
+    if not endings or limit <= 0:
+        return []
+    matches_ending = or_(
+        *(
+            Node.name_normalized.like("%" + _escape_like(ending), escape="\\")
+            for ending in sorted(endings)
+        )
+    )
+    found: list[str] = []
+    level = [folder_id]
+    while level and len(found) < limit:
+        next_level: list[uuid.UUID] = []
+        for start in range(0, len(level), _IN_LIST_LIMIT):
+            if len(found) >= limit:
+                break
+            batch = level[start : start + _IN_LIST_LIMIT]
+            live_children = and_(Node.parent_id.in_(batch), Node.trashed_at.is_(None))
+            found.extend(
+                name
+                for name in session.scalars(
+                    select(Node.name)
+                    .where(live_children, Node.kind == NodeKind.FILE, matches_ending)
+                    .order_by(Node.name_normalized, Node.id)
+                    .limit(limit - len(found))
+                )
+                if name is not None
+            )
+            next_level.extend(
+                session.scalars(select(Node.id).where(live_children, Node.kind == NodeKind.FOLDER))
+            )
+        level = next_level
+    return found[:limit]
+
+
+def _escape_like(value: str) -> str:
+    """`value` matched literally by LIKE ... ESCAPE '\\' (PostgreSQL and Oracle)."""
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def trash(

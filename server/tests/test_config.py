@@ -147,3 +147,47 @@ def test_purge_audit_uses_its_own_account_when_one_is_set() -> None:
 def test_purge_audit_account_needs_both_user_and_password() -> None:
     with pytest.raises(ValidationError):
         _app_settings(audit_purge_db_user="purger")
+
+
+def test_default_limits_follow_the_content_safety_decisions() -> None:
+    settings = _app_settings()
+
+    assert settings.max_file_size_bytes == 3 * 1024**3  # D18, NFR-SCALE-01
+    assert settings.banned_extensions == [
+        ".exe", ".dll", ".msi", ".bat", ".cmd", ".com", ".scr", ".ps1", ".vbs",
+        ".js", ".jse", ".wsf", ".hta", ".jar", ".lnk", ".reg", ".iso",
+    ]  # fmt: skip
+    assert not {".docm", ".xlsm", ".pptm"} & set(settings.banned_extensions)  # OQ-57 (6)
+
+
+def test_banned_extensions_are_kept_in_comparison_form() -> None:
+    settings = _app_settings(banned_extensions=[".EXE", ".Ps1"])
+
+    assert settings.banned_extensions == [".exe", ".ps1"]
+
+
+def test_banned_extensions_load_from_a_json_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, value in (("DB_HOST", "h"), ("DB_NAME", "n"), ("DB_USER", "u")):
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("DB_PASSWORD", "p")
+    monkeypatch.setenv("STORAGE_LOCAL_ROOT", "storage")
+    monkeypatch.setenv("TOKEN_SECRET", "s" * 32)
+    monkeypatch.setenv("BANNED_EXTENSIONS", '[".exe", ".dll"]')
+
+    assert _WithoutEnvFile().banned_extensions == [".exe", ".dll"]
+
+
+def test_an_empty_ban_list_is_allowed() -> None:
+    assert _app_settings(banned_extensions=[]).banned_extensions == []
+
+
+@pytest.mark.parametrize(
+    "values",
+    [["exe"], [".tar.gz"], ["*.exe"], [".ex/e"], [".exe "], ["."], [".exe", ".EXE"]],
+)
+def test_startup_refuses_an_invalid_ban_list(values: list[str]) -> None:
+    # NFR-OPS-03: a typo must stop the server, not silently allow the type.
+    with pytest.raises(ValidationError) as caught:
+        _app_settings(banned_extensions=values)
+
+    assert "banned_extensions" in {error["loc"][0] for error in caught.value.errors()}
