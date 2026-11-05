@@ -2,6 +2,7 @@
 
 import re
 import unicodedata
+from collections.abc import Collection
 from enum import StrEnum
 
 # Counted in UTF-16 code units, as NTFS does: a character outside the BMP (e.g. emoji) counts 2.
@@ -76,3 +77,36 @@ def validate_name(name: str) -> str:
 def normalize_name(name: str) -> str:
     """Comparison key for case-insensitive uniqueness: Unicode NFC, then casefold."""
     return unicodedata.normalize("NFC", unicodedata.normalize("NFC", name).casefold())
+
+
+def file_extension(name: str) -> str | None:
+    """The last extension of a name in the form the ban list compares (FR-SAFE-02): the dot and
+    what follows the last dot, NFC and casefolded. None when there is no dot or nothing follows
+    it. "invoice.pdf.EXE" gives ".exe"; ".exe" on its own is an extension too, as Windows reads it.
+    """
+    key = normalize_name(name)
+    dot = key.rfind(".")
+    if dot == -1 or dot == len(key) - 1:
+        return None
+    return key[dot:]
+
+
+def is_banned(name: str, banned: Collection[str]) -> bool:
+    """Whether a file name's last extension is in `banned`, whose entries are already in
+    `normalize_extension` form."""
+    extension = file_extension(name)
+    return extension is not None and extension in banned
+
+
+def normalize_extension(extension: str) -> str:
+    """A ban-list entry such as ".EXE" in comparison form (".exe"), or ValueError if it could
+    never match the last extension of a valid name."""
+    if not extension.startswith(".") or len(extension) < 2:
+        raise ValueError(f"{extension!r} must be a dot followed by the extension, like '.exe'")
+    if "." in extension[1:]:
+        raise ValueError(f"{extension!r} has more than one dot; only the last extension counts")
+    if not all(is_allowed_character(char) for char in extension):
+        raise ValueError(f"{extension!r} contains a character file names can't contain")
+    if extension.endswith(" "):
+        raise ValueError(f"{extension!r} ends with a space, which file names can't")
+    return normalize_name(extension)

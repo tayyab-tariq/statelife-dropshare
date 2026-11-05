@@ -2,8 +2,10 @@
 
 import uuid
 from datetime import datetime
+from enum import StrEnum
+from typing import Annotated
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from dropshare_shared.schemas.nodes import TolerantNodeKind
 
@@ -45,6 +47,25 @@ class FileTooLargeDetails(BaseModel):
     """413 FILE_TOO_LARGE (NFR-SCALE-01)."""
 
     max_file_size_bytes: int
+
+
+class FileTypeProblem(StrEnum):
+    BANNED_EXTENSION = "banned_extension"  # the file's own last extension is banned
+    EXECUTABLE_CONTENT = "executable_content"  # a program (PE, ELF, Mach-O), whatever its name
+    CONTAINS_BANNED_FILE = "contains_banned_file"  # a folder holding banned files (OQ-57)
+
+
+# A newer server may add a reason; clients show the message rather than failing.
+type TolerantFileTypeProblem = Annotated[FileTypeProblem | str, Field(union_mode="left_to_right")]
+
+
+class FileTypeNotAllowedDetails(BaseModel):
+    """422 FILE_TYPE_NOT_ALLOWED (FR-SAFE-02). `extension` is the banned one (None for
+    executable content); `file_names` are up to 10 banned files inside a folder."""
+
+    reason: TolerantFileTypeProblem
+    extension: str | None = None
+    file_names: list[str] = []
 
 
 class RangeNotSatisfiableDetails(BaseModel):

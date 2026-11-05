@@ -15,6 +15,7 @@ class ErrorCode(StrEnum):
     SHARE_NOT_ALLOWED = "SHARE_NOT_ALLOWED"  # nested share, own root, self, mount, trashed
     ALREADY_SHARED = "ALREADY_SHARED"  # this user or group already has access: change the role
     FILE_TOO_LARGE = "FILE_TOO_LARGE"
+    FILE_TYPE_NOT_ALLOWED = "FILE_TYPE_NOT_ALLOWED"  # banned extension or executable (FR-SAFE-02)
     CHUNK_HASH_MISMATCH = "CHUNK_HASH_MISMATCH"
     FILE_HASH_MISMATCH = "FILE_HASH_MISMATCH"
     UPLOAD_INCOMPLETE = "UPLOAD_INCOMPLETE"
