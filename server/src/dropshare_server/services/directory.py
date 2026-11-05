@@ -1,5 +1,7 @@
 """Finding people and groups to share with (FR-SHARE-08, OQ-24): any signed-in user can search
-all active users by name or email, and groups by name. Only what the share dialog shows."""
+all other active users by name or email, and groups by name. Only what the share dialog shows."""
+
+import uuid
 
 from sqlalchemy.orm import Session
 
@@ -29,13 +31,15 @@ def _query_text(query: SearchQuery) -> str:
     return text
 
 
-def search_users(session: Session, query: SearchQuery) -> list[UserHit]:
+def search_users(session: Session, query: SearchQuery, searcher_id: uuid.UUID) -> list[UserHit]:
+    """The searcher is never among the hits: you can't share with yourself."""
     text = _query_text(query)
     users = user_repository.search_active(
         session,
         login_prefix=_like_escaped(normalize_name(text)),
         name_prefix=_like_escaped(text.lower()),
         limit=SEARCH_RESULTS_MAX,
+        exclude_user_id=searcher_id,
     )
     return [UserHit(id=u.id, display_name=u.display_name, email=u.email) for u in users]
 

@@ -66,15 +66,23 @@ def list_all(session: Session) -> list[User]:
     return list(session.scalars(select(User).order_by(User.username_normalized, User.id)))
 
 
-def search_active(session: Session, login_prefix: str, name_prefix: str, limit: int) -> list[User]:
-    """Active users whose username or email starts with `login_prefix` (normalized), or whose
-    display name starts with `name_prefix` (lower-cased); both LIKE-escaped with a backslash.
-    The display name has no normalized column, so LOWER() scans: fine at our user counts."""
+def search_active(
+    session: Session,
+    login_prefix: str,
+    name_prefix: str,
+    limit: int,
+    exclude_user_id: uuid.UUID,
+) -> list[User]:
+    """Active users other than `exclude_user_id` whose username or email starts with
+    `login_prefix` (normalized), or whose display name starts with `name_prefix` (lower-cased);
+    both LIKE-escaped with a backslash. The display name has no normalized column, so LOWER()
+    scans: fine at our user counts."""
     return list(
         session.scalars(
             select(User)
             .where(
                 User.status == UserStatus.ACTIVE,
+                User.id != exclude_user_id,
                 or_(
                     User.username_normalized.like(f"{login_prefix}%", escape="\\"),
                     User.email_normalized.like(f"{login_prefix}%", escape="\\"),

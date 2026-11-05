@@ -1,6 +1,6 @@
 # StateLife DropShare — Requirements
 
-> **Status:** Draft v0.3 · **Last updated:** 2026-10-26
+> **Status:** Draft v0.3 · **Last updated:** 2026-11-05
 > **Product name:** StateLife DropShare ("DropShare" for short in the UI). Python packages use the `dropshare_` prefix.
 >
 > This document is the **source of truth** for what we are building. Every task, plan, and
@@ -79,7 +79,7 @@ Decisions agreed with the project owner. Changing any of these requires updating
 | D15 | Distribution                                     | **Installer, code signing, and auto-update** all required in v1.                                                                                                                                                                         |
 | D16 | Tooling                                          | **uv** (dependencies/workspace), **ruff** (lint/format), **mypy** (types), **pytest**. Monorepo with `client/`, `server/`, `shared/`.                                                                                                    |
 | D17 | Planning                                         | Requirements split into **v1** and **later phases**.                                                                                                                                                                                     |
-| D18 | Limits                                           | 10 GB max file, 50 GB default quota, 5 TB initial storage, shared content counts against the owner, 30-day trash, 1-year audit retention (OQ-4).                                                                                         |
+| D18 | Limits                                           | 3 GB max file (was 10 GB until 2026-11-05, OQ-54), 50 GB default quota, 5 TB initial storage, shared content counts against the owner, 30-day trash, 1-year audit retention (OQ-4).                                                                                         |
 | D19 | Platforms                                        | Server: **Linux in production**; developed on **macOS**. Desktop client: developed on **macOS**, tested and built on a **Windows** machine. All server code and the client's non-OS-specific code must run on macOS, Windows, and Linux. |
 | D20 | Product name                                     | **StateLife DropShare**.                                                                                                                                                                                                                 |
 
@@ -293,7 +293,7 @@ Acceptance:
 Acceptance:
 
 - These are never synced: `desktop.ini`, `Thumbs.db`, `~$*`, `*.tmp`, `.~lock.*`, `.DS_Store`, and the client's own temp folder.
-- Items that cannot be synced (invalid name for Windows, path too long, over quota) are listed in a "Can't sync" view with the reason and a suggested fix.
+- Items that cannot be synced (invalid name for Windows, path too long, over quota, file type not allowed or malware detected per FR-SAFE-01/03) are listed in a "Can't sync" view with the reason and a suggested fix.
 
 **FR-SYNC-08 — Mass-delete protection** `v1`
 Acceptance:
@@ -430,7 +430,7 @@ Acceptance:
 **FR-SHARE-08 — Find people and groups** `v1`
 Acceptance:
 
-- `GET /users/search?q=` returns active users matching the start of their display name, username, or email (case-insensitive), with only ID, display name, and email. Requires at least 2 characters and returns at most 20 results. Disabled users are never returned.
+- `GET /users/search?q=` returns active users matching the start of their display name, username, or email (case-insensitive), with only ID, display name, and email. Requires at least 2 characters and returns at most 20 results. Disabled users are never returned, and neither is the signed-in user (you can't share with yourself; OQ-53).
 - `GET /groups/search?q=` does the same for groups (ID, name, member count).
 - Both endpoints require authentication and are rate-limited like other API calls.
 
@@ -440,7 +440,7 @@ Acceptance:
 Acceptance — at minimum these are recorded:
 
 - Authentication: sign-in success/failure, sign-out, token refresh reuse detected, lockout/unlock, password change/reset.
-- Files: upload complete, download, create folder, rename, move, delete to trash, restore, permanent delete.
+- Files: upload complete, download, create folder, rename, move, delete to trash, restore, permanent delete, upload or rename refused for file type or malware (FR-SAFE-01/02).
 - Sharing: share created/changed/removed, shared folder accepted/left.
 - Admin: user/group created/changed/disabled, quota changed, audit export.
 - Authorization failures (access denied).
@@ -535,6 +535,48 @@ Acceptance:
 - Admins can list releases and withdraw one, so clients are no longer offered it.
 - Each user is on the stable or beta channel, set via the CLI (default stable). Beta users are offered the newer of the latest beta and the latest stable release (OQ-49).
 
+### 6.12 Content safety (SAFE)
+
+The server is internet-facing, and a shared folder passes every file in it to everyone with access.
+So the server checks file content before anyone else can see it. The server's check is the one that
+counts; the client checks too, but only so users find out early and files aren't uploaded just to be
+refused. Planned in roadmap milestone M15; OQ-57 must be answered before it starts.
+
+**FR-SAFE-01 — Malware scan before a file becomes visible** `v1` (NFR-SEC-11; OQ-54, OQ-55)
+Every uploaded file version is scanned for malware on the server before it becomes visible to anyone: the uploader's other devices, share recipients, or the uploader in the file browser.
+Acceptance:
+
+- A version becomes visible only after it scans clean (extends NFR-REL-03). An infected version is never visible or downloadable; its staged data is deleted, and the previous version (if any) stays current.
+- Every file is scanned in full: the 3 GB file limit (NFR-SCALE-01) is within the scanner's limits, and the scanner is configured so no file is skipped for size.
+- The uploading client receives `MALWARE_DETECTED` with the detection name. The item appears in "Can't sync" (FR-SYNC-07) with a plain-language reason, and the user is notified. DropShare doesn't change, move, or delete the local file (OQ-57).
+- Scanning applies to every upload path: the sync engine, in-app upload (FR-FILE-02), and new versions of individually shared files (FR-SHARE-03, OQ-32), in personal and shared folders alike.
+- Detections are audited as `file.malware_detected` with actor, device, source IP, file name, folder, and detection name, never file content (FR-AUDIT-02).
+- When the scanner is down, uploads wait (fail closed, OQ-55): nothing becomes visible unscanned, the client shows the item as waiting for the scan and checks again with backoff, and the upload completes once the scanner is back. Nothing is lost, and a waiting upload survives an app restart (FR-XFER-01).
+- `/health/ready` reports whether the scanner is reachable and how old its signatures are (NFR-OPS-02).
+- Scanning streams the content: the app server never loads a whole file into memory (§11). A small file still reaches other devices within NFR-PERF-02.
+
+**FR-SAFE-02 — Banned file types on the server** `v1` (OQ-56, OQ-57)
+The server refuses banned file types, so they are never stored and never reach anyone through a share.
+Acceptance:
+
+- The banned extensions are one list for everyone in server configuration, validated at startup (NFR-OPS-03). Changing it doesn't need a client release.
+- The list is enforced on every write that creates or names a file, in personal and shared folders, for owners and editors alike: upload start (before any content is sent), upload completion, rename, and move. A refused request returns `FILE_TYPE_NOT_ALLOWED`, naming the extension.
+- Extensions are matched case-insensitively on the last extension of the normalized name (NFR-COMPAT-02), so `invoice.pdf.EXE` counts as `.exe`.
+- Before a version becomes visible, the server checks its first bytes. Executable content (Windows PE, ELF, Mach-O) is refused as `FILE_TYPE_NOT_ALLOWED` whatever the extension, so a renamed `.exe` is still caught.
+- Banned files never reach the server, so a shared folder holds only allowed types and sharing needs no separate check.
+- Refusals are audited as `file.type_blocked` with actor, device, source IP, file name, and extension.
+- Files already stored when a type is banned are handled as set by OQ-57.
+
+**FR-SAFE-03 — Banned files on the client** `v1` (OQ-56, OQ-57)
+Acceptance:
+
+- The client gets the current banned list from the server and checks names before uploading, so a banned file is never uploaded just to be refused. The server's answer still decides (FR-SAFE-02).
+- Banned files in the sync folder stay where they are, untouched. DropShare never deletes, moves, renames, or quarantines them (OQ-57). They are listed in "Can't sync" with the reason (for example "This file type isn't allowed: .exe") and a suggested fix, and the "can't sync" notification is shown (FR-CLIENT-02, OQ-43). DropShare can't stop other programs saving files into the sync folder; it only declines to sync them.
+- A refused upload (type or malware) is retried only after the local file changes, so there is no upload loop. The server keeps its last good version, and the client doesn't overwrite the local file with it.
+- If a local rename gives a synced file a banned extension, the server item is never deleted. It keeps its old name, the local file is listed in "Can't sync", and renaming it back resumes syncing (NFR-REL-01).
+- In-app upload (FR-FILE-02) checks the selection before copying. Banned files aren't copied into the sync folder, the rest are, and the summary lists what was skipped and why.
+- The same rules apply to editors in shared folders. Viewers can't upload (FR-SHARE-05).
+
 ---
 
 ## 7. Non-functional requirements
@@ -553,7 +595,7 @@ Acceptance:
 | NFR-SEC-08 | Encryption at rest via encrypted storage volumes (NAS/SAN or object store). Oracle TDE only if licensed (OQ-10).                                                                | v1        |
 | NFR-SEC-09 | Secrets (DB password, token secret, storage keys) come from environment/secret store, validated at startup. Never committed.                                                    | v1        |
 | NFR-SEC-10 | Dependencies pinned via `uv.lock`; vulnerability scan (`pip-audit` or equivalent, needs approval) before each release.                                                          | v1        |
-| NFR-SEC-11 | Antivirus / malware scanning of uploads.                                                                                                                                        | P2        |
+| NFR-SEC-11 | Antivirus / malware scanning of uploads (FR-SAFE-01; moved from P2, OQ-54).                                                                                                     | v1        |
 | NFR-SEC-12 | MFA (TOTP).                                                                                                                                                                     | P2 (OQ-9) |
 
 ### 7.2 Performance and scale (PERF, SCALE)
@@ -567,7 +609,7 @@ Values confirmed (OQ-4). All limits are configuration, not code constants.
 | NFR-PERF-03  | The UI thread is never blocked by network, disk, or hashing work; the window stays responsive with 200,000 files in the sync folder.                                                  | v1          |
 | NFR-PERF-04  | Large transfers use at least 80% of available bandwidth on a stable connection.                                                                                                       | v1          |
 | NFR-PERF-05  | Initial sync of 50,000 files / 50 GB completes without user intervention and survives restarts mid-way.                                                                               | v1          |
-| NFR-SCALE-01 | Maximum file size: **10 GB** (configurable).                                                                                                                                          | v1          |
+| NFR-SCALE-01 | Maximum file size: **3 GB** (configurable; was 10 GB, lowered so every file fits the malware scanner, OQ-54). No limit on folder size.                                              | v1          |
 | NFR-SCALE-02 | Up to 200,000 files per user (own + mounted shared folders).                                                                                                                          | v1          |
 | NFR-SCALE-03 | Default quota: **50 GB per user**, adjustable per user by admins.                                                                                                                     | v1          |
 | NFR-SCALE-04 | Initial storage provisioning: **5 TB usable**, expandable, alert at 75% full. (100 users × 50 GB is the worst case; typical use is 30–50% of quota, and trash/versions add overhead.) | v1          |
@@ -639,7 +681,7 @@ increasing integer) and UTC timestamps.
 | **NamespaceMember**         | Who can access a shared namespace                                                           | namespace, user or group, role (viewer/editor)                                                                                                                    |
 | **Mount**                   | A recipient's accepted shared folder in their tree                                          | user, namespace, mount name, accepted at                                                                                                                          |
 | **Node**                    | A file or folder                                                                            | namespace, parent, name, normalized name, kind, size, content hash, current version, revision (for optimistic concurrency), created/modified by/at, trashed at/by |
-| **FileVersion**             | One stored version of a file's content                                                      | node, blob key, size, SHA-256, created by/at                                                                                                                      |
+| **FileVersion**             | One stored version of a file's content                                                      | node, blob key, size, SHA-256, created by/at, scanned at and scanner signature version (FR-SAFE-01)                                                               |
 | **FileShare**               | A single file shared with users/groups (FR-SHARE-03)                                        | node, user or group, role                                                                                                                                         |
 | **UploadSession**           | In-progress resumable upload                                                                | user, target (parent + name, or node + base revision), size, chunk size, received chunks, expected hash, status, expires                                          |
 | **Change**                  | Append-only journal of node changes per namespace; its increasing ID is the sync cursor     | namespace, node, change type, snapshot of node fields, actor, time                                                                                                |
@@ -685,7 +727,7 @@ Every request sends `X-Client-Version`; every response includes `X-Request-ID`.
 Error codes are stable SCREAMING_SNAKE_CASE strings defined in `shared/`, for example
 `VALIDATION_ERROR`, `UNAUTHENTICATED`, `FORBIDDEN`, `NOT_FOUND`, `NAME_CONFLICT`,
 `REVISION_CONFLICT`, `QUOTA_EXCEEDED`, `FILE_TOO_LARGE`, `CHUNK_HASH_MISMATCH`, `FILE_HASH_MISMATCH`,
-`ACCOUNT_LOCKED`, `UPGRADE_REQUIRED`, `RATE_LIMITED`.
+`ACCOUNT_LOCKED`, `UPGRADE_REQUIRED`, `RATE_LIMITED`, `FILE_TYPE_NOT_ALLOWED`, `MALWARE_DETECTED` (FR-SAFE-01/02).
 
 ---
 
@@ -770,7 +812,7 @@ build installer (Inno Setup) → sign installer → publish release to the serve
 | BL-07 | File previews (images, PDF, Office thumbnails)                                                      | P2        |
 | BL-08 | macOS client                                                                                        | P2        |
 | BL-09 | Windows Explorer integration (status overlay icons, right-click "Share")                            | P2        |
-| BL-10 | Malware scanning of uploads                                                                         | P2        |
+| BL-10 | Malware scanning of uploads: moved to v1 as FR-SAFE-01 (OQ-54, roadmap M15)                         | v1        |
 | BL-11 | Proxy configuration in the client                                                                   | P2        |
 | BL-12 | Metrics and dashboards                                                                              | P2        |
 | BL-13 | Editors can re-share; share expiry dates                                                            | P2        |
@@ -808,6 +850,7 @@ These need an answer from the project owner. Items marked **Blocks** stop the na
 | **OQ-11** | Which CI/source-control platform do you use (GitHub, GitLab, Azure DevOps, other)? We need a **Windows runner** for Windows-only tests and installer builds, plus a Linux runner for server tests.     | Any platform with hosted Windows and Linux runners.                    | Automated Windows builds (manual builds on the Windows machine work until then)             |
 | **OQ-9**  | MFA is planned for P2. Given the server is internet-facing, do you want to pull it into v1?                                                                                                            | Pull into v1 if the pilot includes users outside the office.           | —                                                                                           |
 | **OQ-10** | Encryption at rest: is Oracle Advanced Security (TDE) licensed, or do we rely on encrypted storage volumes only?                                                                                       | Encrypted volumes for v1; TDE if already licensed.                     | —                                                                                           |
+| **OQ-57** | Content-safety assumptions to confirm (FR-SAFE-01 … 03). (1) DropShare never deletes, moves, or quarantines a local file because of a ban or a detection; it only declines to sync it. (2) Files already on the server when a type is banned, or larger than the new 3 GB limit, stay and can still be downloaded; new versions of them, and renames or moves of them, must pass the checks. (3) The ban list doesn't look inside archives, though ClamAV scans their contents; password-protected archives can't be scanned and are accepted. (4) Stored files aren't rescanned when signatures update, and downloads aren't scanned again. (5) The scan runs after `POST /uploads/{id}/complete`, with the upload in a "scanning" state that the client checks, because a 3 GB scan would outlast HTTP timeouts; this changes the upload API and the client's upload flow. (6) The starting ban list: `.exe .dll .msi .bat .cmd .com .scr .ps1 .vbs .js .jse .wsf .hta .jar .lnk .reg .iso`, plus macro-enabled Office `.docm .xlsm .pptm`? (7) Engine: ClamAV (`clamd`) in its own container beside the API (OQ-50), with signatures kept current by `freshclam`. The server talks to it over its socket protocol using only the standard library, so no new Python package. ClamAV is GPL but runs as a separate service and isn't linked into our code. The new container needs approval as new infrastructure. | Confirm (1) … (5) and (7). For (6), the list without the macro-enabled Office types, which ClamAV already checks for known macro malware and which some teams use. Revisit (3) and (4) after the pilot. | Roadmap M15 (FR-SAFE-01 … 03) |
 
 ### Resolved
 
@@ -857,6 +900,11 @@ These need an answer from the project owner. Items marked **Blocks** stop the na
 | OQ-49 | Distribution (FR-UPD-01 … 05): the installer doesn't create the start-at-sign-in entry (OQ-44) but removes it on uninstall; removing app data at uninstall also deletes the Credential Manager entry. `releases publish` refuses an installer whose Authenticode signature or publisher doesn't verify (it runs on the Windows server, OQ-48); `releases list` and `releases withdraw` exist. The channel is per user (`users set-channel`, default stable) and reported by `GET /me`; the server picks it, the client doesn't pass it. `/auth/refresh` and `/client/releases/*` skip the minimum-version check (still signed in), so a client that is too old can fetch its update. The effective minimum version is the higher of `MIN_CLIENT_VERSION` and the minimum of the latest published stable release. Installers must be signed by `RELEASE_PUBLISHER` with a certificate whose SHA-256 is pinned (`RELEASE_CERT_SHA256` on the server, `cert_sha256` in the client build), and their version resource must equal the release version (audit 2026-11-02-0544). Clients from before the updater (0.2.0) are upgraded by hand; `--min-supported` stays at 0.2.0 until they are. | 2026-11-02 |
 | OQ-50 | Production deployment (interim, OQ-48): Docker Compose (`docker-compose.yml`) on a Windows server with Docker Desktop, deployed by GitHub Actions on every push to `main` after ruff, mypy and the shared/server tests pass on Linux (self-hosted runner labelled `dropshare`). The database is **PostgreSQL 16 in a container** for now, a change to D3: the Oracle code path stays, but moving back needs a data migration as well as the settings change, and server tests must pass on Oracle again first. Postgres is published on the host's loopback only, for the host's admin CLI (`releases publish` needs Windows). File storage is the local filesystem backend on a server folder (`E:\DropShareData`), never created by the deploy. The API listens on port 5009 for the existing nginx on another machine: on loopback until the Windows firewall allows that port from the proxy only, then on the server's address (`DROPSHARE_API_BIND`, NFR-SEC-01). Only `main` deploys; the `dropshare-production` environment is limited to `main`, because the runner can control the host. A `jobs` container runs the NFR-REL-05 jobs at each deploy and then daily. Known gaps, accepted for now: **no backups** (NFR-REL-06 not met; backups and a tested restore are needed before go-live); **the app connects as the PostgreSQL superuser**, so DB grants don't enforce FR-AUDIT-03 and §12's separate schema owner and app user don't exist yet; **nginx → app is plain HTTP** across the internal network (NFR-SEC-01 relies on that network being trusted until TLS is added on the hop). Runbook: `docs/deploy/windows-docker.md`. | 2026-11-03 |
 | OQ-51 | Server address (FR-CLIENT-05): installer builds, test builds included, don't offer "Use a different server" and refuse to sign in anywhere but the built-in address; only a run from source can choose the server. An installed client still keeps the address it first signed in with, so a later build with another built-in address doesn't move it off the server its sync folder belongs to; moving such a client to another server means a clean reinstall. Replaces "can be overridden in an advanced setting for testing". | 2026-11-04 |
+| OQ-52 | "Active users" in the share dialog means **enabled accounts** (everyone who can sign in). There is no online or recently-active status. | 2026-11-05 |
+| OQ-53 | The share dialog keeps type-to-search (FR-SHARE-08: at least 2 characters, at most 20 results); it doesn't list everyone before you type. The signed-in user is never among the results. | 2026-11-05 |
+| OQ-54 | Malware scanning moves from P2 to **v1** (FR-SAFE-01, NFR-SEC-11, BL-10) as its own milestone (roadmap M15) with rigorous testing. The maximum file size is lowered from 10 GB to **3 GB** (D18, NFR-SCALE-01) so every file fits the scanner; folders have no size limit. Files saved straight into the sync folder are checked per file. | 2026-11-05 |
+| OQ-55 | When the malware scanner is down, uploads **wait** (fail closed): nothing becomes visible unscanned, the client shows the item as waiting for the scan, and the upload completes once the scanner is back (FR-SAFE-01). | 2026-11-05 |
+| OQ-56 | File-type policy: one **banned list** of extensions for everyone, in server configuration (not an allowlist, not per user or folder). The server also checks content, so executables (Windows PE, ELF, Mach-O) are refused whatever their extension and a renamed `.exe` is caught (FR-SAFE-02/03). | 2026-11-05 |
 
 ## 16. Glossary
 

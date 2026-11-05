@@ -23,7 +23,8 @@ Every milestone starts with `/plan` and ends with `/audit` and `/commit`.
 | M11 App completeness | ✅ Done (Windows pass deferred, see below) |
 | M12 Admin and security | ✅ Done (staging, Oracle and Windows checks deferred, see below) |
 | M13 Distribution | In progress |
-| M14 Ops and go-live | Planned |
+| M14 Ops and go-live | Planned (after M15) |
+| M15 Content safety | Planned, before go-live; blocked by OQ-57 |
 
 ### Deferred checks (run once the app is complete)
 
@@ -232,6 +233,64 @@ Acceptance:
 - Server tests cover publish rules (higher version, checksum, signature refused), withdrawn releases hidden, the channel per user, ranged installer download, and a too-old client still reaching the release endpoints.
 - Updater tests cover resume, a hash mismatch, a bad signature, and the check repeated just before install; pytest-qt covers the update UI states.
 - On Windows: install an older test-signed build, publish a newer one, and the client updates with sync state intact; uninstall keeps the sync folder.
+
+### M15 — Content safety · large
+
+Comes before M14: go-live waits for it, because the server is internet-facing and shares spread files to everyone with access.
+
+**Requirements:** FR-SAFE-01 (malware scan before a version is visible, fail closed), FR-SAFE-02 (banned extensions and executable-content check on the server), FR-SAFE-03 (banned files on the client), NFR-SEC-11, NFR-SCALE-01 and D18 (3 GB maximum file), FR-AUDIT-01 (refusal and detection events), FR-SYNC-07 (Can't sync reasons), NFR-OPS-02 (scanner in `/health/ready`). Decisions OQ-54 … OQ-56.
+
+**Blocked by:** OQ-57 (assumptions to confirm, the starting ban list, scan-after-complete API shape, and approval of the ClamAV container).
+
+**Scope:**
+- **Infrastructure:** a `clamav` service in `docker-compose.yml` (`clamd` + `freshclam`, signatures on a volume), on the internal network only, with limits set for 3 GB files; dev setup documented beside `docs/postgres-setup.md`.
+- **Server:**
+  - `MAX_FILE_SIZE` default 3 GB;
+  - banned-extension setting validated at startup;
+  - checks at upload start, completion, rename, and move;
+  - first-bytes executable check;
+  - a `Scanner` protocol with a `clamd` implementation (stdlib socket, INSTREAM) and a fake for tests;
+  - upload "scanning" state; a version is visible only when clean;
+  - error codes `FILE_TYPE_NOT_ALLOWED` and `MALWARE_DETECTED`;
+  - audit events;
+  - scanner reachability and signature age in `/health/ready`;
+  - the banned list served to clients.
+- **Client:**
+  - pre-upload name check against the server's list;
+  - "waiting for virus scan" in Transfers;
+  - "Can't sync" reasons and notifications;
+  - no retry until the file changes;
+  - a rename to a banned extension never trashes the server item;
+  - in-app upload skips banned files and reports them.
+
+**Done when (rigorous testing):**
+- **Server, banned types** (TestClient, table-driven), each refused with `FILE_TYPE_NOT_ALLOWED` and an audit row:
+  - every banned extension, in mixed case;
+  - double extensions (`a.pdf.exe`); names with trailing dots or spaces;
+  - at upload start, before any chunk is accepted; at completion; by rename; by move into another folder or namespace;
+  - by an owner and by an editor of a shared folder;
+  - allowed look-alikes (`.exe.pdf`, `exe.txt`, names with no extension) accepted.
+- **Server, content check:** a PE, an ELF, and a Mach-O file renamed to `.pdf`/`.txt`/`.docx` are refused at completion, and the previous version stays current. Office, PDF, image, zip, and empty files pass. A table-driven test of extension parsing covers Unicode, NFC/NFD forms, dots, and the 255-character limit (no new test dependency).
+- **Server, malware** (fake scanner):
+  - a clean file becomes visible; an infected one never does, and its staged blob is deleted;
+  - an infected new version leaves the old version current;
+  - the uploader gets `MALWARE_DETECTED`; `file.malware_detected` is audited without content;
+  - every upload path is covered: sync upload, in-app upload, a new version of an individually shared file;
+  - with the scanner down, the upload stays "scanning", nothing is visible, and the upload completes when the scanner returns;
+  - a scanner timeout or a reply it can't parse also fails closed;
+  - two uploads of the same node racing through scanning keep revisions correct (NFR-REL-04);
+  - completing a retried upload twice doesn't scan twice or duplicate versions.
+- **Server, real ClamAV** (marker `clamav`, run in CI against the container): the EICAR test file is detected; EICAR inside a zip is detected; a clean file of 3 GB is scanned in full within the timeout; a 3 GB + 1 byte file is refused with `FILE_TOO_LARGE` before upload; `/health/ready` fails when `clamd` is stopped.
+- **Server, limits and health:** every size check uses the new 3 GB maximum; startup refuses an invalid banned list; tests pass on PostgreSQL and on Oracle (OQ-25).
+- **Sync engine** (table-driven, NFR-REL-01 matrix extended):
+  - a banned file created locally; a synced file renamed locally to a banned extension, then renamed back;
+  - malware detected on a first upload and on a new version;
+  - scanner down across an app restart; a banned file in a shared folder by an editor.
+  - Each asserts: no server item trashed, no local file changed, moved, or deleted, no upload loop, and the right "Can't sync" entry.
+- **Client UI** (pytest-qt): "waiting for virus scan" in Transfers; the Can't sync reasons; in-app upload of a mixed selection copies only allowed files and lists the skipped ones; the four view states.
+- **Security review:** `security-reviewer` and `sync-reviewer` pass with no open blockers; the audit report lists the test matrix above.
+- **Performance:** a small file still meets NFR-PERF-02 with scanning on (`scripts/perf`).
+- **Windows check list:** a banned file and an EICAR file in the sync folder (Defender may remove EICAR first; the test uses a Defender exclusion folder), a rename to `.exe` on NTFS, 150% scaling and Narrator on the new messages.
 
 ### M14 — Ops and go-live · medium
 
