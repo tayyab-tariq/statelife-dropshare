@@ -24,7 +24,7 @@ Every milestone starts with `/plan` and ends with `/audit` and `/commit`.
 | M12 Admin and security | ✅ Done (staging, Oracle and Windows checks deferred, see below) |
 | M13 Distribution | In progress |
 | M14 Ops and go-live | Planned (after M15) |
-| M15 Content safety | Planned, before go-live; blocked by OQ-57 |
+| M15 Content safety | Planned, before go-live (OQ-57 decided) |
 
 ### Deferred checks (run once the app is complete)
 
@@ -240,7 +240,7 @@ Comes before M14: go-live waits for it, because the server is internet-facing an
 
 **Requirements:** FR-SAFE-01 (malware scan before a version is visible, fail closed), FR-SAFE-02 (banned extensions and executable-content check on the server), FR-SAFE-03 (banned files on the client), NFR-SEC-11, NFR-SCALE-01 and D18 (3 GB maximum file), FR-AUDIT-01 (refusal and detection events), FR-SYNC-07 (Can't sync reasons), NFR-OPS-02 (scanner in `/health/ready`). Decisions OQ-54 … OQ-56.
 
-**Blocked by:** OQ-57 (assumptions to confirm, the starting ban list, scan-after-complete API shape, and approval of the ClamAV container).
+**Decided:** OQ-57 (2026-11-05): assumptions confirmed, the starting ban list without macro-enabled Office types, scan after `complete` with a "scanning" upload state, and the ClamAV container approved.
 
 **Scope:**
 - **Infrastructure:** a `clamav` service in `docker-compose.yml` (`clamd` + `freshclam`, signatures on a volume), on the internal network only, with limits set for 3 GB files; dev setup documented beside `docs/postgres-setup.md`.
