@@ -83,6 +83,46 @@ def test_at_most_twenty_results(
     assert len(_search(api, alice, "users", "temp")) == 20
 
 
+def test_the_signed_in_user_never_finds_themselves(
+    api: TestClient, sign_in: SignIn, session_factory: sessionmaker[Session]
+) -> None:
+    alice = sign_in()  # username alice, display name Alice, alice@example.com
+    _person(session_factory, "akhan", "Alicia Khan", "akhan@example.com")
+
+    expected = {
+        "al": ["Alicia Khan"],  # her own display name and username match too
+        "ALICE": [],  # her username, any case
+        "alice@example.com": [],  # her email
+    }
+    for q, names in expected.items():
+        assert [h["display_name"] for h in _search(api, alice, "users", q)] == names, q
+
+
+def test_other_users_still_find_the_one_who_is_excluded_for_themselves(
+    api: TestClient, sign_in: SignIn
+) -> None:
+    alice = sign_in()
+    bob = sign_in("bob")
+
+    assert [h["display_name"] for h in _search(api, bob, "users", "ali")] == ["Alice"]
+    assert _search(api, alice, "users", "ali") == []
+
+
+def test_excluding_the_searcher_does_not_cost_a_result(
+    api: TestClient, sign_in: SignIn, session_factory: sessionmaker[Session]
+) -> None:
+    # "Temp" sorts before "Temp 00": were the searcher dropped after the 20-row limit, only 19
+    # others would come back.
+    searcher = sign_in("temp")
+    for number in range(20):
+        _person(session_factory, f"temp{number:02}", f"Temp {number:02}", f"t{number}@example.com")
+
+    hits = _search(api, searcher, "users", "temp")
+
+    assert len(hits) == 20
+    assert "Temp" not in [h["display_name"] for h in hits]
+
+
 def test_like_wildcards_in_the_query_match_literally(
     api: TestClient, sign_in: SignIn, session_factory: sessionmaker[Session]
 ) -> None:

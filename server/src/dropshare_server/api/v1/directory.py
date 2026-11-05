@@ -14,9 +14,9 @@ router = APIRouter(tags=["sharing"])
 # Not paginated: at most SEARCH_RESULTS_MAX hits; the user types more to narrow it down.
 @router.get("/users/search", response_model=DataResponse[list[UserHit]])
 def search_users(
-    query: Annotated[SearchQuery, Query()], _current: ActiveSession, db: DbSession
+    query: Annotated[SearchQuery, Query()], current: ActiveSession, db: DbSession
 ) -> DataResponse[list[UserHit]]:
-    return DataResponse(data=directory_service.search_users(db, query))
+    return DataResponse(data=directory_service.search_users(db, query, current.user.id))
 
 
 @router.get("/groups/search", response_model=DataResponse[list[GroupHit]])
