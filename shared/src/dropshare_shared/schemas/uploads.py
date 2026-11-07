@@ -17,7 +17,13 @@ SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 class UploadStatus(StrEnum):
     PENDING = "pending"
+    # Assembled and verified, waiting for the malware scan (FR-SAFE-01). Every chunk counts as
+    # received; ask `complete` again until it answers with the file or the refusal.
+    SCANNING = "scanning"
     COMPLETED = "completed"
+    # Refused after it was assembled: malware, or the target changed while it was scanned.
+    # `complete` answers with the reason; send the file again only once it has changed.
+    REJECTED = "rejected"
     CANCELLED = "cancelled"
     EXPIRED = "expired"  # set by the expire-uploads job (NFR-REL-05)
 

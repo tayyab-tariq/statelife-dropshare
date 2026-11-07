@@ -68,6 +68,12 @@ class FileTypeNotAllowedDetails(BaseModel):
     file_names: list[str] = []
 
 
+class MalwareDetectedDetails(BaseModel):
+    """422 MALWARE_DETECTED (FR-SAFE-01): the scanner's name for what it found."""
+
+    detection: str
+
+
 class RangeNotSatisfiableDetails(BaseModel):
     """416 RANGE_NOT_SATISFIABLE: the file is this long (FR-XFER-02). Also in Content-Range."""
 
