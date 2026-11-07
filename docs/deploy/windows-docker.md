@@ -10,6 +10,8 @@ deployed by a self-hosted runner on the server (`.github/workflows/deploy.yml`).
 | `dropshare-postgres-1` | PostgreSQL 16. Data in the Docker volume `dropshare_dropshare-postgres`. Port 5432 on the server's loopback only. |
 | `dropshare-api-1` | Runs the migrations, then the API (4 workers) on port 5009: loopback only until `DROPSHARE_API_BIND` is set (step 5). |
 | `dropshare-jobs-1` | Runs the cleanup jobs (NFR-REL-05) at each deploy and then daily. |
+| `dropshare-clamav-1` | ClamAV (FR-SAFE-01): `clamd` scans uploads, `freshclam` fetches new signatures every 2 hours. Signatures in the volume `dropshare_dropshare-clamav`. No published port: only the API and the scanner reach it. |
+| `dropshare-scanner-1` | The scan worker: scans uploads over 64 MiB, and any sent while ClamAV was down, then makes them visible. |
 | `dropshare-watchdog-1` | Restarts the API if its health check fails. |
 
 Users' files live in `E:\DropShareData`, a normal Windows folder mounted into the containers.
@@ -33,6 +35,10 @@ Known gaps, recorded in requirements OQ-50:
   only when the volume is first created. Change it in the database first
   (`ALTER USER <DROPSHARE_POSTGRES_USER> PASSWORD '…'`), then in GitHub.
 - **Never empty or move `E:\DropShareData`** while the stack runs.
+- **Never raise `MAX_FILE_SIZE_BYTES` above 2 GiB.** ClamAV can't scan more than 2 GiB of a file,
+  so larger files would all be refused as unscannable (OQ-58 (4)). The default is 2,000 MiB.
+- **There is no way to turn malware scanning off**, and none should be added (OQ-58 (1)). While
+  ClamAV is down, uploads wait and finish once it is back.
 
 ## One-time server setup
 
@@ -48,6 +54,17 @@ Known gaps, recorded in requirements OQ-50:
    someone signs in, unless the server signs in automatically.
 6. Check, in PowerShell: `docker info --format '{{.OperatingSystem}} / {{.OSType}}'` prints
    `Docker Desktop / linux`.
+7. Memory: the containers may use up to about 12 GB together (ClamAV alone needs about 4 GB while
+   it reloads signatures). With the WSL 2 backend, Docker Desktop's share is set in
+   `%UserProfile%\.wslconfig`:
+
+   ```ini
+   [wsl2]
+   memory=12GB
+   ```
+
+   Then `wsl --shutdown` and restart Docker Desktop. Check: `docker info --format '{{.MemTotal}}'`
+   shows about 12 GB.
 
 ### 2. Tools and folders
 
@@ -138,6 +155,16 @@ one HSTS header; replace `X-Forwarded-For` with `$remote_addr` and set `X-Forwar
 `client_max_body_size 16m` with request buffering off; `proxy_read_timeout 90s`; the rate limits
 in `nginx.conf.example`.
 
+### 8. Outbound access for ClamAV
+
+`freshclam` downloads signatures over HTTPS from `database.clamav.net` (a CDN). If the server's
+outbound traffic is filtered, ask for that host to be allowed on port 443. Without it, scanning
+continues with old signatures, and the API log warns once they are older than 48 hours.
+
+The first deploy downloads about 300 MB of signatures and loads them, which takes a few minutes.
+Until then `/health/ready` reports `"scanner": "failed"` and uploads wait (OQ-55); they finish on
+their own once ClamAV is up. Setup details and troubleshooting: `docs/clamav-setup.md`.
+
 ## Deploying
 
 Merge a pull request into `main`. The workflow tests, then runs `docker compose up -d --build` on
@@ -167,8 +194,21 @@ leave the variable at `[]` if you can't confirm it.
 docker ps --filter label=com.docker.compose.project=dropshare   # status
 docker logs --tail 100 dropshare-api-1                         # API log (JSON lines)
 docker logs --tail 50 dropshare-jobs-1                         # last job runs
+docker logs --tail 50 dropshare-scanner-1                      # uploads waiting for the scanner
+docker logs --tail 50 dropshare-clamav-1                       # clamd and freshclam
 docker restart dropshare-api-1
 ```
+
+Malware scanning (FR-SAFE-01):
+
+- `curl.exe -s http://127.0.0.1:5009/health/ready` shows `"scanner": "ok"` and
+  `signatures_age_hours`. Normally under 24; over 48 means `freshclam` can't download (step 8).
+- Detections are in the audit log as `file.malware_detected`, with user, device, file name,
+  folder and the detection name:
+  `docker exec dropshare-api-1 dropshare-server audit export --action file.malware_detected --output /tmp/detections.csv`,
+  then `docker cp dropshare-api-1:/tmp/detections.csv .`.
+- If the scanner log repeats "waits for the malware scanner", check `dropshare-clamav-1`. Nothing
+  is lost meanwhile: the files wait and finish once ClamAV answers.
 
 Admin CLI (FR-ADMIN-01), for everything except publishing releases:
 
@@ -210,11 +250,17 @@ Keep that clone on the same commit as `main`, then:
 
 ## Windows checks after the first deploy
 
-1. The deploy is green and `/health/ready` on port 5009 reports database and storage `ok`.
-2. Upload a file of several GB from a client (through the proxy, or on the server against
+1. The deploy is green and `/health/ready` on port 5009 reports database, storage and scanner
+   `ok` (after the first signature download, step 8).
+2. Upload a file of nearly 2,000 MiB from a client (through the proxy, or on the server against
    `http://127.0.0.1:5009` while `DROPSHARE_API_BIND` is unset). It completes, and a new file appears under
    `E:\DropShareData\blobs`. This proves the folder mount handles chunk writes, `fsync` and the
    final rename. If uploads fail with permission or "access denied" errors on rename, look at
    antivirus scanning of `E:\DropShareData` before anything else.
 3. After step 6: binding to `<server IP>` works and the port tests pass.
 4. Reboot, sign in, and check the stack comes back on its own.
+5. Malware scanning: from a client, upload the EICAR test file (from https://www.eicar.org; the
+   client machine's own antivirus may remove it first, so use a folder excluded from it). The
+   client lists it in "Can't sync", nothing appears in the folder on other devices, and the
+   audit log has a `file.malware_detected` row. Then upload a clean file over 64 MiB: it shows
+   as waiting for a moment, then completes (the scan worker scanned it).
