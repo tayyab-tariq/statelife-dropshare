@@ -25,6 +25,8 @@ x-app: &app
     TRUSTED_PROXIES: ${DROPSHARE_TRUSTED_PROXIES:-[]}
     RELEASE_PUBLISHER: ${DROPSHARE_RELEASE_PUBLISHER:-}
     RELEASE_CERT_SHA256: ${DROPSHARE_RELEASE_CERT_SHA256:-[]}
+    # Malware scanner (FR-SAFE-01). While it can't be reached, uploads wait (OQ-55).
+    CLAMD_HOST: clamav
   volumes:
     # Users' files. A Windows folder, not a Docker volume: the host's `releases publish` writes
     # here too, and it survives a Docker Desktop reset. Never created by Docker: a missing folder
@@ -36,7 +38,7 @@ x-app: &app
         create_host_path: false
   depends_on:
     postgres: { condition: service_healthy }
-  networks: [dropshare-private]
+  networks: [dropshare-private, dropshare-scan]
   logging: *default-logging
   security_opt: [no-new-privileges:true]
 
@@ -49,7 +51,7 @@ services:
     restart: unless-stopped
     # Defaults suit a metadata-only database (file content is in the storage folder). No
     # idle-in-transaction timeout: completing an upload holds its transaction while the whole file
-    # (up to 3 GiB) is assembled and hashed.
+    # (up to 2,000 MiB) is assembled and hashed.
     command:
       - postgres
       - -c
@@ -113,7 +115,54 @@ services:
           done
           sleep "$${JOBS_INTERVAL_SECONDS:-86400}"
         done
+    networks: [dropshare-private]        # never talks to the scanner
     mem_limit: 512m
+
+  # The scan worker (FR-SAFE-01): finishes uploads too large to scan within a request, and ones
+  # sent while clamav was down.
+  scanner:
+    <<: *app
+    pull_policy: never                   # the image is built by the api service
+    depends_on:
+      api: { condition: service_healthy }   # the API has run the migrations
+    command: ["dropshare-server", "jobs", "run", "scan-uploads", "--loop"]
+    mem_limit: 512m
+
+  # ClamAV (OQ-57 (7)): clamd plus freshclam, which keeps the signatures current. GPL, run as a
+  # separate service and never linked into our code. Private network only, no published port.
+  # Needs outbound HTTPS to database.clamav.net. The first start downloads the signatures for a
+  # few minutes; until then uploads wait and /health/ready reports the scanner as failed.
+  clamav:
+    # The LTS line (supported to Aug 2027). The Debian build: also runs on the Macs used for
+    # development (arm64), which the Alpine-based clamav/clamav image doesn't.
+    image: clamav/clamav-debian:1.4.6
+    restart: unless-stopped
+    environment:
+      # Look for new signatures every 2 hours (the image's default is once a day). ClamAV asks
+      # for no more than once an hour.
+      FRESHCLAM_CHECKS: "12"
+    volumes:
+      - dropshare-clamav:/var/lib/clamav
+      - type: bind
+        source: ./deploy/clamav/clamd.conf
+        target: /etc/clamav/clamd.conf
+        read_only: true
+    healthcheck:
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15m
+    # clamd parses untrusted files: its own network, shared only with the API and the scanner,
+    # never with the database. Not internal: freshclam needs the internet.
+    networks: [dropshare-scan]
+    # Only what its start script needs: hand the signatures to the clamav user, then drop to it.
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER]
+    # Signatures take about 1.5 GB, briefly twice that while freshclam reloads them.
+    mem_limit: 4g
+    logging: *default-logging
+    security_opt: [no-new-privileges:true]
 
   watchdog:
     image: dropshare/watchdog:production
@@ -140,7 +189,11 @@ services:
 
 volumes:
   dropshare-postgres:
+  dropshare-clamav:
 
 networks:
   dropshare-private:
+    driver: bridge
+  # The malware scanner's own network (FR-SAFE-01): the API, the scanner and clamav.
+  dropshare-scan:
     driver: bridge

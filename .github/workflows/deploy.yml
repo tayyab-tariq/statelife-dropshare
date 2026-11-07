@@ -87,16 +87,39 @@ jobs:
 
       - name: Build and start the stack
         run: |
-          & docker compose up -d --build --remove-orphans --wait --wait-timeout 240
+          # ClamAV is started without waiting for it: its first start downloads and loads the
+          # signatures, which can take longer than the other services' wait (runbook step 8).
+          # Uploads wait meanwhile and finish once it answers (OQ-55).
+          & docker compose up -d --remove-orphans clamav
+          if (-not $LASTEXITCODE) {
+            & docker compose up -d --build --remove-orphans --wait --wait-timeout 240 postgres api jobs scanner watchdog
+          }
           if ($LASTEXITCODE) {
             & docker compose ps -a
-            & docker compose logs --tail 100 api jobs
+            & docker compose logs --tail 100 api jobs scanner clamav
             throw 'Deploy failed'
           }
 
-      - name: Readiness check (database and storage)
+      - name: Readiness check (database, storage and malware scanner)
         run: |
-          $ErrorActionPreference = 'Stop'
           # The API listens only on DROPSHARE_API_BIND once that is set, not on loopback.
           $apiHost = if ($env:DROPSHARE_API_BIND) { $env:DROPSHARE_API_BIND } else { '127.0.0.1' }
-          Invoke-WebRequest -UseBasicParsing -Uri "http://${apiHost}:5009/health/ready" -TimeoutSec 10 | Out-Null
+          # Up to 20 minutes: the scanner is ready only once ClamAV has its signatures.
+          $deadline = (Get-Date).AddMinutes(20)
+          while ($true) {
+            try {
+              Invoke-WebRequest -UseBasicParsing -Uri "http://${apiHost}:5009/health/ready" -TimeoutSec 10 | Out-Null
+              break
+            } catch {
+              if ((Get-Date) -gt $deadline) {
+                & docker compose ps -a
+                & docker compose logs --tail 100 api scanner clamav
+                throw "Not ready after 20 minutes: $($_.ErrorDetails.Message)"
+              }
+              Start-Sleep -Seconds 15
+            }
+          }
+          # On its first start clamd can load the signatures bundled in the image while freshclam
+          # is downloading newer ones, and freshclam's notice then misses it. Reloading once
+          # it is up makes it use what freshclam fetched (clamd keeps scanning meanwhile).
+          & docker compose exec -T clamav clamdscan --reload
