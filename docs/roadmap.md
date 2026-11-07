@@ -39,7 +39,7 @@ The automated "Done when" items of these milestones pass. The manual checks are 
 - **M10, scale and network:** `scripts/perf/initial_sync.py --files 50000 --gb 50` and `throughput.py --mb 4096` from the Windows machine to the server (see `docs/perf-results.md`); the Windows check above.
 - **M9, Windows:** Trash view at 100/150/200% scaling, light/dark/high contrast, keyboard only (Enter restores, Delete deletes for good, F5) and Narrator.
 - **M8, Windows:** the check list at the end of `docs/session-audits/2026-10-28-1720.md` (read-only attribute, viewer edits, opening a link, scaling/contrast/Narrator, save-copy progress and cancel).
-- **M6 and M7, Windows:** the check list at the end of `docs/session-audits/2026-10-28-0727.md` (Explorer drag-and-drop and Show in Explorer, junctions, a 3 GB upload, Replace and Cancel with the file open in Word, 100/150/200% scaling, light/dark/high contrast, keyboard-only and Narrator) and the M7 items in `docs/session-audits/2026-10-28-0405.md` (case-only rename on NTFS, renaming a file open in Office), plus `uv run pytest -m windows_only client/tests`.
+- **M6 and M7, Windows:** the check list at the end of `docs/session-audits/2026-10-28-0727.md` (Explorer drag-and-drop and Show in Explorer, junctions, a 2,000 MiB upload, Replace and Cancel with the file open in Word, 100/150/200% scaling, light/dark/high contrast, keyboard-only and Narrator) and the M7 items in `docs/session-audits/2026-10-28-0405.md` (case-only rename on NTFS, renaming a file open in Office), plus `uv run pytest -m windows_only client/tests`.
 
 ## Decisions
 
@@ -238,14 +238,14 @@ Acceptance:
 
 Comes before M14: go-live waits for it, because the server is internet-facing and shares spread files to everyone with access.
 
-**Requirements:** FR-SAFE-01 (malware scan before a version is visible, fail closed), FR-SAFE-02 (banned extensions and executable-content check on the server), FR-SAFE-03 (banned files on the client), NFR-SEC-11, NFR-SCALE-01 and D18 (3 GB maximum file), FR-AUDIT-01 (refusal and detection events), FR-SYNC-07 (Can't sync reasons), NFR-OPS-02 (scanner in `/health/ready`). Decisions OQ-54 … OQ-56.
+**Requirements:** FR-SAFE-01 (malware scan before a version is visible, fail closed), FR-SAFE-02 (banned extensions and executable-content check on the server), FR-SAFE-03 (banned files on the client), NFR-SEC-11, NFR-SCALE-01 and D18 (2,000 MiB maximum file, OQ-58 (4)), FR-AUDIT-01 (refusal and detection events), FR-SYNC-07 (Can't sync reasons), NFR-OPS-02 (scanner in `/health/ready`). Decisions OQ-54 … OQ-56.
 
 **Decided:** OQ-57 (2026-11-05): assumptions confirmed, the starting ban list without macro-enabled Office types, scan after `complete` with a "scanning" upload state, and the ClamAV container approved.
 
 **Scope:**
-- **Infrastructure:** a `clamav` service in `docker-compose.yml` (`clamd` + `freshclam`, signatures on a volume), on the internal network only, with limits set for 3 GB files; dev setup documented beside `docs/postgres-setup.md`.
+- **Infrastructure:** a `clamav` service in `docker-compose.yml` (`clamd` + `freshclam`, signatures on a volume), on the internal network only, with limits set for the largest allowed file; dev setup documented beside `docs/postgres-setup.md`.
 - **Server:**
-  - `MAX_FILE_SIZE` default 3 GB;
+  - `MAX_FILE_SIZE` default 2,000 MiB (ClamAV scans at most 2 GiB of a file);
   - banned-extension setting validated at startup;
   - checks at upload start, completion, rename, and move;
   - first-bytes executable check;
@@ -280,8 +280,8 @@ Comes before M14: go-live waits for it, because the server is internet-facing an
   - a scanner timeout or a reply it can't parse also fails closed;
   - two uploads of the same node racing through scanning keep revisions correct (NFR-REL-04);
   - completing a retried upload twice doesn't scan twice or duplicate versions.
-- **Server, real ClamAV** (marker `clamav`, run in CI against the container): the EICAR test file is detected; EICAR inside a zip is detected; a clean file of 3 GB is scanned in full within the timeout; a 3 GB + 1 byte file is refused with `FILE_TOO_LARGE` before upload; `/health/ready` fails when `clamd` is stopped.
-- **Server, limits and health:** every size check uses the new 3 GB maximum; startup refuses an invalid banned list; tests pass on PostgreSQL and on Oracle (OQ-25).
+- **Server, real ClamAV** (marker `clamav`, run in CI against the container): the EICAR test file is detected; EICAR inside a zip is detected; a clean file of 2,000 MiB is scanned in full within the timeout; a file one byte larger is refused with `FILE_TOO_LARGE` before upload; `/health/ready` fails when `clamd` is stopped.
+- **Server, limits and health:** every size check uses the new 2,000 MiB maximum; startup refuses an invalid banned list; tests pass on PostgreSQL and on Oracle (OQ-25).
 - **Sync engine** (table-driven, NFR-REL-01 matrix extended):
   - a banned file created locally; a synced file renamed locally to a banned extension, then renamed back;
   - malware detected on a first upload and on a new version;
