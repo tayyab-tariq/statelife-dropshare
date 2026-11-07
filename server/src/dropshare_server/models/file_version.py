@@ -20,3 +20,7 @@ class FileVersion(Base):
     sha256: Mapped[str] = mapped_column(String(64))
     created_at: Mapped[datetime] = mapped_column(UtcDateTime())
     created_by_user_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.id"))
+    # When the malware scanner passed it, with its signature version (FR-SAFE-01). None for
+    # versions stored before scanning existed; they aren't rescanned (OQ-57 (4)).
+    scanned_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+    scan_signature: Mapped[str | None] = mapped_column(String(64))

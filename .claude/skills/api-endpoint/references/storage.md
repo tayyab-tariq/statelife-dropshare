@@ -34,7 +34,8 @@ class StorageBackend(Protocol):
 2. `PUT /uploads/{id}/chunks/{index}` — `async def`; read the body (reject if larger than the chunk size or the declared last-chunk size), verify `X-Chunk-SHA256`, then `write_chunk` in the threadpool. Re-sending an existing chunk is a no-op success (idempotent).
 3. `GET /uploads/{id}` — returns received chunk indexes so a client can resume.
 4. `POST /uploads/{id}/complete` — check all chunks present, `commit()` to assemble and compute the whole-file SHA-256, compare with the client's declared hash (`CHUNK_HASH_MISMATCH`/`FILE_HASH_MISMATCH` on mismatch), then in **one DB transaction**: create the `FileVersion`, create/update the `Node` (revision check against the base revision), write the `Change` row, settle quota, record audit. Completing an already-completed session returns the same node (idempotent retries).
-5. `DELETE /uploads/{id}` — discard and release reserved quota.
+   **Malware scan (FR-SAFE-01):** after assembling, and before anything is recorded, the blob is scanned. Up to `SCAN_INLINE_MAX_BYTES` within the request; larger ones, or any while ClamAV is down, become `SCANNING` (blob kept, chunks discarded) and `complete` answers 202 until the scan worker (`services/scans.py`) records the version or rejects the upload (`REJECTED`, replayed by every later `complete`). `GET` reports every chunk as received for `SCANNING`/`REJECTED`. gc-blobs keeps the blob of a `SCANNING` upload (checking those before file versions), expire-uploads skips it, and its size stays reserved.
+5. `DELETE /uploads/{id}` — discard and release reserved quota; 409 `UPLOAD_SCANNING` while the worker is scanning it.
 
 Filesystem backend details: chunks go to `staging/{upload_id}/{index:06d}`; `commit` streams them in
 order into a temp file in the blobs volume while hashing, calls `fsync`, then `os.replace` into the

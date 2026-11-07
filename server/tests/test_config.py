@@ -152,7 +152,8 @@ def test_purge_audit_account_needs_both_user_and_password() -> None:
 def test_default_limits_follow_the_content_safety_decisions() -> None:
     settings = _app_settings()
 
-    assert settings.max_file_size_bytes == 3 * 1024**3  # D18, NFR-SCALE-01
+    assert settings.max_file_size_bytes == 2000 * 1024**2  # D18, NFR-SCALE-01, OQ-58 (4)
+    assert settings.max_file_size_bytes < 2**31 - 1  # what ClamAV can scan in full
     assert settings.banned_extensions == [
         ".exe", ".dll", ".msi", ".bat", ".cmd", ".com", ".scr", ".ps1", ".vbs",
         ".js", ".jse", ".wsf", ".hta", ".jar", ".lnk", ".reg", ".iso",

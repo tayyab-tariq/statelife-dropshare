@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from dropshare_server.repositories import nodes as node_repository
 from dropshare_server.repositories import releases as release_repository
+from dropshare_server.repositories import uploads as upload_repository
 from dropshare_server.storage.base import StorageBackend
 
 logger = logging.getLogger(__name__)
@@ -113,6 +114,11 @@ def _unknown(session_factory: sessionmaker[Session], keys: list[str]) -> list[st
     if not keys:
         return []
     with session_factory() as session:
-        known = node_repository.known_blob_keys(session, keys)
+        # Uploads waiting for their scan first: one becomes a file version in a single commit,
+        # and each query sees what was committed before it started (READ COMMITTED). Asked in
+        # the other order, a version recorded between the two would be in neither answer, and
+        # its blob deleted (audit 2026-11-07-0309).
+        known = upload_repository.scanning_blob_keys(session, keys)
+        known |= node_repository.known_blob_keys(session, keys)
         known |= release_repository.known_blob_keys(session, keys)  # client installers
     return [key for key in keys if key not in known]

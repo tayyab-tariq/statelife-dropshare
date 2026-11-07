@@ -18,10 +18,12 @@ from sqlalchemy.orm import Session, sessionmaker
 from dropshare_server.core.config import Settings
 from dropshare_server.core.db import create_db_engine, create_session_factory
 from dropshare_server.core.errors import AppError
+from dropshare_server.scanner.factory import create_scanner
 from dropshare_server.services import audit as audit_service
 from dropshare_server.services import blobs as blob_service
 from dropshare_server.services import groups as group_service
 from dropshare_server.services import releases as release_service
+from dropshare_server.services import scans as scan_service
 from dropshare_server.services import storage_report as storage_report_service
 from dropshare_server.services import trash as trash_service
 from dropshare_server.services import uploads as upload_service
@@ -333,6 +335,9 @@ def _run_job(
 ) -> int:
     """Scheduled maintenance, run by the OS scheduler (NFR-REL-05). Jobs log what they did."""
     now = datetime.now(UTC)
+    if args.loop and args.job != "scan-uploads":
+        _err("--loop is only for scan-uploads.")
+        return 2
     match args.job:
         case "expire-uploads":
             result = upload_service.expire_uploads(sessions, create_storage_backend(settings), now)
@@ -368,6 +373,17 @@ def _run_job(
             _out(
                 f"Removed {collected.versions} replaced version(s) and "
                 f"{collected.orphans} unreferenced blob(s)."
+            )
+        case "scan-uploads":
+            storage, scanner = create_storage_backend(settings), create_scanner(settings)
+            if args.loop:
+                _out("Scanning uploads as they arrive (Ctrl+C stops).")
+                scan_service.run_forever(sessions, storage, scanner, settings)
+            counts = scan_service.scan_due(sessions, storage, scanner, settings)
+            _out(
+                f"Scanned {counts.clean} clean, {counts.infected} infected, "
+                f"{counts.refused} not published; {counts.retrying} to try again."
+                + (" The scanner doesn't answer: the rest wait." if counts.scanner_down else "")
             )
         case "purge-audit":
             removed = _purge_audit(sessions, settings, ctx, now)
@@ -563,7 +579,15 @@ def _build_parser() -> argparse.ArgumentParser:
         dest="command", required=True
     )
     run = jobs.add_parser("run", help="Run one job now")
-    run.add_argument("job", choices=["expire-uploads", "purge-trash", "gc-blobs", "purge-audit"])
+    run.add_argument(
+        "job",
+        choices=["expire-uploads", "purge-trash", "gc-blobs", "purge-audit", "scan-uploads"],
+    )
+    run.add_argument(
+        "--loop",
+        action="store_true",
+        help="scan-uploads: keep scanning uploads as they arrive (the scan worker service)",
+    )
     run.add_argument(
         "--force",
         action="store_true",

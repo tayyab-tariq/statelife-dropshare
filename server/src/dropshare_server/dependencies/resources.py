@@ -9,6 +9,7 @@ from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from dropshare_server.core.config import Settings
+from dropshare_server.scanner.base import Scanner
 from dropshare_server.services.file_policy import FileTypePolicy
 from dropshare_server.services.releases import MinimumVersion
 from dropshare_server.storage.base import StorageBackend
@@ -22,6 +23,8 @@ class AppResources:
     storage: StorageBackend
     minimum_version: MinimumVersion  # the effective minimum client version (FR-UPD-04)
     file_types: FileTypePolicy  # banned file types (FR-SAFE-02)
+    scanner: Scanner  # the malware scanner for scans within a request (FR-SAFE-01)
+    scanner_probe: Scanner  # the same, answering within seconds, for /health/ready
 
 
 def get_resources(request: Request) -> AppResources:
