@@ -26,6 +26,7 @@ class AuditAction(StrEnum):
     FILE_UPLOADED = "file.uploaded"
     FILE_DOWNLOADED = "file.downloaded"
     FILE_TYPE_BLOCKED = "file.type_blocked"
+    FILE_MALWARE_DETECTED = "file.malware_detected"
     NODE_TRASHED = "node.trashed"
     NODE_RENAMED = "node.renamed"
     NODE_MOVED = "node.moved"

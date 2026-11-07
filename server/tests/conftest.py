@@ -6,6 +6,7 @@ settings they are skipped.
 """
 
 import hashlib
+import os
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Literal
@@ -17,6 +18,7 @@ from fastapi.testclient import TestClient
 from httpx import Response
 from pydantic import Field, SecretStr, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from scanner_fake import FakeScanner
 from sqlalchemy import Engine, delete, select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -341,3 +343,21 @@ def offline_settings(storage_root: Path) -> Settings:
         db_user="none",
         db_password="none",
     )
+
+
+@pytest.fixture(autouse=True)
+def scanner(monkeypatch: pytest.MonkeyPatch) -> FakeScanner:
+    """Every app built in a test scans with this fake (FR-SAFE-01): clean, unless told
+    otherwise. Tests against a real clamd are marked `clamav`."""
+    fake = FakeScanner()
+    monkeypatch.setattr("dropshare_server.main.create_scanner", lambda *_args, **_kwargs: fake)
+    return fake
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    if os.environ.get("CLAMD_TEST_HOST"):
+        return
+    skip = pytest.mark.skip(reason="set CLAMD_TEST_HOST to run against a real clamd")
+    for item in items:
+        if "clamav" in item.keywords:
+            item.add_marker(skip)

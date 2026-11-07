@@ -9,6 +9,8 @@ from dropshare_server.models import Namespace, UploadSession
 from dropshare_shared.schemas.uploads import UploadStatus
 
 _IN_LIST_LIMIT = 1000  # Oracle ORA-01795
+# Rows the scan worker looks at to find one no other worker holds.
+_SCAN_CANDIDATES = 20
 
 
 def add(session: Session, upload: UploadSession) -> None:
@@ -20,29 +22,78 @@ def get(session: Session, upload_id: uuid.UUID) -> UploadSession | None:
     return session.get(UploadSession, upload_id)
 
 
-def get_for_update(session: Session, upload_id: uuid.UUID) -> UploadSession | None:
-    """Lock the session so two concurrent `complete` calls can't both create a version."""
+def get_for_update(
+    session: Session, upload_id: uuid.UUID, *, skip_locked: bool = False
+) -> UploadSession | None:
+    """Lock the session so two concurrent `complete` calls can't both create a version. With
+    `skip_locked`, None if someone else holds it (the scan worker scanning it)."""
     return session.scalars(
         select(UploadSession)
         .where(UploadSession.id == upload_id)
-        .with_for_update()
+        .with_for_update(skip_locked=skip_locked)
         .execution_options(populate_existing=True)
     ).one_or_none()
 
 
+def lock_next_to_scan(session: Session, now: datetime) -> UploadSession | None:
+    """The scanning upload due longest, locked; ones another worker holds are skipped. Exactly
+    one row is locked: the worker holds it for the whole scan, and any other it held would block
+    cancelling that upload or purging its folder meanwhile. Candidates are read first because
+    Oracle can't combine FOR UPDATE with FETCH FIRST (ORA-02014)."""
+    due = (UploadSession.status == UploadStatus.SCANNING, UploadSession.next_scan_at <= now)
+    candidates = session.scalars(
+        select(UploadSession.id)
+        .where(*due)
+        .order_by(UploadSession.next_scan_at, UploadSession.id)
+        .limit(_SCAN_CANDIDATES)
+    ).all()
+    for upload_id in candidates:
+        upload = session.scalars(
+            select(UploadSession)
+            .where(UploadSession.id == upload_id, *due)
+            .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
+        ).one_or_none()
+        if upload is not None:
+            return upload
+    return None
+
+
+def scanning_blob_keys(session: Session, blob_keys: Sequence[str]) -> set[str]:
+    """Which of these blobs belong to uploads waiting for their scan: gc-blobs keeps them,
+    however long the scanner is down (OQ-55)."""
+    found: set[str] = set()
+    for start in range(0, len(blob_keys), _IN_LIST_LIMIT):
+        found.update(
+            key
+            for key in session.scalars(
+                select(UploadSession.blob_key).where(
+                    UploadSession.blob_key.in_(blob_keys[start : start + _IN_LIST_LIMIT]),
+                    UploadSession.status == UploadStatus.SCANNING,
+                )
+            )
+            if key is not None
+        )
+    return found
+
+
 def reserved_bytes(session: Session, owner_user_id: uuid.UUID, now: datetime) -> int:
-    """Bytes promised to unexpired pending uploads into namespaces this user owns.
+    """Bytes promised to unexpired pending uploads, and to uploads waiting for their malware
+    scan, into namespaces this user owns.
 
     Every pending upload reserves its full size, new versions included: that is what it stages
-    on disk until it completes or expires (audit decision D1).
+    on disk until it completes or expires (audit decision D1). A scanning one holds its blob
+    until the scan decides, however long that takes (OQ-55).
     """
     query = (
         select(func.coalesce(func.sum(UploadSession.size_bytes), 0))
         .join(Namespace, Namespace.id == UploadSession.namespace_id)
         .where(
             Namespace.owner_user_id == owner_user_id,
-            UploadSession.status == UploadStatus.PENDING,
-            UploadSession.expires_at > now,
+            or_(
+                and_(UploadSession.status == UploadStatus.PENDING, UploadSession.expires_at > now),
+                UploadSession.status == UploadStatus.SCANNING,
+            ),
         )
     )
     return int(session.scalar(query) or 0)

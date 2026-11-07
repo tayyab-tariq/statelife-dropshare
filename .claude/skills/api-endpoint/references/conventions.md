@@ -41,6 +41,9 @@ Source of truth for server code. Requirements live in `docs/requirements.md`.
 | Too large                                    | 413 `FILE_TOO_LARGE`                                                              |
 | Banned file type, or a program (FR-SAFE-02)  | 422 `FILE_TYPE_NOT_ALLOWED` (audited as `file.type_blocked`)                      |
 | Upload completed with chunks missing         | 409 `UPLOAD_INCOMPLETE`                                                           |
+| Upload still to be scanned (`complete`)      | 202 + `UploadOut` (status `scanning`) and `Retry-After`: ask again (FR-SAFE-01)   |
+| Cancelling an upload being scanned           | 409 `UPLOAD_SCANNING`: it may still complete                                      |
+| Malware found (or a file it can't scan)      | 422 `MALWARE_DETECTED` (audited as `file.malware_detected`)                       |
 | Chunk or whole-file checksum wrong           | 400 `CHUNK_HASH_MISMATCH` / `FILE_HASH_MISMATCH`                                  |
 | Range outside the file                       | 416 `RANGE_NOT_SATISFIABLE` (with `Content-Range: bytes */size`)                  |
 | Over quota                                   | 409 `QUOTA_EXCEEDED`                                                              |
@@ -53,11 +56,13 @@ Several codes share a status (403 has three), so clients branch on `error.code`,
 status alone. Errors the client must act on carry typed `details` from
 `dropshare_shared.schemas.error_details`, the one module for them (423 `AccountLockedDetails` plus
 `Retry-After`, 426 `UpgradeRequiredDetails`, 409 `NameConflictDetails` / `RevisionConflictDetails`
-/ `UploadIncompleteDetails`, 413 `FileTooLargeDetails`, 422 `FileTypeNotAllowedDetails`, 416
+/ `UploadIncompleteDetails`, 413 `FileTooLargeDetails`, 422 `FileTypeNotAllowedDetails` / `MalwareDetectedDetails`, 416
 `RangeNotSatisfiableDetails`).
 `400 VALIDATION_ERROR` details are always a list of `ValidationIssue` with a stable `type`:
 raise them with `core.errors.invalid(message, type, loc)`. `POST /uploads/{id}/complete`
-answers 200 (it is an action), not 201.
+answers 200 (it is an action), not 201, or 202 while the malware scan is still to come. A request
+never waits on a row the scan worker may hold for minutes: lock it with `skip_locked` and answer
+at once.
 
 Framework-raised `HTTPException`s are mapped to the same codes in `core/error_handlers.py`; any
 other 4xx becomes `VALIDATION_ERROR` and any 5xx becomes 500 `INTERNAL_ERROR`.
@@ -111,7 +116,7 @@ validates outgoing data and drops any field not in the model.
 - Every body, query, and path model comes from `shared/` with `extra="forbid"` and explicit constraints (`min_length`, `max_length`, `ge`, `le`).
 - Response models do **not** use `extra="forbid"`: they keep the default (`ignore`) so installed clients keep parsing responses after the server adds fields (FR-UPD-04). Clients must also tolerate unknown `ErrorCode` values (`ErrorBody.code` is `ErrorCode | str`), and enum fields in response models are `Annotated[Enum | str, Field(union_mode="left_to_right")]` for the same reason; the client treats an unknown value as "refetch".
 - File and folder names: always `dropshare_shared.naming.validate_name()` (rules in NFR-COMPAT-02) and store `normalize_name()` (NFC + casefold) for uniqueness checks.
-- FastAPI returns 422 for validation errors by default; we override it so validation errors become `400 VALIDATION_ERROR` with `details` = list of `{loc, msg, type}`. Our only 422 is `FILE_TYPE_NOT_ALLOWED`.
+- FastAPI returns 422 for validation errors by default; we override it so validation errors become `400 VALIDATION_ERROR` with `details` = list of `{loc, msg, type}`. Our only 422s are `FILE_TYPE_NOT_ALLOWED` and `MALWARE_DETECTED`.
 
 ## 6. Errors
 

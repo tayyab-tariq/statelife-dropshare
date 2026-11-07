@@ -72,6 +72,19 @@ def _error(status: int, code: str) -> httpx.Response:
     return httpx.Response(status, json={"error": {"code": code, "message": code}})
 
 
+def _malware() -> httpx.Response:
+    return httpx.Response(
+        422,
+        json={
+            "error": {
+                "code": "MALWARE_DETECTED",
+                "message": "DropShare's virus scan found a threat in this file (Eicar).",
+                "details": {"detection": "Eicar"},
+            }
+        },
+    )
+
+
 class FakeTransfers:
     """Uploads and downloads as the server implements them (services/uploads.py, nodes.py)."""
 
@@ -89,6 +102,9 @@ class FakeTransfers:
         self.params: list[str] = []
         self.bodies: list[object] = []
         self.moved: set[str] = set()  # completed uploads whose file was renamed since
+        # What the malware scan says at each `complete` from now on (FR-SAFE-01): "wait" (202,
+        # still scanning), "clean" or "malware". Empty: clean at once, as before M15b.
+        self.scan: list[str] = []
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(f"{request.method} {request.url.path}")
@@ -133,8 +149,7 @@ class FakeTransfers:
                 if hashlib.sha256(assembled).hexdigest() != upload["sha256"]:
                     upload["status"] = "cancelled"
                     return _error(400, "FILE_HASH_MISMATCH")
-                upload["status"] = "completed"
-                return httpx.Response(200, json={"data": _node(assembled, 2)})
+                return self._scanned(upload_id, upload, assembled)
             case "DELETE", ["uploads", upload_id]:
                 self.uploads[upload_id]["status"] = "cancelled"
                 return httpx.Response(204)
@@ -144,6 +159,21 @@ class FakeTransfers:
                 self.bodies.append(json.loads(request.content))
                 return httpx.Response(200, json={"data": _node(b"moved", 2)})
         return _error(404, "NOT_FOUND")
+
+    def _scanned(
+        self, upload_id: str, upload: dict[str, object], assembled: bytes
+    ) -> httpx.Response:
+        if upload["status"] == "rejected":
+            return _malware()
+        answer = self.scan.pop(0) if self.scan else "clean"
+        if answer == "wait":
+            upload["status"] = "scanning"
+            return httpx.Response(202, json={"data": self._upload(upload_id)})
+        if answer == "malware":
+            upload["status"] = "rejected"
+            return _malware()
+        upload["status"] = "completed"
+        return httpx.Response(200, json={"data": _node(assembled, 2)})
 
     def content_of(self, upload_id: str) -> bytes:
         return b"".join(v for _, v in sorted(self.chunks[upload_id].items()))
@@ -157,7 +187,11 @@ class FakeTransfers:
             "size_bytes": size,
             "chunk_size": self.chunk_size,
             "chunk_count": -(-size // self.chunk_size),
-            "received_chunks": sorted(self.chunks[upload_id]),
+            "received_chunks": (
+                list(range(-(-size // self.chunk_size)))
+                if upload["status"] in ("scanning", "rejected")
+                else sorted(self.chunks[upload_id])
+            ),
             "expires_at": (NOW + timedelta(hours=24)).isoformat(),
             "node_id": None,
         }
@@ -605,3 +639,45 @@ def test_download_progress_starts_from_the_partial_file_and_ends_at_the_size(
 
     assert seen[0] == 4 and seen[-1] == 10
     assert seen == sorted(seen)
+
+
+# How this client (0.2.x) copes with malware scanning on the server, until the client part of
+# M15 (requirements OQ-58 (5)): pinned so a server change can't silently make it worse.
+
+
+def test_a_scan_still_to_come_is_retried_without_sending_the_file_again(
+    files: RemoteFiles, fake: FakeTransfers, tmp_path: Path
+) -> None:
+    source = _source(tmp_path, b"abcdefgh")
+    fake.scan = ["wait", "wait", "clean"]
+    target = NewFile(PARENT_ID, "big.bin")
+
+    for _ in range(2):  # the 202 is an answer this client doesn't understand: it tries again
+        with pytest.raises(ApiError) as caught:
+            files.upload(source, target, threading.Event())
+        assert caught.value.code == "INVALID_RESPONSE"
+    node = files.upload(source, target, threading.Event())
+
+    assert node.content_hash == source.sha256
+    assert len(fake.uploads) == 1  # the same upload throughout
+    chunk_puts = [request for request in fake.requests if request.startswith("PUT ")]
+    assert len(chunk_puts) == 2  # each chunk sent once, never again after the first 202
+    assert not any(request.startswith("DELETE ") for request in fake.requests)
+
+
+def test_malware_found_is_reported_and_the_file_isnt_sent_again(
+    files: RemoteFiles, fake: FakeTransfers, tmp_path: Path
+) -> None:
+    source = _source(tmp_path, b"abcdefgh")
+    fake.scan = ["malware"]
+    target = NewFile(PARENT_ID, "bad.exe.txt")
+
+    for _ in range(2):
+        with pytest.raises(ApiError) as caught:
+            files.upload(source, target, threading.Event())
+        assert caught.value.code == "MALWARE_DETECTED"
+        assert "Eicar" in caught.value.message  # what "Can't sync" shows
+
+    assert len(fake.uploads) == 1  # a retry asks again; it doesn't upload again
+    assert len([request for request in fake.requests if request.startswith("PUT ")]) == 2
+    assert not any(request.startswith("DELETE ") for request in fake.requests)

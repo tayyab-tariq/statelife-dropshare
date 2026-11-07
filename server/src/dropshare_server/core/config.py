@@ -70,12 +70,31 @@ class Settings(DatabaseSettings):
     release_cert_sha256: list[str] = []
     default_quota_bytes: int = Field(default=50 * _GIB, ge=0)  # NFR-SCALE-03
 
-    # Files and transfers (FR-XFER-01, NFR-SCALE-01, requirements §7.2). 3 GB so every file
-    # fits the malware scanner (D18, OQ-54).
-    max_file_size_bytes: int = Field(default=3 * _GIB, ge=0)
+    # Files and transfers (FR-XFER-01, NFR-SCALE-01, requirements §7.2). 2,000 MiB, so every
+    # file fits the malware scanner: ClamAV can't scan a file over 2 GiB (D18, OQ-58 (4)).
+    max_file_size_bytes: int = Field(default=2000 * _MIB, ge=0)
     # Refused as a file's last extension (FR-SAFE-02), a JSON list such as [".exe", ".dll"].
     # Kept in `naming.normalize_extension` form.
     banned_extensions: list[str] = _BANNED_EXTENSIONS
+
+    # Malware scanner (FR-SAFE-01, OQ-57 (7)): clamd's address. There is no setting to turn
+    # scanning off (OQ-58 (1)): while clamd can't be reached, uploads wait.
+    clamd_host: str = Field(default="localhost", min_length=1)
+    clamd_port: int = Field(default=3310, ge=1, le=65535)
+    clamd_connect_timeout_seconds: float = Field(default=5, gt=0)
+    # The scan worker's wait for clamd's answer, in total: a 2 GB file takes minutes. Below
+    # clamd's MaxScanTime (deploy/clamav/clamd.conf) plus the time to send the file.
+    clamd_reply_timeout_seconds: float = Field(default=900, gt=0)
+    # A scan within `complete`, in total: below the client's 60 s wait for `complete`. Past it,
+    # the upload goes to the scan worker (202) rather than holding the request.
+    scan_inline_timeout_seconds: float = Field(default=30, gt=0)
+    # Files up to this size are scanned within `complete`; larger ones by the scan worker.
+    scan_inline_max_bytes: int = Field(default=64 * _MIB, ge=0)
+    # The scan worker's longest wait between tries while the scanner is down.
+    scan_retry_max_seconds: int = Field(default=300, ge=1)
+    # Failed scans of one file (the scanner answering otherwise) before it is refused as
+    # unscannable: fail closed, never published unscanned.
+    scan_max_attempts: int = Field(default=5, ge=1)
     upload_chunk_size_bytes: int = Field(default=8 * _MIB, ge=1)
     upload_expiry_hours: int = Field(default=24, ge=1)
 

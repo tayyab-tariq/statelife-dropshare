@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, ForeignKey, Integer, String, Uuid
+from sqlalchemy import BigInteger, ForeignKey, Integer, String, Uuid, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from dropshare_server.models.base import Base
@@ -36,6 +36,19 @@ class UploadSession(Base):
     # The file's revision as this upload left it: a repeated `complete` answers with this, not
     # with whatever later edits made of the file (NFR-REL-04).
     result_revision: Mapped[int | None] = mapped_column(Integer)
+    # While SCANNING (FR-SAFE-01): the assembled blob, and who completed the upload and in which
+    # request, for the audit events the scan worker writes later (FR-AUDIT-02).
+    blob_key: Mapped[str | None] = mapped_column(String(128))
+    device_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    source_ip: Mapped[str | None] = mapped_column(String(45))
+    request_id: Mapped[str | None] = mapped_column(String(64))
+    # When the scan worker next tries it (backing off while the scanner is down), and how
+    # often it has tried.
+    next_scan_at: Mapped[datetime | None] = mapped_column(UtcDateTime(), index=True)
+    scan_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"))
+    # Once REJECTED: the error code `complete` answers with, and the scanner's detection name.
+    rejection_code: Mapped[str | None] = mapped_column(String(32))
+    detection: Mapped[str | None] = mapped_column(String(255))
 
     @property
     def chunk_count(self) -> int:

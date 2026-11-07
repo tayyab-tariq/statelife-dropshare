@@ -85,3 +85,13 @@ DB_MAX_OVERFLOW) must stay below the database's connection limit (M14).
 - against http://127.0.0.1:8765; full scale is 50,000 files / 50 GB
 - upload 82 files/s, 82 MB/s; download 248 files/s, 248 MB/s
 - killed (SIGKILL) at 50% of the files moved
+
+## NFR-PERF-02 change propagation — 2026-11-07 07:51 UTC
+
+- **Target:** a small file visible on another device within 10 s (p95)
+- **Result:** p95 4.15 s over 20 files, 0 not seen within 60 s — ✅ met
+- **Where:** 192.168.100.60 (macOS-27.0.1-arm64-arm-64bit), Python 3.12.15
+- two engines, one user, against http://127.0.0.1:8765
+- seconds: n=20, p50=4.1, p95=4.2, p99=4.2, mean=4.1
+- includes the 2 s a new file must stay unchanged before it is uploaded (FR-SYNC-06)
+- with malware scanning on (M15b): each file scanned within `complete` by a real ClamAV 1.4.6 (`clamav/clamav-debian`, signatures 28174); all 20 versions record that signature

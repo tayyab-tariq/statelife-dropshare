@@ -16,9 +16,11 @@ class ErrorCode(StrEnum):
     ALREADY_SHARED = "ALREADY_SHARED"  # this user or group already has access: change the role
     FILE_TOO_LARGE = "FILE_TOO_LARGE"
     FILE_TYPE_NOT_ALLOWED = "FILE_TYPE_NOT_ALLOWED"  # banned extension or executable (FR-SAFE-02)
+    MALWARE_DETECTED = "MALWARE_DETECTED"  # the malware scan found something (FR-SAFE-01)
     CHUNK_HASH_MISMATCH = "CHUNK_HASH_MISMATCH"
     FILE_HASH_MISMATCH = "FILE_HASH_MISMATCH"
     UPLOAD_INCOMPLETE = "UPLOAD_INCOMPLETE"
+    UPLOAD_SCANNING = "UPLOAD_SCANNING"  # being scanned now; it may still complete (FR-SAFE-01)
     RANGE_NOT_SATISFIABLE = "RANGE_NOT_SATISFIABLE"
     ACCOUNT_LOCKED = "ACCOUNT_LOCKED"
     ACCOUNT_DISABLED = "ACCOUNT_DISABLED"

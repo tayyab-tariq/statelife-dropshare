@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter
 
-from dropshare_server.dependencies.resources import DbSession, Storage
+from dropshare_server.dependencies.resources import DbSession, Resources
 from dropshare_server.services import health as health_service
 from dropshare_shared.schemas.envelope import DataResponse
 from dropshare_shared.schemas.health import CheckStatus, HealthOut, ReadinessOut
@@ -16,5 +16,7 @@ def liveness() -> DataResponse[HealthOut]:
 
 
 @router.get("/ready", response_model=DataResponse[ReadinessOut])
-def readiness(db: DbSession, storage: Storage) -> DataResponse[ReadinessOut]:
-    return DataResponse(data=health_service.check_readiness(db, storage))
+def readiness(db: DbSession, resources: Resources) -> DataResponse[ReadinessOut]:
+    return DataResponse(
+        data=health_service.check_readiness(db, resources.storage, resources.scanner_probe)
+    )

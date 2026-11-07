@@ -9,7 +9,7 @@ import hashlib
 import hmac
 import logging
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import NoReturn
@@ -23,18 +23,24 @@ from dropshare_server.repositories import namespaces as namespace_repository
 from dropshare_server.repositories import nodes as node_repository
 from dropshare_server.repositories import uploads as upload_repository
 from dropshare_server.repositories import users as user_repository
+from dropshare_server.scanner.base import Scanner, ScannerUnavailableError, ScanResult
 from dropshare_server.services import access
 from dropshare_server.services import audit as audit_service
 from dropshare_server.services import changes as change_service
 from dropshare_server.services import nodes as node_service
-from dropshare_server.services.audit import AuditTarget
+from dropshare_server.services.audit import AuditDetails, AuditTarget
 from dropshare_server.services.context import CallContext
 from dropshare_server.services.file_policy import FileTypePolicy
 from dropshare_server.services.file_types import executable_kind
 from dropshare_server.storage.base import CommitResult, StorageBackend, new_blob_key
 from dropshare_shared.errors import ErrorCode
+from dropshare_shared.naming import normalize_name
 from dropshare_shared.schemas.audit import AuditAction, AuditOutcome
-from dropshare_shared.schemas.error_details import FileTooLargeDetails, UploadIncompleteDetails
+from dropshare_shared.schemas.error_details import (
+    FileTooLargeDetails,
+    MalwareDetectedDetails,
+    UploadIncompleteDetails,
+)
 from dropshare_shared.schemas.nodes import NodeKind, NodeOut
 from dropshare_shared.schemas.sync import ChangeType
 from dropshare_shared.schemas.uploads import (
@@ -185,8 +191,13 @@ def get(
     upload = _require_upload(session, user_id, upload_id)
     if upload.status == UploadStatus.PENDING:
         _require_pending(upload, datetime.now(UTC))
-        return _to_out(upload, storage.chunk_indexes(upload.id))
-    return _to_out(upload, set())
+    return _status(storage, upload)
+
+
+def _all_chunks(upload: UploadSession) -> set[int]:
+    """Assembled already (scanning, or refused after it): every chunk counts as received, so
+    no client sends any again, older ones included (FR-SAFE-01)."""
+    return set(range(upload.chunk_count))
 
 
 def expected_chunk_size(upload: UploadSession, index: int) -> int:
@@ -263,20 +274,34 @@ def complete(
     session_factory: sessionmaker[Session],
     storage: StorageBackend,
     file_types: FileTypePolicy,
+    scanner: Scanner,
+    settings: Settings,
     ctx: CallContext,
     user_id: uuid.UUID,
     upload_id: uuid.UUID,
-) -> NodeOut:
-    """Verify the whole file and make it visible. Completing again returns the same result.
+) -> NodeOut | UploadOut:
+    """Verify the whole file, scan it, and make it visible. Completing again returns the same
+    result. Returns the upload instead of the file (202) while the malware scan is still to
+    come: the client asks again (FR-SAFE-01, OQ-57 (5), OQ-58).
 
     Order (audit S2): check the target without locks, assemble the blob, then lock the target,
     check again and record the version. Only the upload row is locked while assembling, so a
     large file doesn't block other writes in its folder. The staged chunks are discarded only
     after the database commit: any failure before that leaves the upload retryable.
     """
-    upload = _require_upload(session, user_id, upload_id, lock=True)
+    found = _require_upload(session, user_id, upload_id)
+    # Never wait for another `complete` assembling it or for the scan worker scanning it, which
+    # can take minutes: answer with where it stands (202), and the client asks again. A retry
+    # that finds it handed to the worker meanwhile gets the same (NFR-REL-04).
+    upload = upload_repository.get_for_update(session, upload_id, skip_locked=True)
+    if upload is None:
+        return _status(storage, found)
+    if upload.status == UploadStatus.SCANNING:
+        return _status(storage, upload)
     if upload.status == UploadStatus.COMPLETED:
         return _replay(session, user_id, upload)
+    if upload.status == UploadStatus.REJECTED:
+        raise _rejection(session, user_id, upload)
     now = datetime.now(UTC)
     _require_pending(upload, now)
     missing = sorted(set(range(upload.chunk_count)) - storage.chunk_indexes(upload.id))
@@ -309,14 +334,172 @@ def complete(
     if kind is not None:  # a program, whatever its name (FR-SAFE-02): the old version stays
         _cancel(session, storage, upload, blob_key)
         raise file_types.refuse_executable(session, ctx, target, kind)
+    if upload.size_bytes > settings.scan_inline_max_bytes:
+        return _defer(session, storage, ctx, upload, blob_key, now)
     try:
-        result = _record_version(session, ctx, user_id, upload, blob_key, stored, now)
+        scan = scanner.scan(blob_chunks(storage, blob_key, stored.size_bytes))
+    except ScannerUnavailableError:
+        logger.warning("Upload %s waits for the malware scanner", upload.id, exc_info=True)
+        return _defer(session, storage, ctx, upload, blob_key, now)
+    if scan.detection is not None:
+        target, details = malware_audit(session, upload, scan.detection)
+        reject(upload, ErrorCode.MALWARE_DETECTED, scan.detection)
+        # In the same transaction as the refusal, as the scan worker does: no row of the users
+        # table is locked here, so the audit's reference to the actor can't wait on one.
+        audit_service.record(
+            session,
+            ctx,
+            AuditAction.FILE_MALWARE_DETECTED,
+            AuditOutcome.DENIED,
+            target=target,
+            details=details,
+        )
+        session.commit()
+        _remove_data(storage, upload, blob_key)
+        raise malware_detected(scan.detection, audited=True)
+    try:
+        result = record_version(session, ctx, user_id, upload, blob_key, stored, scan, now)
     except AppError:
-        storage.delete_blob(blob_key)  # the staged chunks remain, so the client can retry
+        _remove_blob(storage, blob_key)  # the staged chunks remain, so the client can retry
         raise
     session.commit()  # the version is durable in storage and now in the database
     storage.discard_upload(upload.id)
     return result
+
+
+def _defer(
+    session: Session,
+    storage: StorageBackend,
+    ctx: CallContext,
+    upload: UploadSession,
+    blob_key: str,
+    now: datetime,
+) -> UploadOut:
+    """Leave the scan to the scan worker: too large to scan within the request, or the scanner
+    is down (OQ-55: the upload waits, nothing becomes visible unscanned). The blob holds every
+    byte now, so the staged chunks go; gc-blobs keeps the blob while the upload scans."""
+    upload.status = UploadStatus.SCANNING
+    upload.blob_key = blob_key
+    upload.device_id = ctx.actor.device_id
+    upload.source_ip = ctx.source_ip
+    upload.request_id = ctx.request_id
+    upload.next_scan_at = now
+    session.commit()
+    _remove_data(storage, upload, None)
+    return _to_out(upload, _all_chunks(upload))
+
+
+def blob_chunks(storage: StorageBackend, blob_key: str, size: int) -> Iterable[bytes]:
+    """A stored blob as a stream, for the scanner (never all of it in memory, §11)."""
+    return storage.open_range(blob_key, 0, size - 1) if size > 0 else ()
+
+
+def reject(upload: UploadSession, code: ErrorCode, detection: str | None = None) -> None:
+    """Refused after it was assembled: `complete` answers with `code` from now on."""
+    upload.status = UploadStatus.REJECTED
+    upload.rejection_code = code.value
+    upload.detection = detection
+    upload.next_scan_at = None
+
+
+def malware_detected(detection: str, *, audited: bool) -> AppError:
+    return AppError(
+        422,
+        ErrorCode.MALWARE_DETECTED,
+        f"DropShare's virus scan found a threat in this file ({detection}), so it wasn't "
+        "uploaded. Your copy on this computer hasn't been changed.",
+        MalwareDetectedDetails(detection=detection).model_dump(),
+        audited=audited,
+    )
+
+
+def malware_audit(
+    session: Session, upload: UploadSession, detection: str
+) -> tuple[AuditTarget, AuditDetails]:
+    """Target and details of `file.malware_detected` (FR-SAFE-01): the file's name and folder
+    and the detection, never content. Read before anything is committed or rolled back."""
+    node = node_repository.get(session, upload.node_id) if upload.node_id else None
+    folder_id = node.parent_id if node is not None else upload.parent_id
+    target = audit_target(session, upload)
+    details: AuditDetails = {
+        "detection": detection,
+        "folder_id": str(folder_id) if folder_id else None,
+        "size_bytes": upload.size_bytes,
+        "new_version": upload.base_revision is not None,
+        "upload_id": str(upload.id),
+    }
+    return target, details
+
+
+def audit_target(session: Session, upload: UploadSession) -> AuditTarget:
+    """The file an upload is for: the file itself for a new version, else its folder and name."""
+    node = node_repository.get(session, upload.node_id) if upload.node_id else None
+    if node is not None:
+        return audit_service.node_target(node)
+    return AuditTarget(type="folder", id=str(upload.parent_id), name=upload.name)
+
+
+def _rejection(session: Session, user_id: uuid.UUID, upload: UploadSession) -> AppError:
+    """What a repeated `complete` answers for an upload refused after it was assembled: the
+    same code, status and details `complete` itself would have answered with. Anything else
+    becomes 404 "start again", which every client treats as the end of this upload."""
+    code = upload.rejection_code
+    if code == ErrorCode.MALWARE_DETECTED:
+        return malware_detected(upload.detection or "unknown", audited=True)
+    if code == ErrorCode.REVISION_CONFLICT:
+        return node_service.revision_conflict(_current_revision(session, user_id, upload))
+    if code == ErrorCode.NAME_CONFLICT and upload.parent_id is not None and upload.name:
+        existing = node_repository.get_live_child(
+            session, upload.namespace_id, upload.parent_id, normalize_name(upload.name)
+        )
+        if existing is not None:
+            return node_service.name_conflict(existing)
+    if code == ErrorCode.QUOTA_EXCEEDED:
+        return _quota_exceeded()
+    if code == ErrorCode.FORBIDDEN:
+        return access.view_only()
+    return AppError(
+        404,
+        ErrorCode.NOT_FOUND,
+        "Where this file was going changed while it was scanned. Start the upload again.",
+    )
+
+
+def _current_revision(session: Session, user_id: uuid.UUID, upload: UploadSession) -> int | None:
+    """The file's revision now, only for someone who may still see it."""
+    if upload.node_id is None:
+        return None
+    try:
+        node = access.require_node(session, user_id, upload.node_id, file_share=True)
+    except AppError:
+        return None
+    return node.revision
+
+
+def _status(storage: StorageBackend, upload: UploadSession) -> UploadOut:
+    """Where an upload stands, as GET /uploads/{id} answers."""
+    if upload.status == UploadStatus.PENDING:
+        return _to_out(upload, storage.chunk_indexes(upload.id))
+    if upload.status in (UploadStatus.SCANNING, UploadStatus.REJECTED):
+        return _to_out(upload, _all_chunks(upload))
+    return _to_out(upload, set())
+
+
+def _remove_blob(storage: StorageBackend, blob_key: str) -> None:
+    try:
+        storage.delete_blob(blob_key)
+    except OSError:
+        logger.warning("Couldn't remove blob %s; gc-blobs will", blob_key, exc_info=True)
+
+
+def _remove_data(storage: StorageBackend, upload: UploadSession, blob_key: str | None) -> None:
+    """Best effort: what's left behind is removed by gc-blobs and expire-uploads."""
+    try:
+        if blob_key is not None:
+            storage.delete_blob(blob_key)
+        storage.discard_upload(upload.id)
+    except OSError:
+        logger.warning("Couldn't remove the data of upload %s", upload.id, exc_info=True)
 
 
 def _replay(session: Session, user_id: uuid.UUID, upload: UploadSession) -> NodeOut:
@@ -432,12 +615,7 @@ def _cancel(
     """
     upload.status = UploadStatus.CANCELLED
     session.commit()
-    try:
-        if blob_key is not None:
-            storage.delete_blob(blob_key)
-        storage.discard_upload(upload.id)
-    except OSError:
-        logger.warning("Couldn't remove the data of cancelled upload %s", upload.id, exc_info=True)
+    _remove_data(storage, upload, blob_key)
 
 
 def _new_file_target(parent: Node, name: str) -> AuditTarget:
@@ -464,16 +642,18 @@ def _reader(storage: StorageBackend, blob_key: str, size: int) -> Callable[[int,
     return read
 
 
-def _record_version(
+def record_version(
     session: Session,
     ctx: CallContext,
     user_id: uuid.UUID,
     upload: UploadSession,
     blob_key: str,
     stored: CommitResult,
+    scan: ScanResult,
     now: datetime,
 ) -> NodeOut:
-    """Lock the target and the owner, check again, and record the version, change and audit."""
+    """Lock the target and the owner, check again, and record the version, change and audit.
+    Only ever for content the malware scanner passed (FR-SAFE-01)."""
     node, parent = _target(session, user_id, upload, lock=True)
     previous_size = node.size_bytes if node is not None else 0
     owner = _owner(session, _namespace_of(node, parent), lock=True)
@@ -514,6 +694,8 @@ def _record_version(
             sha256=stored.sha256,
             created_at=now,
             created_by_user_id=user_id,
+            scanned_at=now,
+            scan_signature=scan.signature,
         ),
     )
     owner.used_bytes += delta
@@ -521,6 +703,7 @@ def _record_version(
     upload.completed_at = now
     upload.node_id = node.id
     upload.result_revision = node.revision
+    upload.blob_key = upload.next_scan_at = None
     change_service.record(session, node, change_type, user_id, now)
     audit_service.record(
         session,
@@ -538,7 +721,16 @@ def _record_version(
 def cancel(
     session: Session, storage: StorageBackend, user_id: uuid.UUID, upload_id: uuid.UUID
 ) -> None:
-    upload = _require_upload(session, user_id, upload_id, lock=True)
+    _require_upload(session, user_id, upload_id)
+    # Never wait for the scan worker, which holds the row for minutes while it scans: say at
+    # once that the upload may still complete (FR-SAFE-01, audit 2026-11-07).
+    upload = upload_repository.get_for_update(session, upload_id, skip_locked=True)
+    if upload is None:
+        raise AppError(
+            409,
+            ErrorCode.UPLOAD_SCANNING,
+            "This upload is being scanned right now and may still complete. Ask again shortly.",
+        )
     if upload.status == UploadStatus.COMPLETED:
         raise invalid("This upload has already completed.", "already_completed")
     upload.status = UploadStatus.CANCELLED

@@ -2,6 +2,7 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Path, Request, Response
+from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from dropshare_server.dependencies.auth import ActiveSession
@@ -13,6 +14,9 @@ from dropshare_shared.schemas.nodes import NodeOut
 from dropshare_shared.schemas.uploads import CHUNK_SHA256_HEADER, UploadCreateIn, UploadOut
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
+
+# How soon to ask `complete` again while the upload waits for its malware scan.
+_ASK_AGAIN_SECONDS = 5
 
 
 @router.post("", status_code=201, response_model=DataResponse[UploadOut])
@@ -71,24 +75,38 @@ async def put_chunk(
     return Response(status_code=204)
 
 
-@router.post("/{upload_id}/complete", response_model=DataResponse[NodeOut])
+@router.post(
+    "/{upload_id}/complete",
+    response_model=DataResponse[NodeOut],
+    responses={202: {"model": DataResponse[UploadOut], "description": "Still being scanned"}},
+)
 def complete_upload(
     upload_id: uuid.UUID,
     current: ActiveSession,
     db: DbSession,
     resources: Resources,
     ctx: Context,
-) -> DataResponse[NodeOut]:
-    node = upload_service.complete(
+) -> DataResponse[NodeOut] | JSONResponse:
+    """200 with the file once it is stored and scanned clean; 202 with the upload (status
+    `scanning`) while the malware scan is still to come: ask again (FR-SAFE-01)."""
+    result = upload_service.complete(
         db,
         resources.session_factory,
         resources.storage,
         resources.file_types,
+        resources.scanner,
+        resources.settings,
         ctx.as_actor(current.actor),
         current.user.id,
         upload_id,
     )
-    return DataResponse(data=node)
+    if isinstance(result, UploadOut):
+        return JSONResponse(
+            status_code=202,
+            content=DataResponse(data=result).model_dump(mode="json"),
+            headers={"Retry-After": str(_ASK_AGAIN_SECONDS)},
+        )
+    return DataResponse(data=result)
 
 
 @router.delete("/{upload_id}", status_code=204)
