@@ -29,8 +29,10 @@ from dropshare_server.models import (
 )
 from dropshare_server.repositories import uploads as upload_repository
 from dropshare_server.services import uploads as upload_service
+from dropshare_server.services.context import Actor, CallContext
+from dropshare_server.services.file_policy import FileTypePolicy
 from dropshare_server.storage.local import LocalFilesystemBackend
-from dropshare_shared.schemas.audit import AuditAction, AuditOutcome
+from dropshare_shared.schemas.audit import AuditAction, AuditActorType, AuditOutcome
 from dropshare_shared.schemas.uploads import UploadCreateIn
 
 type Account = dict[str, str]
@@ -538,10 +540,14 @@ def test_starting_an_upload_never_holds_the_owner_while_waiting_for_its_folder(
         user = session.scalars(select(User).where(User.username == "alice")).one()
     body = UploadCreateIn(parent_id=root, name="new.txt", size_bytes=1, sha256=_sha(b"x"))
     started: list[object] = []
+    file_types = FileTypePolicy(frozenset(db_settings.banned_extensions), session_factory)
+    ctx = CallContext(actor=Actor(AuditActorType.USER, user_id=user.id))
 
     def start() -> None:
         with session_factory.begin() as session:
-            started.append(upload_service.start(session, db_settings, user.id, body))
+            started.append(
+                upload_service.start(session, db_settings, file_types, ctx, user.id, body)
+            )
 
     with session_factory.begin() as completing:  # as `complete` does: the folder first...
         completing.scalars(select(Node).where(Node.id == root).with_for_update()).one()

@@ -16,9 +16,10 @@ from dropshare_server.repositories.nodes import LiveNameTakenError
 from dropshare_server.services import access
 from dropshare_server.services import audit as audit_service
 from dropshare_server.services import changes as change_service
-from dropshare_server.services.audit import AuditDetails, AuditTarget
+from dropshare_server.services.audit import AuditDetails, node_target
 from dropshare_server.services.content import Content, resolve_range
 from dropshare_server.services.context import CallContext
+from dropshare_server.services.file_policy import FileTypePolicy
 from dropshare_server.storage.base import StorageBackend
 from dropshare_shared.errors import ErrorCode
 from dropshare_shared.naming import InvalidNameError, normalize_name, validate_name
@@ -42,10 +43,6 @@ from dropshare_shared.schemas.sync import ChangeType
 
 def to_out(node: Node) -> NodeOut:
     return NodeOut.model_validate(node, from_attributes=True)
-
-
-def node_target(node: Node) -> AuditTarget:
-    return AuditTarget(type="node", id=str(node.id), name=node.name)
 
 
 def valid_name(name: str, loc: list[str | int]) -> tuple[str, str]:
@@ -173,6 +170,7 @@ def create_folder(
 
 def move_node(
     session: Session,
+    file_types: FileTypePolicy,
     ctx: CallContext,
     user_id: uuid.UUID,
     node_id: uuid.UUID,
@@ -229,6 +227,12 @@ def move_node(
     existing = node_repository.get_live_child(session, parent.namespace_id, parent.id, normalized)
     if existing is not None and existing.id != node.id:
         raise name_conflict(existing)
+    # Banned types (FR-SAFE-02, OQ-57): checked once the move is known to change something,
+    # so repeating an earlier success still succeeds, and after the move's own checks.
+    if node.kind == NodeKind.FILE:
+        file_types.check_name(session, ctx, name, node_target(node))
+    else:
+        file_types.check_folder(session, ctx, node)
 
     if parent.namespace_id != node.namespace_id:
         return _move_between_namespaces(session, ctx, user_id, node, parent, name, normalized)

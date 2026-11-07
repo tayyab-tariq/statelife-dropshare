@@ -28,6 +28,7 @@ from dropshare_server.services import changes as change_service
 from dropshare_server.services import nodes as node_service
 from dropshare_server.services.audit import AuditDetails, AuditTarget
 from dropshare_server.services.context import CallContext
+from dropshare_server.services.file_policy import FileTypePolicy
 from dropshare_shared.errors import ErrorCode
 from dropshare_shared.schemas.audit import AuditAction
 from dropshare_shared.schemas.envelope import Meta, PageQuery
@@ -156,7 +157,7 @@ def folder_name(session: Session, namespace: Namespace) -> str:
 
 def _audit_target(session: Session, target: _Target) -> AuditTarget:
     if target.is_file or not target.shared:
-        return node_service.node_target(target.node)
+        return audit_service.node_target(target.node)
     name = folder_name(session, target.namespace)
     return AuditTarget(type="node", id=str(target.node.id), name=name)
 
@@ -195,7 +196,12 @@ def _grantee_details(share: Share) -> AuditDetails:
 
 
 def add_member(
-    session: Session, ctx: CallContext, user_id: uuid.UUID, node_id: uuid.UUID, body: MemberIn
+    session: Session,
+    file_types: FileTypePolicy,
+    ctx: CallContext,
+    user_id: uuid.UUID,
+    node_id: uuid.UUID,
+    body: MemberIn,
 ) -> MemberOut:
     """Give a user or group a role on a folder or file. The first member of a folder turns it
     into a shared folder (`_share_folder`)."""
@@ -203,6 +209,14 @@ def add_member(
     if target.role != AccessRole.OWNER:
         raise _owner_only()
     grantee = _grantee(session, target.namespace.owner_user_id, body)
+    # OQ-57 (10): a file stored before its type was banned, or a folder holding one, reaches
+    # nobody new. Checked for every new member: each one would sync the file.
+    if target.is_file:
+        file_types.check_name(
+            session, ctx, target.node.name or "", audit_service.node_target(target.node)
+        )
+    else:
+        file_types.check_folder(session, ctx, target.node)
     is_user = isinstance(grantee, User)
     now = datetime.now(UTC)
     user_ref = grantee.id if is_user else None
@@ -511,7 +525,7 @@ def mount(session: Session, ctx: CallContext, user_id: uuid.UUID, body: MountIn)
             session,
             ctx,
             AuditAction.SHARE_ACCEPTED,
-            target=node_service.node_target(node),
+            target=audit_service.node_target(node),
             details={"namespace_id": str(namespace.id)},
         )
         return node_service.to_out(node)
@@ -541,7 +555,7 @@ def unmount(
         session,
         ctx,
         AuditAction.SHARE_LEFT,
-        target=node_service.node_target(node),
+        target=audit_service.node_target(node),
         details={"namespace_id": str(namespace_id)},
     )
 

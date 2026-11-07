@@ -7,6 +7,7 @@ from typing import Literal, Self
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from dropshare_shared.naming import normalize_extension
 from dropshare_shared.signing import ExpectedSigner, normalize_thumbprint
 from dropshare_shared.version import parse_version
 
@@ -15,6 +16,13 @@ ENV_FILE = Path(__file__).resolve().parents[3] / ".env"
 
 _MIB = 1024**2
 _GIB = 1024**3
+
+# Programs and scripts Windows runs or installs when opened (OQ-56, OQ-57). Macro-enabled
+# Office files stay allowed: ClamAV checks them for known macro malware.
+_BANNED_EXTENSIONS = [
+    ".exe", ".dll", ".msi", ".bat", ".cmd", ".com", ".scr", ".ps1", ".vbs",
+    ".js", ".jse", ".wsf", ".hta", ".jar", ".lnk", ".reg", ".iso",
+]  # fmt: skip
 
 
 class DatabaseSettings(BaseSettings):
@@ -62,8 +70,12 @@ class Settings(DatabaseSettings):
     release_cert_sha256: list[str] = []
     default_quota_bytes: int = Field(default=50 * _GIB, ge=0)  # NFR-SCALE-03
 
-    # Files and transfers (FR-XFER-01, NFR-SCALE-01, requirements §7.2).
-    max_file_size_bytes: int = Field(default=10 * _GIB, ge=0)
+    # Files and transfers (FR-XFER-01, NFR-SCALE-01, requirements §7.2). 3 GB so every file
+    # fits the malware scanner (D18, OQ-54).
+    max_file_size_bytes: int = Field(default=3 * _GIB, ge=0)
+    # Refused as a file's last extension (FR-SAFE-02), a JSON list such as [".exe", ".dll"].
+    # Kept in `naming.normalize_extension` form.
+    banned_extensions: list[str] = _BANNED_EXTENSIONS
     upload_chunk_size_bytes: int = Field(default=8 * _MIB, ge=1)
     upload_expiry_hours: int = Field(default=24, ge=1)
 
@@ -112,6 +124,15 @@ class Settings(DatabaseSettings):
 
     def release_signer(self) -> ExpectedSigner:
         return ExpectedSigner.of(self.release_publisher, self.release_cert_sha256)
+
+    @field_validator("banned_extensions")
+    @classmethod
+    def _banned_extensions(cls, values: list[str]) -> list[str]:
+        normalized = [normalize_extension(value) for value in values]
+        duplicates = sorted({value for value in normalized if normalized.count(value) > 1})
+        if duplicates:
+            raise ValueError(f"Listed more than once: {', '.join(duplicates)}")
+        return normalized
 
     @field_validator("min_client_version")
     @classmethod

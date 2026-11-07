@@ -33,10 +33,11 @@ from dropshare_server.services import blobs as blob_service
 from dropshare_server.services import changes as change_service
 from dropshare_server.services import nodes as node_service
 from dropshare_server.services.context import CallContext
+from dropshare_server.services.file_policy import FileTypePolicy
 from dropshare_server.storage.base import StorageBackend
 from dropshare_shared.errors import ErrorCode
 from dropshare_shared.naming import InvalidNameError, normalize_name, validate_name
-from dropshare_shared.schemas.audit import AuditAction
+from dropshare_shared.schemas.audit import AuditAction, AuditOutcome
 from dropshare_shared.schemas.envelope import Meta, PageQuery
 from dropshare_shared.schemas.error_details import RevisionConflictDetails
 from dropshare_shared.schemas.nodes import AccessRole, NamespaceKind, NodeKind, NodeOut
@@ -174,7 +175,13 @@ def _shared_folder_name(
 # --- restore ------------------------------------------------------------------------------------
 
 
-def restore(session: Session, ctx: CallContext, user_id: uuid.UUID, node_id: uuid.UUID) -> NodeOut:
+def restore(
+    session: Session,
+    file_types: FileTypePolicy,
+    ctx: CallContext,
+    user_id: uuid.UUID,
+    node_id: uuid.UUID,
+) -> NodeOut:
     """Put an item back where it was deleted from (FR-TRASH-02). A deleted parent folder is
     recreated (or a live folder of that name reused); a name taken meanwhile gets "(restored)".
     Restoring again after it succeeded returns the item as it is (NFR-REL-04)."""
@@ -188,6 +195,8 @@ def restore(session: Session, ctx: CallContext, user_id: uuid.UUID, node_id: uui
     node = group[0]
     _require_yours(session, user_id, node, role)  # again, now that it is locked
     _require_shared_folder_live(session, node)
+    if node.kind == NodeKind.FILE:  # OQ-57 (9): a banned file stays in the trash
+        file_types.check_name(session, ctx, node.name or "", audit_service.node_target(node))
     parent, created = _live_parent(session, user_id, node)
     original = node.name
     assert original is not None  # noqa: S101 - never a root
@@ -195,6 +204,12 @@ def restore(session: Session, ctx: CallContext, user_id: uuid.UUID, node_id: uui
     node.parent_id, node.name, node.name_normalized = parent.id, name, normalized
 
     restored, mounts = _restorable(session, user_id, node, group)
+    # OQ-57 (9): a folder comes back without its banned files. Each stays in the trash as an
+    # item of its own, so it can still be deleted for good, and nothing else is held back.
+    kept = file_types.banned_files(item for item in restored if item is not node)
+    for item in kept:
+        item.trash_root_id = item.id
+    restored = [item for item in restored if item not in kept]
     _free_names_beside(session, node, restored)
     # A new revision for each: clients remember a trashed item's revision and ignore anything
     # about it at that revision or below, so an unchanged one would never come back.
@@ -212,14 +227,25 @@ def restore(session: Session, ctx: CallContext, user_id: uuid.UUID, node_id: uui
         session,
         ctx,
         AuditAction.NODE_RESTORED,
-        target=node_service.node_target(node),
+        target=audit_service.node_target(node),
         details={
             "kind": node.kind.value,
             "items": len(restored) - 1,
             "renamed": name != original,
             "recreated_folders": created,
+            "left_in_trash": len(kept),
         },
     )
+    if kept:
+        names = sorted(item.name or "" for item in kept)
+        audit_service.record(
+            session,
+            ctx,
+            AuditAction.FILE_TYPE_BLOCKED,
+            AuditOutcome.DENIED,
+            target=audit_service.node_target(node),
+            details={"reason": "left_in_trash", "file_name": names[0], "files": len(names)},
+        )
     return node_service.to_out(node)
 
 
@@ -421,7 +447,7 @@ def delete_forever(
             "Only the owner can delete this permanently.",
             target=("node", str(node_id)),
         )
-    target = node_service.node_target(node)
+    target = audit_service.node_target(node)
     kind = node.kind
     purged = _purge(session, node.id)
     if purged is None:  # restored or purged by another request since it was read
@@ -457,7 +483,7 @@ def empty_trash(
         node = node_repository.get(session, root_id)
         if node is None:
             continue
-        target, kind = node_service.node_target(node), node.kind
+        target, kind = audit_service.node_target(node), node.kind
         shown = not _others_mount(session, user_id, node)
         try:
             purged = _purge(session, root_id)
@@ -615,7 +641,7 @@ def purge_expired(
                 node = node_repository.get(session, root_id)
                 if node is None:
                     continue
-                target, kind = node_service.node_target(node), node.kind
+                target, kind = audit_service.node_target(node), node.kind
                 try:
                     # Checked again under the lock: restored, purged or deleted again since.
                     purged = _purge(session, root_id, trashed_before=before)

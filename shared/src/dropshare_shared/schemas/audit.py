@@ -25,6 +25,7 @@ class AuditAction(StrEnum):
     FOLDER_CREATED = "folder.created"
     FILE_UPLOADED = "file.uploaded"
     FILE_DOWNLOADED = "file.downloaded"
+    FILE_TYPE_BLOCKED = "file.type_blocked"
     NODE_TRASHED = "node.trashed"
     NODE_RENAMED = "node.renamed"
     NODE_MOVED = "node.moved"

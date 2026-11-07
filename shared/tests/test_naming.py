@@ -7,6 +7,9 @@ from dropshare_shared.naming import (
     NAME_PROBLEM_MESSAGES,
     InvalidNameError,
     NameProblem,
+    file_extension,
+    is_banned,
+    normalize_extension,
     normalize_name,
     validate_name,
 )
@@ -109,3 +112,81 @@ def test_normalized_names_collide_case_insensitively(first: str, second: str) ->
 
 def test_different_names_do_not_collide() -> None:
     assert normalize_name("report-1.docx") != normalize_name("report-2.docx")
+
+
+# FR-SAFE-02: the last extension of the normalized name, compared case-insensitively.
+@pytest.mark.parametrize(
+    ("name", "extension"),
+    [
+        ("setup.exe", ".exe"),
+        ("SETUP.EXE", ".exe"),
+        ("Setup.ExE", ".exe"),
+        ("invoice.pdf.EXE", ".exe"),
+        ("archive.tar.gz", ".gz"),
+        ("report.exe.pdf", ".pdf"),
+        ("exe.txt", ".txt"),
+        (".exe", ".exe"),
+        (".gitignore", ".gitignore"),
+        ("README", None),
+        ("exe", None),
+        ("trailing.", None),
+        ("Résumé.PDF", ".pdf"),
+        ("caf\u0065\u0301.\u00c9XE", ".\u00e9xe"),  # NFD stem, NFC extension
+        ("x.\u0045\u0301XE", ".\u00e9xe"),  # NFD extension
+        ("photo.\u0130", ".i\u0307"),  # casefold of dotted capital I
+        ("a" * 251 + ".exe", ".exe"),
+        ("名前.EXE", ".exe"),
+        ("📄.exe", ".exe"),
+        ("name .exe", ".exe"),
+        ("a. exe", ". exe"),
+    ],
+)
+def test_file_extension_is_the_last_extension_casefolded(name: str, extension: str | None) -> None:
+    assert file_extension(name) == extension
+
+
+_BANNED = frozenset({".exe", ".ps1", ".js"})
+
+
+@pytest.mark.parametrize(
+    ("name", "banned"),
+    [
+        ("setup.exe", True),
+        ("SETUP.EXE", True),
+        ("invoice.pdf.Exe", True),
+        ("script.PS1", True),
+        (".exe", True),
+        ("app.js", True),
+        ("report.exe.pdf", False),
+        ("exe.txt", False),
+        ("exe", False),
+        ("notes.json", False),  # ".js" is not a prefix match
+        ("setup.exe1", False),
+        ("setup.xe", False),
+        ("README", False),
+    ],
+)
+def test_is_banned_matches_only_the_last_extension(name: str, banned: bool) -> None:
+    assert is_banned(name, _BANNED) is banned
+
+
+def test_is_banned_with_an_empty_list_allows_everything() -> None:
+    assert not is_banned("setup.exe", frozenset())
+
+
+@pytest.mark.parametrize(
+    ("entry", "normalized"),
+    [(".exe", ".exe"), (".EXE", ".exe"), (".Ps1", ".ps1"), (".\u0045\u0301", ".\u00e9")],
+)
+def test_normalize_extension_gives_the_comparison_form(entry: str, normalized: str) -> None:
+    assert normalize_extension(entry) == normalized
+    assert is_banned("file" + entry, {normalized})
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["", ".", "exe", "*.exe", ".tar.gz", "..exe", ".ex/e", ".ex:e", ".e\x00", ".exe "],
+)
+def test_normalize_extension_refuses_entries_that_could_never_match(entry: str) -> None:
+    with pytest.raises(ValueError, match=r"."):
+        normalize_extension(entry)
