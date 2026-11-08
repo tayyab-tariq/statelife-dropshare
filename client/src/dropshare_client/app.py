@@ -284,7 +284,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             index_path,
         ),
         UploadController(
-            config, lambda root: Importer(root, system.recycle_bin), sync, auth.current_user
+            config,
+            lambda root: Importer(root, system.recycle_bin, files.banned_extensions),
+            sync,
+            auth.current_user,
         ),
         share=ShareController(sharing),
         shared=SharedController(sharing),

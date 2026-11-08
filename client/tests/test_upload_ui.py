@@ -254,10 +254,12 @@ def test_checking_a_big_upload_can_be_cancelled(
     walking = threading.Event()
     real_walk = importer._walk
 
-    def slow_walk(path: Path, stop: threading.Event) -> int:
+    def slow_walk(
+        path: Path, stop: threading.Event, banned: frozenset[str], not_allowed: list[str]
+    ) -> int:
         walking.set()
         stop.wait(5)  # until cancelled
-        return real_walk(path, stop)
+        return real_walk(path, stop, banned, not_allowed)
 
     monkeypatch.setattr(importer, "_walk", slow_walk)
     cancelled: list[str] = []
@@ -293,3 +295,22 @@ def test_without_the_server_the_quota_from_sign_in_is_used(
     s.shell.browser_view._upload_files_action.trigger()
 
     qtbot.waitUntil(lambda: "only 2 bytes left" in _error(s))
+
+
+def test_an_upload_leaves_out_banned_files_and_says_which(
+    qtbot: QtBot, make_client: MakeClient, make_shell: MakeShell, tmp_path: Path, desktop: Path
+) -> None:
+    # FR-SAFE-03: the rest is copied; the summary names what was left out and why.
+    (desktop / "setup.exe").write_bytes(b"MZ")
+    s = _setup(qtbot, make_client, make_shell, tmp_path)
+    view = s.shell.browser_view
+    view.uploads.choose_files = lambda: [desktop / "setup.exe", desktop / "report.pdf"]
+
+    view._upload_files_action.trigger()
+
+    qtbot.waitUntil(lambda: (s.root / "report.pdf").exists())
+    # Kept on screen (the error line), not a caption that clears after a few seconds.
+    qtbot.waitUntil(lambda: "doesn't allow its type" in _error(s))
+    assert "1 file wasn't added because DropShare doesn't allow its type: setup.exe" in _error(s)
+    assert not (s.root / "setup.exe").exists()
+    assert (desktop / "setup.exe").read_bytes() == b"MZ"

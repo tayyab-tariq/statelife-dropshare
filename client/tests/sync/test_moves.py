@@ -536,7 +536,8 @@ def test_a_rename_to_a_name_windows_cant_use_loses_nothing(
     device: Device, server: FakeFileServer
 ) -> None:
     """The scanner refuses the name (as the server would, NFR-COMPAT-02): the file stays
-    here, listed as can't sync, and the old name goes to the server trash."""
+    here, listed as can't sync, and the server keeps it under its old name, never trashed
+    (OQ-59 (1)). Renaming it back resumes syncing."""
     device.write("doc.txt", BASE)
     device.sync()
 
@@ -545,4 +546,12 @@ def test_a_rename_to_a_name_windows_cant_use_loses_nothing(
 
     assert (device.root / "CON.txt").read_bytes() == BASE
     assert [problem.path for problem in device.index.problems()] == ["CON.txt"]
-    assert server.trashed() == [("doc.txt", BASE)]
+    assert server.tree() == {"doc.txt": BASE}
+    assert server.trashed() == []
+
+    _rename(device, "CON.txt", "doc.txt")
+    device.sync()
+
+    assert device.index.problems() == []
+    assert server.tree() == {"doc.txt": BASE}
+    assert server.calls.count("upload") == 1  # the first upload only: nothing sent again

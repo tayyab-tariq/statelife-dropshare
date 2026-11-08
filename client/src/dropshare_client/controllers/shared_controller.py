@@ -13,7 +13,11 @@ from PySide6.QtCore import QObject, QTimer, Signal
 
 from dropshare_client.controllers import messages
 from dropshare_client.controllers.worker import Worker
-from dropshare_client.services.errors import TransferCancelledError
+from dropshare_client.services.errors import (
+    OfflineError,
+    ScanPendingError,
+    TransferCancelledError,
+)
 from dropshare_client.services.links import link_to
 from dropshare_client.services.sharing import Sharing
 from dropshare_shared.schemas.nodes import NodeKind
@@ -22,6 +26,9 @@ from dropshare_shared.schemas.sharing import SharedItemOut, ShareRole
 logger = logging.getLogger(__name__)
 
 REFRESH_MS = 60_000
+
+# The longest wait between asking again about a new version being scanned (FR-SAFE-01).
+_VERSION_CHECK_MAX = 300.0
 
 # Re-exported so ui/ needn't import the shared contract (architecture §1).
 __all__ = ["NodeKind", "ShareRole", "SharedController", "SharedItemOut"]
@@ -49,6 +56,9 @@ class SharedController(QObject):
         self._generation = 0
         self._busy = False
         self._stop = threading.Event()
+        # New versions waiting for the server's malware scan: asked again until settled.
+        self._versions: dict[uuid.UUID, Callable[[threading.Event], object]] = {}
+        self._uploading: uuid.UUID | None = None  # the file of the version upload running
         self._timer = QTimer(self)
         self._timer.setInterval(REFRESH_MS)
         self._timer.timeout.connect(lambda: self.refresh(quiet=True))
@@ -128,11 +138,51 @@ class SharedController(QObject):
         )
 
     def upload_version(self, item: SharedItemOut, source: Path) -> None:
-        self._transfer(
-            messages.uploading_version(item.name),
-            lambda stop: self._sharing.upload_version(item.node_id, source, stop, self._progress),
-            messages.NEW_VERSION_UPLOADED,
-        )
+        based_on: list[int] = []  # asked once, so asking again continues the same upload
+
+        def work(stop: threading.Event) -> object:
+            if not based_on:
+                based_on.append(self._sharing.current_revision(item.node_id))
+            return self._sharing.upload_version(
+                item.node_id, based_on[0], source, stop, self._progress
+            )
+
+        self._versions[item.node_id] = work
+        self._uploading = item.node_id
+        self._transfer(messages.uploading_version(item.name), work, messages.NEW_VERSION_UPLOADED)
+
+    def _check_version(self, node_id: uuid.UUID, delay: float) -> None:
+        """Ask again, in the background, about a new version the server is still scanning,
+        until it is published or refused (FR-SAFE-01): the user is told either way."""
+        work, generation = self._versions.get(node_id), self._generation
+
+        def ask() -> None:
+            if work is None or generation != self._generation:
+                return  # signed out or reset meanwhile
+
+            def published(_: object) -> None:
+                self._versions.pop(node_id, None)
+                if generation == self._generation:
+                    self.succeeded.emit(messages.NEW_VERSION_UPLOADED)
+                    self.refresh(quiet=True)
+
+            def not_yet(exc: Exception) -> None:
+                if generation != self._generation:
+                    return
+                if isinstance(exc, ScanPendingError | OfflineError):
+                    self._check_version(node_id, min(delay * 2, _VERSION_CHECK_MAX))
+                    return
+                self._versions.pop(node_id, None)
+                logger.info("New version refused after its scan: %s", exc)
+                self.action_failed.emit(messages.message_for(exc))
+
+            self._worker.submit(lambda: work(threading.Event()), published, not_yet)
+
+        QTimer.singleShot(int(delay * 1000), self, ask)
+
+    def _check_after_scan(self, delay: float) -> None:
+        if self._uploading is not None:
+            self._check_version(self._uploading, delay)
 
     def cancel(self) -> None:
         """Stop the transfer running now; what it wrote so far is removed."""
@@ -171,6 +221,9 @@ class SharedController(QObject):
                     self.action_failed.emit(messages.COPY_EXISTS_THERE)
                 elif isinstance(exc, TransferCancelledError):
                     self.succeeded.emit(messages.TRANSFER_CANCELLED)
+                elif isinstance(exc, ScanPendingError):  # uploaded; visible once scanned
+                    self.succeeded.emit(messages.NEW_VERSION_SCANNING)
+                    self._check_after_scan(exc.retry_after)
                 else:
                     self.action_failed.emit(messages.message_for(exc))
 

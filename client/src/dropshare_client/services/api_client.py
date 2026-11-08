@@ -7,6 +7,7 @@ Logs method, path, status, duration and request ID; never headers, tokens or bod
 
 import contextlib
 import logging
+import math
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -33,6 +34,10 @@ logger = logging.getLogger(__name__)
 _TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
 _REFRESH_PATH = "/api/v1/auth/refresh"
 _INVALID_RESPONSE = "INVALID_RESPONSE"  # client-side code: the body wasn't what we expected
+# How soon to ask again after a 202 that names no time (FR-SAFE-01), and the longest wait a
+# server may ask for.
+_DEFAULT_RETRY_AFTER = 5.0
+_MAX_RETRY_AFTER = 300.0
 # Failures where the request never reached the server, so nothing was used up on the way.
 _NOT_SENT = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 # Refresh answers given before the token is looked at: the client version check (426) runs
@@ -60,6 +65,25 @@ class _ObjectData(BaseModel):
     """`{data: {...}}` before `data` is parsed as the endpoint's model."""
 
     data: dict[str, object]
+
+
+@dataclass(frozen=True)
+class Accepted[T: BaseModel]:
+    """A 202: the server took the request, but its result isn't ready (FR-SAFE-01)."""
+
+    data: T
+    retry_after: float  # seconds until it is worth asking again
+
+
+def _retry_after(response: httpx.Response) -> float:
+    """The server's Retry-After in seconds, within reason; a default if it names none."""
+    try:
+        seconds = float(response.headers.get("Retry-After", ""))
+    except ValueError:
+        return _DEFAULT_RETRY_AFTER
+    if not math.isfinite(seconds):
+        return _DEFAULT_RETRY_AFTER
+    return min(max(seconds, 1.0), _MAX_RETRY_AFTER)
 
 
 class ApiClient:
@@ -98,6 +122,26 @@ class ApiClient:
 
     def close(self) -> None:
         self._http.close()
+
+    def data_or_accepted[T: BaseModel, A: BaseModel](
+        self,
+        method: str,
+        path: str,
+        model: type[T],
+        accepted: type[A],
+        *,
+        timeout: httpx.Timeout | None = None,
+    ) -> T | "Accepted[A]":
+        """Send a request whose result may not be ready yet: its `data` as `model`, or, for a
+        202, as `accepted` with when to ask again (`complete` while the malware scan runs)."""
+        response = self._request(method, path, _Call(timeout=timeout), True)
+        try:
+            data = _ObjectData.model_validate_json(response.content).data
+            if response.status_code == 202:
+                return Accepted(accepted.model_validate(data), _retry_after(response))
+            return model.model_validate(data)
+        except ValidationError:
+            raise self._invalid_response(response) from None
 
     def data[T: BaseModel](
         self,

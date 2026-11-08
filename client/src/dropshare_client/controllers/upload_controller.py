@@ -192,18 +192,25 @@ class UploadController(QObject):
 
         self._worker.submit(
             lambda: importer.run(plan, resolutions, stop, progress),
-            lambda result: self._copied(result, len(plan.sources)),
+            lambda result: self._copied(result, len(plan.sources), plan.not_allowed),
             self._failed,
         )
 
-    def _copied(self, result: ImportResult, chosen: int) -> None:
+    def _copied(self, result: ImportResult, chosen: int, not_allowed: list[str]) -> None:
         self._set_phase(_Phase.IDLE)
         if result.changed:
             self._sync.changed_here(result.changed)
         text = messages.uploaded(len(result.changed), chosen - len(result.changed))
+        if not_allowed:
+            text = f"{text} {messages.not_allowed(not_allowed)}"
         if result.kept:
             text = f"{text} {messages.kept_aside(len(result.kept))}"
-        self.succeeded.emit(text)
+        if not_allowed:
+            # Kept on screen, not a passing caption: the user needs to see what was left out
+            # (FR-SAFE-03). Those files never reach the sync folder, so Can't sync can't list them.
+            self.failed.emit(text)
+        else:
+            self.succeeded.emit(text)
 
     def _failed(self, exc: Exception) -> None:
         self._set_phase(_Phase.IDLE)

@@ -122,20 +122,26 @@ class Sharing:
         finally:
             part.unlink(missing_ok=True)
 
+    def current_revision(self, node_id: uuid.UUID) -> int:
+        """The revision a new version of the file is based on."""
+        return self._files.get_node(node_id).revision
+
     def upload_version(
         self,
         node_id: uuid.UUID,
+        base_revision: int,
         source: Path,
         stop: threading.Event,
         progress: Callable[[int, int], None] = lambda done, total: None,
     ) -> NodeOut:
-        """A new version of a file shared with the user as editor (OQ-32). It replaces the
-        current version; earlier versions are kept on the server (G6)."""
-        node = self._files.get_node(node_id)
+        """A new version of a file shared with the user as editor (OQ-32), based on
+        `base_revision`. It replaces the current version; earlier versions are kept on the
+        server (G6). Asked again with the same revision after ScanPendingError, it picks the
+        same upload up and sends nothing again (FR-SAFE-01)."""
         info = source.stat()
         return self._files.upload(
             SourceFile(source, file_sha256(source, stop), info.st_size, info.st_mtime_ns),
-            NewVersion(node.id, node.revision),
+            NewVersion(node_id, base_revision),
             stop,
             lambda done: progress(done, info.st_size),
         )

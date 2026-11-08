@@ -20,6 +20,7 @@ from dropshare_client.services.errors import (
     ApiError,
     OfflineError,
     RemoteContentChangedError,
+    ScanPendingError,
     SourceChangedError,
 )
 from dropshare_client.services.files import (
@@ -39,7 +40,7 @@ from dropshare_client.sync.paths import key_of, outermost
 from dropshare_client.sync.server import FileServer
 from dropshare_client.sync.transfers import TransferEvent
 from dropshare_shared.errors import ErrorCode
-from dropshare_shared.naming import InvalidNameError, normalize_name, validate_name
+from dropshare_shared.naming import InvalidNameError, file_extension, normalize_name, validate_name
 from dropshare_shared.schemas.nodes import (
     AccessRole,
     NamespaceKind,
@@ -48,6 +49,7 @@ from dropshare_shared.schemas.nodes import (
     NodeOut,
 )
 from dropshare_shared.schemas.sync import ChangeOut, ChangesMeta, ChangesResponse, ChangeType
+from dropshare_shared.schemas.uploads import UploadOut, UploadStatus
 
 USER_ID = uuid.UUID("00000000-0000-0000-0000-00000000a11c")
 OTHER_DEVICE = uuid.UUID("00000000-0000-0000-0000-0000000000b0")
@@ -138,6 +140,19 @@ class FakeFileServer:
         self.cut_upload_at: int | None = None
         self.download_offsets: list[int] = []
         self.resumed_uploads: list[str] = []
+        # Content safety (FR-SAFE-01/02): the banned types it tells clients about, the ones it
+        # refuses (normally the same; different when its list changed after the client asked),
+        # content its malware scan finds (marker -> detection name), and how many more uploads
+        # it answers "still scanning" before finishing them.
+        self.banned: set[str] = set()
+        self.refuses: set[str] | None = None
+        self.malware: dict[bytes, str] = {}
+        self.scan_waits = 0
+        # Uploads the scan worker hasn't finished: upload key -> (target, content). Published
+        # by finish_scans(), as the worker would, whatever the client does meanwhile.
+        self.scanning: dict[str, tuple[UploadTarget, bytes, uuid.UUID | None]] = {}
+        self.published: dict[str, FakeNode] = {}
+        self.completed: dict[uuid.UUID, uuid.UUID] = {}  # upload ID -> the node it published
         self._lock = threading.RLock()
 
     # --- test helpers (another device's actions) ------------------------------------------
@@ -219,6 +234,21 @@ class FakeFileServer:
         return "/".join(reversed(names))
 
     # --- FileServer ------------------------------------------------------------------------
+
+    @_locked
+    def banned_extensions(self, *, refresh: bool = False) -> frozenset[str]:
+        # A read, asked on connect, after namespaces(): not recorded among the calls.
+        return frozenset(self.banned)
+
+    def _refused_type(self, name: str) -> None:
+        refuses = self.banned if self.refuses is None else self.refuses
+        extension = file_extension(name)
+        if extension is not None and extension in refuses:
+            raise ApiError(
+                422,
+                ErrorCode.FILE_TYPE_NOT_ALLOWED,
+                f"Files of type {extension} aren't allowed in DropShare.",
+            )
 
     @_locked
     def namespaces(self) -> list[NamespaceOut]:
@@ -320,6 +350,8 @@ class FakeFileServer:
             raise _invalid("The root folder can't be moved.", "root_not_movable")
         if name is not None:
             _check_name(name)
+        if node.kind == NodeKind.FILE:
+            self._refused_type(name or node.name or "")
         parent = self._live_node(parent_id or node.parent_id)
         if parent.kind != NodeKind.FOLDER:
             raise _invalid("The parent must be a folder.", "not_a_folder")
@@ -342,6 +374,45 @@ class FakeFileServer:
         self._record(ChangeType.MOVED, node)
         self._after("move")
         return node.out(self.namespace_id)
+
+    @_locked
+    def finish_scans(self) -> None:
+        """The scan worker publishes every upload it was scanning (FR-SAFE-01)."""
+        for key, (target, content, upload_id) in list(self.scanning.items()):
+            if isinstance(target, NewFile):
+                node = FakeNode(uuid.uuid4(), target.parent_id, target.name, NodeKind.FILE, content)
+                self.nodes[node.id] = node
+                self._record(ChangeType.CREATED, node)
+            else:
+                node = self.nodes[target.node_id]
+                node.content = content
+                node.revision += 1
+                node.modified_at = datetime.now(UTC)
+                self._record(ChangeType.MODIFIED, node)
+            self.published[key] = node
+            if upload_id is not None:
+                self.completed[upload_id] = node.id
+        self.scanning.clear()
+
+    @_locked
+    def upload_status(self, upload_id: uuid.UUID) -> UploadOut | None:
+        node_id = self.completed.get(upload_id)
+        if node_id is None:
+            return None
+        return UploadOut(
+            id=upload_id,
+            status=UploadStatus.COMPLETED,
+            size_bytes=0,
+            chunk_size=1,
+            chunk_count=0,
+            received_chunks=[],
+            expires_at=datetime.now(UTC),
+            node_id=node_id,
+        )
+
+    def _name_of(self, node_id: uuid.UUID) -> str:
+        node = self.nodes.get(node_id)
+        return (node.name or "") if node is not None else ""
 
     def _live_below(self, node: FakeNode) -> list[FakeNode]:
         found: list[FakeNode] = []
@@ -369,6 +440,9 @@ class FakeFileServer:
             content
         ) != source.sha256:
             raise SourceChangedError(str(source.path))
+        # Refused at upload start, before any session exists (FR-SAFE-02).
+        named = target.name if isinstance(target, NewFile) else self._name_of(target.node_id)
+        self._refused_type(named)
         key = upload_key(target)
         stored = None if sessions is None else sessions.upload_session(key)
         if stored is not None and (stored.sha256, stored.size) == (source.sha256, source.size):
@@ -379,6 +453,32 @@ class FakeFileServer:
             cut, self.cut_upload_at = self.cut_upload_at, None
             progress(cut)
             raise OfflineError("connection lost mid-upload")
+        if key in self.published:  # finished by the scan worker: `complete` answers with it
+            node = self.published.pop(key)
+            if sessions is not None:
+                sessions.forget_upload_session(key)
+            return node.out(self.namespace_id)
+        if key in self.scanning:
+            if self.scanning[key][1] != content:
+                # Edited meanwhile: the earlier upload can't be cancelled while it is scanned,
+                # so RemoteFiles waits (409 UPLOAD_SCANNING).
+                raise ScanPendingError(0.01)
+            raise ScanPendingError(0.01)
+        if self.scan_waits > 0:  # as RemoteFiles after a 202: the session is kept
+            self.scan_waits -= 1
+            session = None if sessions is None else sessions.upload_session(key)
+            self.scanning[key] = (target, content, None if session is None else session.upload_id)
+            raise ScanPendingError(0.01)
+        for marker, detection in self.malware.items():
+            if marker in content:
+                if sessions is not None:
+                    sessions.forget_upload_session(key)
+                raise ApiError(
+                    422,
+                    ErrorCode.MALWARE_DETECTED,
+                    f"DropShare's virus scan found a threat in this file ({detection}).",
+                    {"detection": detection},
+                )
         if isinstance(target, NewFile):
             parent = self._live_folder(target.parent_id)
             self._check_free(parent, target.name)

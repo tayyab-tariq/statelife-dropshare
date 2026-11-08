@@ -7,13 +7,14 @@ that differ only in case as the same file (windows-fs.md).
 
 import fnmatch
 import unicodedata
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from datetime import datetime
 
 # Partial downloads, kept-aside items and the owner marker; never synced (FR-SYNC-07).
 from dropshare_client.services.sync_folder import TEMP_DIR as TEMP_DIR
 from dropshare_shared.naming import (
     InvalidNameError,
+    file_extension,
     is_allowed_character,
     normalize_name,
     validate_name,
@@ -88,6 +89,12 @@ def name_problem(name: str) -> str | None:
     except InvalidNameError as exc:
         return str(exc)
     return None
+
+
+def banned_extension(name: str, banned: Collection[str]) -> str | None:
+    """The file's banned last extension, if its type is banned (FR-SAFE-02/03)."""
+    extension = file_extension(name)
+    return extension if extension is not None and extension in banned else None
 
 
 def conflict_name(

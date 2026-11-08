@@ -176,6 +176,32 @@ def test_ntfs_file_ids_survive_a_move_and_the_move_is_sent_as_one(tmp_path: Path
     assert "upload" not in server.calls and server.trashed() == []
 
 
+def test_renaming_to_a_banned_type_on_ntfs_keeps_the_server_copy(tmp_path: Path) -> None:
+    """OQ-59 (1), FR-SAFE-03, with the real NTFS file index: the renamed file is recognised,
+    so the server keeps it under its old name; renaming it back resumes syncing."""
+    from dropshare_client.platform.common import StatFileIdentity
+
+    server = FakeFileServer()
+    server.banned = {".exe"}
+    device = Device(tmp_path, server)
+    device.restart(file_identity=StatFileIdentity())  # what the app uses
+    device.write("tool.txt", b"tool")
+    device.sync()
+
+    (device.root / "tool.txt").rename(device.root / "Tool.EXE")
+    device.sync()
+
+    assert server.tree() == {"tool.txt": b"tool"} and server.trashed() == []
+    assert (device.root / "Tool.EXE").read_bytes() == b"tool"
+    assert [problem.path for problem in device.index.problems()] == ["Tool.EXE"]
+
+    (device.root / "Tool.EXE").rename(device.root / "tool.txt")
+    device.sync()
+
+    assert device.index.problems() == []
+    assert server.calls.count("upload") == 1
+
+
 def test_show_in_folder_starts_explorer_by_its_full_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

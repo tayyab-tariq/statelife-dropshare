@@ -34,3 +34,30 @@ def recent_activity(index_path: Path, limit: int) -> list[Activity]:
 def cant_sync(index_path: Path) -> list[Problem]:
     """Items that can't be synced (FR-SYNC-07)."""
     return read_problems(index_path)
+
+
+# --- Malware (FR-SAFE-01): why an upload was refused, in plain language -----------------------
+
+VIRUS_FOUND = "A virus was found in this file"
+# What the server calls a file it couldn't scan in full: refused, but not as a virus.
+_UNCHECKED = ("DropShare.Unscannable", "Heuristics.Limits.Exceeded")
+
+
+def malware_reason(detection: str) -> str:
+    """The Can't sync reason for an upload the malware scan refused. The file here is never
+    changed, moved or deleted (OQ-57 (1))."""
+    if detection.startswith(_UNCHECKED):
+        return (
+            "DropShare couldn't check this file for viruses (it is too large or complex to "
+            "scan), so it wasn't uploaded. Your copy here hasn't been changed. Keep it outside "
+            "your DropShare folder, or ask your administrator for help."
+        )
+    named = f" ({detection})" if detection else ""
+    return (
+        f"{VIRUS_FOUND}{named}, so it wasn't uploaded. Your copy here hasn't been changed: "
+        "delete it, or ask your administrator if you think it's safe."
+    )
+
+
+def is_virus(problem: Problem) -> bool:
+    return problem.reason.startswith(VIRUS_FOUND)
