@@ -87,6 +87,30 @@ class Problem:
 
 
 @dataclass(frozen=True)
+class HeldMove:
+    """A synced item renamed or moved here to a place it can't sync to (a refused name, or a
+    move the server refused): the server keeps it at `old_key`, never trashed, until the user
+    renames it back (OQ-59 (1)). `reason` is set when the server refused the move."""
+
+    old_key: str
+    target_key: str
+    node_id: uuid.UUID
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class Refusal:
+    """What the server refused for good (a banned type, malware; FR-SAFE-01/03), as it was
+    on disk then: not sent again until it changes, or is renamed or moved."""
+
+    key: str
+    path: str
+    size: int
+    mtime_ns: int
+    reason: str
+
+
+@dataclass(frozen=True)
 class StoredUpload:
     """A started upload remembered for its target: the server session and the content it is
     for (FR-XFER-01)."""

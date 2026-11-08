@@ -18,6 +18,7 @@ from dropshare_client.services.errors import (
     ContentMismatchError,
     OfflineError,
     RemoteContentChangedError,
+    ScanPendingError,
     SourceChangedError,
     TransferCancelledError,
 )
@@ -30,6 +31,7 @@ from dropshare_client.services.files import (
 )
 from dropshare_client.services.tokens import TokenStore
 from dropshare_client.store.index import Index
+from dropshare_client.store.records import StoredUpload
 from dropshare_shared.schemas.auth import TokenPairOut
 
 CHUNK = 4
@@ -105,6 +107,8 @@ class FakeTransfers:
         # What the malware scan says at each `complete` from now on (FR-SAFE-01): "wait" (202,
         # still scanning), "clean" or "malware". Empty: clean at once, as before M15b.
         self.scan: list[str] = []
+        self.cancel_scanning = False  # DELETE answers 409 UPLOAD_SCANNING (the worker has it)
+        self.rejected_as: tuple[int, str] | None = None  # a rejected upload replays this
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(f"{request.method} {request.url.path}")
@@ -151,6 +155,8 @@ class FakeTransfers:
                     return _error(400, "FILE_HASH_MISMATCH")
                 return self._scanned(upload_id, upload, assembled)
             case "DELETE", ["uploads", upload_id]:
+                if self.cancel_scanning and self.uploads[upload_id]["status"] == "scanning":
+                    return _error(409, "UPLOAD_SCANNING")
                 self.uploads[upload_id]["status"] = "cancelled"
                 return httpx.Response(204)
             case "GET", ["nodes", _, "content"]:
@@ -164,11 +170,15 @@ class FakeTransfers:
         self, upload_id: str, upload: dict[str, object], assembled: bytes
     ) -> httpx.Response:
         if upload["status"] == "rejected":
+            if self.rejected_as is not None:
+                return _error(*self.rejected_as)
             return _malware()
         answer = self.scan.pop(0) if self.scan else "clean"
         if answer == "wait":
             upload["status"] = "scanning"
-            return httpx.Response(202, json={"data": self._upload(upload_id)})
+            return httpx.Response(
+                202, json={"data": self._upload(upload_id)}, headers={"Retry-After": "7"}
+            )
         if answer == "malware":
             upload["status"] = "rejected"
             return _malware()
@@ -641,43 +651,104 @@ def test_download_progress_starts_from_the_partial_file_and_ends_at_the_size(
     assert seen == sorted(seen)
 
 
-# How this client (0.2.x) copes with malware scanning on the server, until the client part of
-# M15 (requirements OQ-58 (5)): pinned so a server change can't silently make it worse.
+# Malware scanning on the server (FR-SAFE-01): the client waits for the scan without sending
+# the file again, and a refusal ends the upload.
 
 
-def test_a_scan_still_to_come_is_retried_without_sending_the_file_again(
+def test_a_scan_still_to_come_is_waited_for_without_sending_the_file_again(
     files: RemoteFiles, fake: FakeTransfers, tmp_path: Path
 ) -> None:
     source = _source(tmp_path, b"abcdefgh")
     fake.scan = ["wait", "wait", "clean"]
     target = NewFile(PARENT_ID, "big.bin")
 
-    for _ in range(2):  # the 202 is an answer this client doesn't understand: it tries again
-        with pytest.raises(ApiError) as caught:
+    for _ in range(2):
+        with pytest.raises(ScanPendingError) as caught:
             files.upload(source, target, threading.Event())
-        assert caught.value.code == "INVALID_RESPONSE"
+        assert caught.value.retry_after == 7  # as the server asked
     node = files.upload(source, target, threading.Event())
 
     assert node.content_hash == source.sha256
     assert len(fake.uploads) == 1  # the same upload throughout
     chunk_puts = [request for request in fake.requests if request.startswith("PUT ")]
-    assert len(chunk_puts) == 2  # each chunk sent once, never again after the first 202
+    assert len(chunk_puts) == 2  # each chunk sent once
     assert not any(request.startswith("DELETE ") for request in fake.requests)
 
 
-def test_malware_found_is_reported_and_the_file_isnt_sent_again(
+def test_a_wait_for_the_scan_survives_a_restart(
+    files: RemoteFiles, fake: FakeTransfers, tmp_path: Path
+) -> None:
+    source = _source(tmp_path, b"abcdefgh")
+    fake.scan = ["wait", "clean"]
+    target = NewFile(PARENT_ID, "big.bin")
+    index = Index(tmp_path / "index.db")
+    with pytest.raises(ScanPendingError):
+        files.upload(source, target, threading.Event(), sessions=index)
+    index.close()
+
+    restarted = Index(tmp_path / "index.db")  # the app started again
+    node = files.upload(source, target, threading.Event(), sessions=restarted)
+
+    assert node.content_hash == source.sha256
+    assert len(fake.uploads) == 1
+    assert len([request for request in fake.requests if request.startswith("PUT ")]) == 2
+
+
+def test_malware_found_ends_the_upload(
     files: RemoteFiles, fake: FakeTransfers, tmp_path: Path
 ) -> None:
     source = _source(tmp_path, b"abcdefgh")
     fake.scan = ["malware"]
-    target = NewFile(PARENT_ID, "bad.exe.txt")
 
-    for _ in range(2):
-        with pytest.raises(ApiError) as caught:
-            files.upload(source, target, threading.Event())
-        assert caught.value.code == "MALWARE_DETECTED"
-        assert "Eicar" in caught.value.message  # what "Can't sync" shows
+    with pytest.raises(ApiError) as caught:
+        files.upload(source, NewFile(PARENT_ID, "bad.txt"), threading.Event())
 
-    assert len(fake.uploads) == 1  # a retry asks again; it doesn't upload again
-    assert len([request for request in fake.requests if request.startswith("PUT ")]) == 2
-    assert not any(request.startswith("DELETE ") for request in fake.requests)
+    assert caught.value.code == "MALWARE_DETECTED"
+    assert "Eicar" in caught.value.message
+    [upload] = fake.uploads.values()
+    assert upload["status"] == "cancelled"  # the session is let go; nothing stays reserved
+
+
+def test_an_edit_while_the_earlier_content_is_scanned_waits_for_that_scan(
+    files: RemoteFiles, fake: FakeTransfers, tmp_path: Path
+) -> None:
+    # Audit 2026-11-07-0712: the earlier upload may still be published, so the new content
+    # waits rather than racing it into a conflict with itself.
+    index = Index(tmp_path / "index.db")
+    first = _source(tmp_path, b"version one")
+    fake.scan = ["wait"]
+    fake.cancel_scanning = True
+    with pytest.raises(ScanPendingError):
+        files.upload(first, NewVersion(NODE_ID, 1), threading.Event(), sessions=index)
+
+    second = _source(tmp_path, b"version two!")
+    with pytest.raises(ScanPendingError):
+        files.upload(second, NewVersion(NODE_ID, 1), threading.Event(), sessions=index)
+
+    assert len(fake.uploads) == 1  # no second upload racing the first
+    assert index.upload_session(upload_key(NewVersion(NODE_ID, 1))) is not None
+
+
+def test_a_rejected_upload_is_let_go_whatever_the_answer(
+    files: RemoteFiles, fake: FakeTransfers, tmp_path: Path
+) -> None:
+    # Made view-only while it was scanned: the replayed 403 ends it too.
+    index = Index(tmp_path / "index.db")
+    source = _source(tmp_path, b"abcdefgh")
+    fake.scan = ["malware"]
+    target = NewFile(PARENT_ID, "doc.txt")
+    upload_id = None
+    with pytest.raises(ApiError):
+        files.upload(source, target, threading.Event(), sessions=index)
+    [upload_id] = fake.uploads
+    fake.uploads[upload_id]["status"] = "rejected"
+    fake.rejected_as = (403, "FORBIDDEN")
+    index.put_upload_session(
+        upload_key(target), StoredUpload(uuid.UUID(upload_id), source.sha256, source.size)
+    )
+
+    with pytest.raises(ApiError) as caught:
+        files.upload(source, target, threading.Event(), sessions=index)
+
+    assert caught.value.code == "FORBIDDEN"
+    assert index.upload_session(upload_key(target)) is None

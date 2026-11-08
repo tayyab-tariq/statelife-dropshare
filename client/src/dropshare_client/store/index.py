@@ -42,9 +42,11 @@ from dropshare_client.store.records import (
     Activity,
     Binding,
     Entry,
+    HeldMove,
     JournalItem,
     NamespaceCursor,
     Problem,
+    Refusal,
     RemoteNode,
     StoredUpload,
 )
@@ -147,6 +149,27 @@ class _Problem(_Base):
     reason: Mapped[str] = mapped_column(Text)
 
 
+class _HeldMove(_Base):
+    """A new table needs no schema version: create_all adds it to an existing index."""
+
+    __tablename__ = "held_moves"
+    old_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    target_key: Mapped[str] = mapped_column(Text)
+    node_id: Mapped[uuid.UUID] = mapped_column(Uuid)
+    reason: Mapped[str | None] = mapped_column(Text)
+
+
+class _Refusal(_Base):
+    """A new table needs no schema version: create_all adds it to an existing index."""
+
+    __tablename__ = "refusals"
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    path: Mapped[str] = mapped_column(Text)
+    size: Mapped[int] = mapped_column(BigInteger)
+    mtime_ns: Mapped[int] = mapped_column(BigInteger)
+    reason: Mapped[str] = mapped_column(Text)
+
+
 class _UploadSession(_Base):
     """An upload started and not finished yet, so it resumes after the app restarts: the
     server keeps its chunks for 24 hours (FR-XFER-01)."""
@@ -174,6 +197,20 @@ def _under(column: Mapped[str], key: str) -> ColumnElement[bool]:
     if not key:
         return column.is_not(None)
     return or_(column == key, (column >= f"{key}/") & (column < f"{key}0"))
+
+
+def _entry_row(entry: Entry) -> _Entry:
+    return _Entry(
+        key=entry.key,
+        path=entry.path,
+        node_id=entry.node_id,
+        kind=entry.kind.value,
+        revision=entry.revision,
+        sha256=entry.sha256,
+        size=entry.size,
+        mtime_ns=entry.mtime_ns,
+        file_id=entry.file_id,
+    )
 
 
 def _entry(row: _Entry) -> Entry:
@@ -337,6 +374,8 @@ class Index:
                 _Journal,
                 _Activity,
                 _Problem,
+                _HeldMove,
+                _Refusal,
                 _UploadSession,
             ):
                 session.execute(delete(table))
@@ -373,19 +412,7 @@ class Index:
 
     def put_entry(self, entry: Entry) -> None:
         with self._sessions.begin() as session:
-            session.merge(
-                _Entry(
-                    key=entry.key,
-                    path=entry.path,
-                    node_id=entry.node_id,
-                    kind=entry.kind.value,
-                    revision=entry.revision,
-                    sha256=entry.sha256,
-                    size=entry.size,
-                    mtime_ns=entry.mtime_ns,
-                    file_id=entry.file_id,
-                )
-            )
+            session.merge(_entry_row(entry))
 
     def move_entries(self, entry: Entry, key: str, path: str) -> None:
         """Record that `entry` (and, for a folder, everything below it) now lives at `key` /
@@ -551,6 +578,21 @@ class Index:
                 )
             )
 
+    def adopt_upload(self, entry: Entry, session_key: str) -> None:
+        """Record a file this computer uploaded, published after its malware scan, and forget
+        its session, in one transaction: a crash leaves both or neither."""
+        with self._sessions.begin() as session:
+            session.merge(_entry_row(entry))
+            session.execute(delete(_UploadSession).where(_UploadSession.key == session_key))
+
+    def upload_sessions(self) -> dict[str, StoredUpload]:
+        """Every upload started here and not finished, by target (files.upload_key)."""
+        with self._sessions() as session:
+            return {
+                row.key: StoredUpload(row.upload_id, row.sha256, row.size)
+                for row in session.scalars(select(_UploadSession))
+            }
+
     def forget_upload_session(self, key: str) -> None:
         with self._sessions.begin() as session:
             session.execute(delete(_UploadSession).where(_UploadSession.key == key))
@@ -582,6 +624,51 @@ class Index:
         """Forget the problems at and below `key`: they are looked at again."""
         with self._sessions.begin() as session:
             session.execute(delete(_Problem).where(_under(_Problem.key, key)))
+
+    def held_moves(self) -> list[HeldMove]:
+        with self._sessions() as session:
+            return [
+                HeldMove(row.old_key, row.target_key, row.node_id, row.reason)
+                for row in session.scalars(select(_HeldMove).order_by(_HeldMove.old_key))
+            ]
+
+    def set_held_move(self, held: HeldMove) -> None:
+        with self._sessions.begin() as session:
+            session.merge(
+                _HeldMove(
+                    old_key=held.old_key,
+                    target_key=held.target_key,
+                    node_id=held.node_id,
+                    reason=held.reason,
+                )
+            )
+
+    def clear_held_move(self, old_key: str) -> None:
+        with self._sessions.begin() as session:
+            session.execute(delete(_HeldMove).where(_HeldMove.old_key == old_key))
+
+    def set_refusal(self, refusal: Refusal) -> None:
+        with self._sessions.begin() as session:
+            session.merge(
+                _Refusal(
+                    key=refusal.key,
+                    path=refusal.path,
+                    size=refusal.size,
+                    mtime_ns=refusal.mtime_ns,
+                    reason=refusal.reason,
+                )
+            )
+
+    def refusals_under(self, key: str) -> list[Refusal]:
+        with self._sessions() as session:
+            return [
+                Refusal(row.key, row.path, row.size, row.mtime_ns, row.reason)
+                for row in session.scalars(select(_Refusal).where(_under(_Refusal.key, key)))
+            ]
+
+    def clear_refusal(self, key: str) -> None:
+        with self._sessions.begin() as session:
+            session.execute(delete(_Refusal).where(_Refusal.key == key))
 
     def problems_if_readable(self) -> list[Problem] | None:
         """`problems()` for reporting: None, logged, when the index can't be read right now

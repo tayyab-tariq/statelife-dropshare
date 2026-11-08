@@ -24,7 +24,7 @@ Every milestone starts with `/plan` and ends with `/audit` and `/commit`.
 | M12 Admin and security | ✅ Done (staging, Oracle and Windows checks deferred, see below) |
 | M13 Distribution | In progress |
 | M14 Ops and go-live | Planned (after M15) |
-| M15 Content safety | Planned, before go-live (OQ-57 decided) |
+| M15 Content safety | Built (15a server types, 15b scanning, 15c client); Windows checks and Oracle run pending |
 
 ### Deferred checks (run once the app is complete)
 

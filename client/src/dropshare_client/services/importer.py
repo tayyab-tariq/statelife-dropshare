@@ -21,6 +21,7 @@ import logging
 import os
 import shutil
 import threading
+import unicodedata
 import uuid
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -30,12 +31,16 @@ from pathlib import Path
 from dropshare_client.platform import rename_no_replace
 from dropshare_client.platform.base import RecycleBin
 from dropshare_client.services.errors import (
+    ApiError,
     FileActionError,
     FileProblem,
+    OfflineError,
+    SessionExpiredError,
     TransferCancelledError,
+    UpgradeRequiredError,
 )
 from dropshare_client.services.sync_folder import TEMP_DIR, is_link
-from dropshare_shared.naming import InvalidNameError, normalize_name, validate_name
+from dropshare_shared.naming import InvalidNameError, is_banned, normalize_name, validate_name
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +72,10 @@ class ImportPlan:
     sources: list[Source]
     total: int
     clashes: list[str]  # names of sources whose name is taken in the target folder
+    # Files of a type the server refuses (FR-SAFE-03), as chosen ("Tools/setup.exe"): never
+    # copied into the sync folder; the rest is.
+    not_allowed: list[str] = field(default_factory=list)
+    banned: frozenset[str] = frozenset()  # the server's banned types when this was planned
 
 
 @dataclass(frozen=True)
@@ -106,9 +115,17 @@ class _Undo:
 
 
 class Importer:
-    def __init__(self, root: Path, recycle_bin: RecycleBin) -> None:
+    def __init__(
+        self,
+        root: Path,
+        recycle_bin: RecycleBin,
+        banned: Callable[[], frozenset[str]] = frozenset,
+    ) -> None:
+        """`banned`: the server's banned file types, asked when an upload is planned (on the
+        worker thread)."""
         self._root = root
         self._recycle_bin = recycle_bin
+        self._banned = banned
 
     def plan(
         self, chosen: Iterable[Path], target: str, stop: threading.Event | None = None
@@ -117,7 +134,13 @@ class Importer:
         the server would refuse stops the upload here, before anything is copied."""
         stop = stop or threading.Event()
         folder = self._folder(target)
-        sources = [self._source(path, folder, stop) for path in chosen]
+        banned = self._banned_now()
+        not_allowed: list[str] = []
+        sources = [
+            source
+            for path in chosen
+            if (source := self._source(path, folder, stop, banned, not_allowed)) is not None
+        ]
         seen: set[str] = set()
         for source in sources:
             key = normalize_name(source.name)
@@ -126,7 +149,17 @@ class Importer:
             seen.add(key)
         taken = _names_in(folder)
         clashes = [s.name for s in sources if normalize_name(s.name) in taken]
-        return ImportPlan(target, sources, sum(s.size for s in sources), clashes)
+        total = sum(s.size for s in sources)
+        return ImportPlan(target, sources, total, clashes, sorted(not_allowed), banned)
+
+    def _banned_now(self) -> frozenset[str]:
+        """The server's banned types; none if it can't be asked now. Its own check still
+        decides when the files sync (FR-SAFE-02), and the engine then lists them."""
+        try:
+            return self._banned()
+        except (ApiError, OfflineError, SessionExpiredError, UpgradeRequiredError):
+            logger.warning("Couldn't ask which file types are allowed", exc_info=True)
+            return frozenset()
 
     def check_space(self, plan: ImportPlan, quota_left: int | None) -> None:
         """NotEnoughSpaceError unless the copy fits on this disk and in DropShare. Skipped and
@@ -169,7 +202,7 @@ class Importer:
                     name = _free_name(folder, source.name, folder_item=source.is_folder)
                 else:
                     name = _existing_name(folder, source.name) or source.name
-                self._copy(source.path, folder / name, aside, undo, stop, count)
+                self._copy(source.path, folder / name, aside, undo, stop, count, plan.banned)
                 changed.append(_join(plan.target, name))
         except BaseException as exc:
             kept = self._take_back(undo, aside)
@@ -188,6 +221,7 @@ class Importer:
         undo: _Undo,
         stop: threading.Event,
         count: Callable[[int], None],
+        banned: frozenset[str],
     ) -> None:
         if source.is_dir():
             if is_link(target):
@@ -203,8 +237,10 @@ class Importer:
                 if is_link(child):
                     continue  # links aren't synced (FR-SYNC-07); planning left them out too
                 name = _nfc_name(child)
+                if not child.is_dir() and is_banned(name, banned):
+                    continue  # never copied (FR-SAFE-03); planning listed it
                 existing = _existing_name(target, name) if target.is_dir() else None
-                self._copy(child, target / (existing or name), aside, undo, stop, count)
+                self._copy(child, target / (existing or name), aside, undo, stop, count, banned)
             return
         temp = aside / f"{uuid.uuid4().hex}.copying"  # inside this import's own folder
         try:
@@ -289,7 +325,15 @@ class Importer:
 
     # --- planning helpers ----------------------------------------------------------------
 
-    def _source(self, path: Path, folder: Path, stop: threading.Event) -> Source:
+    def _source(
+        self,
+        path: Path,
+        folder: Path,
+        stop: threading.Event,
+        banned: frozenset[str],
+        not_allowed: list[str],
+    ) -> Source | None:
+        """What `path` brings; None for a file of a banned type, which is listed instead."""
         if is_link(path):
             raise FileActionError(FileProblem.SOURCE_LINK, path.name)
         if not path.exists():
@@ -298,7 +342,10 @@ class Importer:
         resolved, inside = path.resolve(), folder.resolve()
         if path.is_dir() and (inside == resolved or inside.is_relative_to(resolved)):
             raise FileActionError(FileProblem.INTO_ITSELF, name)
-        return Source(path, name, path.is_dir(), _walk(path, stop))
+        if not path.is_dir() and is_banned(name, banned):
+            not_allowed.append(name)
+            return None
+        return Source(path, name, path.is_dir(), _walk(path, stop, banned, not_allowed))
 
     def _folder(self, target: str) -> Path:
         folder = self._root / target if target else self._root
@@ -345,9 +392,10 @@ def _copy_file(
     shutil.copystat(source, target)
 
 
-def _walk(path: Path, stop: threading.Event) -> int:
+def _walk(path: Path, stop: threading.Event, banned: frozenset[str], not_allowed: list[str]) -> int:
     """Bytes in `path`, checking every name below it as the server would. Links are left out,
-    as the copy leaves them out."""
+    as the copy leaves them out, and so are files of a banned type, listed in `not_allowed`
+    by their path from `path`'s own name."""
     if not path.is_dir():
         return path.stat().st_size
     total = 0
@@ -359,9 +407,12 @@ def _walk(path: Path, stop: threading.Event) -> int:
         for child in folder.iterdir():
             if is_link(child):
                 continue
-            _nfc_name(child)
+            name = _nfc_name(child)
             if child.is_dir():
                 pending.append(child)
+            elif is_banned(name, banned):
+                relative = child.relative_to(path.parent).as_posix()
+                not_allowed.append(unicodedata.normalize("NFC", relative))
             else:
                 total += child.stat().st_size
     return total

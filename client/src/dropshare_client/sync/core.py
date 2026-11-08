@@ -19,6 +19,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from dropshare_client.platform import rename_no_replace
 from dropshare_client.platform.base import FileAttributes, FileIdentity, RecycleBin
 from dropshare_client.services.errors import (
@@ -26,13 +28,24 @@ from dropshare_client.services.errors import (
     ContentMismatchError,
     OfflineError,
     RemoteContentChangedError,
+    ScanPendingError,
     SessionExpiredError,
     SourceChangedError,
     TransferCancelledError,
     UpgradeRequiredError,
 )
+from dropshare_client.services.files import NewFile, NewVersion, UploadTarget, upload_key
 from dropshare_client.store.index import Index
-from dropshare_client.store.records import Entry, JournalItem, NamespaceCursor, Problem
+from dropshare_client.store.records import (
+    Entry,
+    HeldMove,
+    JournalItem,
+    NamespaceCursor,
+    Problem,
+    Refusal,
+    RemoteNode,
+    StoredUpload,
+)
 from dropshare_client.sync import paths
 from dropshare_client.sync.errors import (
     CantSyncError,
@@ -62,10 +75,13 @@ from dropshare_client.sync.reconciler import (
 from dropshare_client.sync.remote_tree import RemoteItem, RemoteTree, TreeDelta, from_node
 from dropshare_client.sync.scanner import STABLE_AFTER_NS, LocalItem, Scanner
 from dropshare_client.sync.server import FileServer
+from dropshare_client.sync.status import malware_reason
 from dropshare_client.sync.transfers import Direction, TransferEvent, TransferReporter
 from dropshare_shared.errors import ErrorCode
+from dropshare_shared.schemas.error_details import MalwareDetectedDetails
 from dropshare_shared.schemas.nodes import AccessRole, NamespaceKind, NamespaceOut, NodeKind
 from dropshare_shared.schemas.sync import ChangeType
+from dropshare_shared.schemas.uploads import UploadStatus
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +115,11 @@ _TRANSIENT: frozenset[str] = frozenset(
         "INVALID_RESPONSE",
     }
 )
+# Refused for good by the server (FR-SAFE-01/02): listed, and not sent again until the file
+# changes, is renamed or moved (FR-SAFE-03). Never retried in a loop.
+_REFUSED: frozenset[str] = frozenset({ErrorCode.FILE_TYPE_NOT_ALLOWED, ErrorCode.MALWARE_DETECTED})
+_SCANNING = "Waiting for the virus scan. It syncs once the scan is done."
+_SCAN_WAIT_MAX = 300.0  # seconds: the longest wait between asking again
 # Failures the user can do something about; anything else is retried later.
 _PROBLEM_REASONS: dict[str, str] = {
     ErrorCode.QUOTA_EXCEEDED: "There isn't enough space left in your DropShare storage. "
@@ -199,6 +220,10 @@ class SyncCore:
         self._tree: RemoteTree | None = None
         self._release = MountRelease(self._scanner, index, recycle_bin, file_attributes, log, stop)
         self._attempts: dict[str, int] = {}
+        self._refused_now: set[str] = set()  # actions the server refused this cycle
+        # Files waiting for the server's malware scan, as hashed: (size, mtime, SHA-256) by
+        # key, so waiting doesn't read a large file again and again (FR-SAFE-01).
+        self._scan_hashes: dict[str, tuple[int, int, str]] = {}
         self._pending_deletes: frozenset[str] = frozenset()
         self._approved_deletes: frozenset[str] = frozenset()
 
@@ -211,6 +236,9 @@ class SyncCore:
         )
         if personal is None:
             raise NoPersonalFolderError()
+        # What the server refuses (FR-SAFE-03), asked afresh each time. Before anything counts
+        # as connected: if it can't be asked, connecting fails and is tried again.
+        self._scanner.banned = self._server.banned_extensions(refresh=True)
         known = {c.namespace_id: c for c in self._index.cursors()}
         cursor = known.get(personal.id)
         if cursor is None or cursor.root_node_id != personal.root_node_id:
@@ -483,6 +511,7 @@ class SyncCore:
         _, tree = self._require_connected()
         self._scanner.require_root()
         result = CycleResult()
+        self._refused_now = set()
         self._settle_finished(tree, result)
         released, held, stuck = self._release_mounts(result)
         dirty = dirty | released
@@ -494,10 +523,17 @@ class SyncCore:
         deferred: set[str] = {transfer.action.key for transfer in self._flight.values()}
         for key in deferred:
             result.retry.setdefault(key, _IN_FLIGHT_RECHECK)
+        refused: set[str] = set()  # can't be synced until the user changes them
+        # Both ends of a held move are always looked at together: seeing only the old one, its
+        # item would read as deleted here, and the server copy go to the trash (OQ-59 (1)).
+        held_moves = self._index.held_moves()
+        dirty = dirty | _partners(dirty, held_moves, tree)
+        collected: set[str] = set()
         roots = paths.outermost(dirty)
         while roots:
             for root in roots:
-                self._collect(root, tree, local, remote, base, deferred, result)
+                self._collect(root, tree, local, remote, base, deferred, refused, result)
+            collected |= roots
             roots = self._moved_out_of_view(roots, dirty, tree, remote, base)
             dirty = dirty | roots
         self._scanner.require_root()  # a vanished root must never read as "all deleted"
@@ -517,8 +553,15 @@ class SyncCore:
             )
 
         self._hash_changed(local, base, deferred, result)
+        self._hash_held(local, base, refused)
         self._identify_new(local, base)
-        plan = reconcile(local.keys() | remote.keys() | base.keys(), local, remote, base, deferred)
+        self._adopt_own_uploads(tree, local, remote, base, deferred)
+        if not self._hold_moves(held_moves, collected, tree, local, deferred, refused, result):
+            return result  # a held item moved on: a full scan finds where, first
+        plan = reconcile(
+            local.keys() | remote.keys() | base.keys(), local, remote, base, deferred, refused
+        )
+        self._keep_held(plan, held_moves, base)
         if (
             plan.deletes
             and not self._deletes_approved(plan)
@@ -579,7 +622,7 @@ class SyncCore:
             if entry is None:
                 continue  # not here yet: its files are marked as they're downloaded
             read_only = self.view_only(namespace_id)
-            for item in self._scanner.scan(entry.key).items.values():
+            for item in self._scanner.scan(entry.key).present():
                 if item.kind == NodeKind.FILE:
                     self._file_attributes.set_read_only(
                         self._scanner.disk_path(item.path), read_only
@@ -596,11 +639,18 @@ class SyncCore:
         remote: dict[str, RemoteItem],
         base: dict[str, Entry],
         deferred: set[str],
+        refused: set[str],
         result: CycleResult,
     ) -> None:
         """Snapshot `root` and everything below it: on disk, on the server and in the index."""
         scan = self._scanner.scan(root)
+        entries = self._index.entries_under(root)
+        scan.accept_synced(entries)
         local.update(scan.items)
+        # Refused but there (deferred below): only so a synced item renamed to one of these
+        # is seen as moved, not deleted (OQ-59 (1)). Nothing is planned for them.
+        local.update(scan.held)
+        refused.update(scan.held)
         deferred |= scan.deferred
         for key in scan.still_writing:
             result.retry[key] = STILL_WRITING_DELAY
@@ -611,7 +661,86 @@ class SyncCore:
         remote.update(tree.items_under(root, problems))
         for problem in problems.values():
             self._index.set_problem(problem)
-        base.update(self._index.entries_under(root))
+        base.update(entries)
+        self._still_refused(root, local, deferred, refused)
+
+    def _hold_moves(
+        self,
+        held_moves: list[HeldMove],
+        collected: set[str],
+        tree: RemoteTree,
+        local: dict[str, LocalItem],
+        deferred: set[str],
+        refused: set[str],
+        result: CycleResult,
+    ) -> bool:
+        """Apply the held moves this cycle looks at. While the item is still at its refused new
+        place, its old key, and wherever the server has the item now, are left alone, however
+        the item changed meanwhile (a "safe save" gives it a new file ID): never read as
+        deleted, never downloaded beside it (OQ-59 (1)). A hold ends only when the item has
+        moved on, its node is gone, or its place isn't refused any more.
+        False: a held item has moved on and this cycle doesn't see everything, so nothing may
+        be planned now (its old key would read as deleted); the full scan asked for decides."""
+        complete = True
+        for held in held_moves:
+            server_key = _key_on_server(tree, held.node_id)
+            ends = (held.old_key, held.target_key, server_key or held.old_key)
+            if not any(_covered(end, collected) for end in ends):
+                continue
+            if server_key is None:  # gone from the server: nothing to keep
+                self._index.clear_held_move(held.old_key)
+                continue
+            item = local.get(held.target_key)
+            if item is None:
+                # Moved on from the held place. A full scan finds where it went; a partial
+                # one might not, so the old key waits for one rather than reading as deleted.
+                if "" in collected:
+                    self._index.clear_held_move(held.old_key)
+                else:
+                    result.retry[""] = 0.0
+                    complete = False
+                continue
+            if held.reason is not None:  # the server refused it: held here too
+                deferred.add(held.target_key)
+                refused.add(held.target_key)
+                self._index.set_problem(Problem(held.target_key, item.path, held.reason))
+            elif not _is_refused(held.target_key, refused):
+                # Its place syncs now (the type was allowed again): an ordinary move from here.
+                self._index.clear_held_move(held.old_key)
+                continue
+            deferred.add(held.old_key)
+            deferred.add(server_key)
+        return complete
+
+    def _keep_held(
+        self,
+        plan: Plan,
+        held_moves: list[HeldMove],
+        base: dict[str, Entry],
+    ) -> None:
+        """Remember the moves this cycle held. They are forgotten only by `_hold_moves`, when
+        it sees they are over."""
+        known = {held.old_key: held for held in held_moves}
+        for old_key, target in plan.parked.items():
+            entry, before = base.get(old_key), known.get(old_key)
+            if entry is None or before is not None:
+                continue  # not a synced item's old key, or already held
+            self._index.set_held_move(HeldMove(old_key, target, entry.node_id))
+
+    def _still_refused(
+        self, root: str, local: dict[str, LocalItem], deferred: set[str], refused: set[str]
+    ) -> None:
+        """What the server refused stays refused while it is unchanged on disk: left alone and
+        listed, never sent again (FR-SAFE-03). Changed, renamed or gone: it is forgotten, and
+        synced as what it is now."""
+        for refusal in self._index.refusals_under(root):
+            item = local.get(refusal.key)
+            if item is not None and (item.size, item.mtime_ns) == (refusal.size, refusal.mtime_ns):
+                deferred.add(refusal.key)
+                refused.add(refusal.key)
+                self._index.set_problem(Problem(refusal.key, item.path, refusal.reason))
+            else:
+                self._index.clear_refusal(refusal.key)
 
     def _refuse_too_long(
         self, remote: dict[str, RemoteItem], base: dict[str, Entry], deferred: set[str]
@@ -674,6 +803,10 @@ class SyncCore:
         for key, item in list(local.items()):
             if key in deferred or not needs_hash(item, base.get(key)):
                 continue
+            known = self._scan_hashes.get(key)
+            if known is not None and known[:2] == (item.size, item.mtime_ns):
+                local[key] = dataclasses.replace(item, sha256=known[2])  # unchanged since
+                continue
             if self._stop.is_set():
                 raise SyncStoppedError()
             try:
@@ -687,6 +820,125 @@ class SyncCore:
                 result.retry[key] = self._backoff(key)
                 reason = _IN_USE if isinstance(exc, PermissionError) else _TRY_AGAIN
                 self._transfers.waiting_for(key, item.path, Direction.UPLOAD, item.size, reason)
+
+    def _scan_wait(self, key: str, retry_after: float) -> float:
+        """How long until asking again about an upload the server is still scanning: what it
+        asks, doubled each time it is still scanning, up to five minutes (FR-SAFE-01)."""
+        attempt = self._attempts.get(key, 0) + 1
+        self._attempts[key] = attempt
+        doubled: float = retry_after * 2.0 ** min(attempt - 1, 10)
+        return min(doubled, max(retry_after, _SCAN_WAIT_MAX))
+
+    def _hash_held(
+        self, local: dict[str, LocalItem], base: dict[str, Entry], refused: set[str]
+    ) -> None:
+        """Held files new at their place, when a synced file of the same size is missing:
+        their content can tell a move the file ID can't (a tool that saves a new copy), so the
+        missing one is held, not read as deleted (algorithm §7, OQ-59 (1))."""
+        missing = {
+            entry.size
+            for key, entry in base.items()
+            if entry.kind == NodeKind.FILE and key not in local
+        }
+        for key in refused:
+            item = local.get(key)
+            if (
+                item is None
+                or item.kind != NodeKind.FILE
+                or item.sha256 is not None
+                or key in base
+                or item.size not in missing
+            ):
+                continue
+            try:
+                local[key] = self._scanner.hash(item, self._stop)
+            except (FileChangingError, OSError):
+                logger.info("Couldn't read held %s to match it; not a move", item.path)
+
+    def _adopt_own_uploads(
+        self,
+        tree: RemoteTree,
+        local: dict[str, LocalItem],
+        remote: dict[str, RemoteItem],
+        base: dict[str, Entry],
+        deferred: set[str],
+    ) -> None:
+        """Files this computer uploaded that the server published after its scan, while
+        `complete` here answered "still scanning" (FR-SAFE-01): recorded as synced, as a
+        finished upload would have been. A delete, rename or edit made here meanwhile then
+        syncs as such: no file comes back, none is sent twice, and the next edit isn't a
+        conflict with itself."""
+        sessions = self._index.upload_sessions()
+        if not sessions:
+            return
+        for key, item in remote.items():
+            node = item.node
+            if node.kind != NodeKind.FILE or node.sha256 is None or key in deferred:
+                continue
+            entry = base.get(key)
+            if entry is not None and (
+                entry.node_id != node.node_id or entry.revision >= node.revision
+            ):
+                continue
+            stored_key = self._own_upload(sessions, tree, key, node, entry)
+            if stored_key is None or not self._published_as(sessions[stored_key], node):
+                continue
+            here = local.get(key)
+            synced = here is not None and here.sha256 == node.sha256
+            adopted = Entry(
+                key=key,
+                path=here.path if here is not None else item.path,
+                node_id=node.node_id,
+                kind=NodeKind.FILE,
+                revision=node.revision,
+                sha256=node.sha256,
+                # What is here now, if it is that content; else nothing matches, so the
+                # change made here is planned from this new base.
+                size=here.size if synced and here is not None else -1,
+                mtime_ns=here.mtime_ns if synced and here is not None else 0,
+                file_id=here.file_id if synced and here is not None else None,
+            )
+            self._index.adopt_upload(adopted, stored_key)  # both or neither
+            self._scan_hashes.pop(key, None)
+            self._attempts.pop(key, None)
+            base[key] = adopted
+            logger.info("Recorded %s as synced: published after its malware scan", key)
+
+    def _published_as(self, stored: StoredUpload, node: RemoteNode) -> bool:
+        """The server says this very upload completed as `node`. A session left behind (its
+        file moved away mid-upload) never matches someone else's identical file: that one is
+        downloaded, not taken for ours and deleted."""
+        try:
+            upload = self._server.upload_status(stored.upload_id)
+        except (ApiError, OfflineError):
+            logger.info("Couldn't ask about upload %s; not recorded yet", stored.upload_id)
+            return False
+        return (
+            upload is not None
+            and upload.status == UploadStatus.COMPLETED
+            and upload.node_id == node.node_id
+        )
+
+    def _own_upload(
+        self,
+        sessions: dict[str, StoredUpload],
+        tree: RemoteTree,
+        key: str,
+        node: RemoteNode,
+        entry: Entry | None,
+    ) -> str | None:
+        """The stored session whose content the server published as `node`, if any."""
+        if entry is not None:
+            targets: list[UploadTarget] = [NewVersion(node.node_id, entry.revision)]
+        else:
+            parents = {node.parent_id, tree.node_at(paths.parent_of(key))} - {None}
+            targets = [NewFile(parent, node.name or "") for parent in parents if parent]
+        for target in targets:
+            stored_key = upload_key(target)
+            stored = sessions.get(stored_key)
+            if stored is not None and (stored.sha256, stored.size) == (node.sha256, node.size):
+                return stored_key
+        return None
 
     def _identify_new(self, local: dict[str, LocalItem], base: dict[str, Entry]) -> None:
         """File IDs for move detection (FR-SYNC-10), only where they can matter: items that
@@ -743,7 +995,8 @@ class SyncCore:
             done_ok, created = self._run(executor, action, tree, result)
             position += 1
             if not done_ok:
-                if action.op in (Op.MOVE_LOCAL, Op.MOVE_REMOTE):
+                refused = action.key in self._refused_now
+                if action.op in (Op.MOVE_LOCAL, Op.MOVE_REMOTE) and not refused:
                     self._hold_move_together(action, result)
                 continue
             self._done(action, created, result)
@@ -757,6 +1010,7 @@ class SyncCore:
 
     def _done(self, action: Action, created: str | None, result: CycleResult) -> None:
         self._attempts.pop(action.key, None)
+        self._scan_hashes.pop(action.key, None)
         if created is not None:
             result.retry[created] = 0.0
         if action.op != Op.RECORD:
@@ -859,6 +1113,8 @@ class SyncCore:
                 _settle(transfer, future)
             except TransferCancelledError:
                 self._transfers.waiting(key, reason)
+            except ScanPendingError:  # the server is still scanning it: asked again next run
+                self._transfers.waiting(key, _SCANNING)
             except Exception:
                 logger.warning("Couldn't record the transfer of %s", key, exc_info=True)
                 self._transfers.waiting(key, _TRY_AGAIN)
@@ -896,6 +1152,15 @@ class SyncCore:
         except TransferCancelledError as exc:
             self._transfers.waiting(action.key, _stopped_because(SyncStoppedError()))
             raise SyncStoppedError() from exc
+        except ScanPendingError as exc:
+            # The server has every byte and scans it (FR-SAFE-01): ask again later, sending
+            # nothing, each time a little later; the upload session survives a restart.
+            result.retry[action.key] = self._scan_wait(action.key, exc.retry_after)
+            item = action.local
+            if item is not None and item.sha256 is not None:
+                self._scan_hashes[action.key] = (item.size, item.mtime_ns, item.sha256)
+            self._transfers.waiting(action.key, _SCANNING)
+            return False, None
         except RetryLaterError as exc:
             result.again = True
             result.retry[action.key] = 0.0
@@ -961,6 +1226,8 @@ class SyncCore:
             and self._in_view_only(action, tree)
         ):
             self._undo_viewer_change(action, result)
+        elif exc.code in _REFUSED and action.op in (Op.UPLOAD, Op.MOVE_REMOTE):
+            self._refused(action, exc, result)
         elif exc.code == ErrorCode.SHARE_NOT_ALLOWED and action.op == Op.DELETE_REMOTE:
             # A folder the user shared, deleted here while others still have it: the server
             # keeps it. Forgetting the base makes it new here, so it comes back (edit wins).
@@ -990,6 +1257,37 @@ class SyncCore:
             self._cant_sync(key, path, reason)
         else:
             result.retry[key] = self._backoff(key)
+
+    def _refused(self, action: Action, exc: ApiError, result: CycleResult) -> None:
+        """The server refused the file, or a move or rename of it, for good: remember it as it
+        is now, so it waits until it changes (a refused move is held, the server keeping the
+        item where it was; OQ-59 (1)). Its local copy is never touched (OQ-57 (1))."""
+        item = action.local
+        reason = exc.message
+        if exc.code == ErrorCode.MALWARE_DETECTED:
+            reason = malware_reason(_detection(exc))
+        if exc.request_id:
+            reason = f"{reason} (reference {exc.request_id})"
+        if item is None:
+            self._cant_sync(action.key, action.path, reason)
+            return
+        key = paths.key_of(item.path)
+        if action.op == Op.MOVE_REMOTE and action.base is not None:
+            # A rename or move the server refused: held, the server keeping the item where it
+            # was, until the user renames it back (OQ-59 (1)). Never retried as is.
+            old = action.base
+            reason = (
+                f"{reason} The server keeps it as “{old.path}”: rename it back to sync it again."
+            )
+            self._index.set_held_move(HeldMove(old.key, key, old.node_id, reason))
+            self._refused_now.add(action.key)
+            self._cant_sync(key, item.path, reason)
+            result.again = True
+            return
+        self._index.set_refusal(Refusal(key, item.path, item.size, item.mtime_ns, reason))
+        self._refused_now.add(action.key)
+        self._cant_sync(key, item.path, reason)
+        result.again = True  # the next cycle holds it, now that it is refused
 
     def _in_view_only(self, action: Action, tree: RemoteTree) -> bool:
         """Whether the action's item is (or would be) in a view-only shared folder. Any other
@@ -1053,7 +1351,7 @@ class SyncCore:
         follows links or junctions out of the sync folder."""
         if self._scanner.resolve(key) is None:
             return
-        for item in self._scanner.scan(key).items.values():
+        for item in self._scanner.scan(key).present():
             if item.kind == NodeKind.FILE:
                 self._file_attributes.set_read_only(self._scanner.disk_path(item.path), False)
 
@@ -1073,6 +1371,49 @@ class SyncCore:
         if self._namespace is None or self._tree is None:
             raise RuntimeError("connect() first")
         return self._namespace, self._tree
+
+
+def _detection(exc: ApiError) -> str:
+    """The scanner's name for what it found (MalwareDetectedDetails); "" if not given."""
+    try:
+        return MalwareDetectedDetails.model_validate(exc.details).detection
+    except ValidationError:
+        return ""
+
+
+def _touches(keys: set[str], key: str) -> bool:
+    """Some key in `keys` is `key`, above it, or below it."""
+    return any(paths.is_within(key, k) or paths.is_within(k, key) for k in keys)
+
+
+def _partners(dirty: set[str], held_moves: list[HeldMove], tree: RemoteTree) -> set[str]:
+    """Every end of a held move a cycle over `dirty` would look at: its old key, its held
+    place here, and where the server has the item now (renamed there meanwhile)."""
+    found: set[str] = set()
+    for held in held_moves:
+        ends = {held.old_key, held.target_key}
+        server_key = _key_on_server(tree, held.node_id)
+        if server_key is not None:
+            ends.add(server_key)
+        if any(_touches(dirty, end) for end in ends):
+            found |= ends
+    return found
+
+
+def _key_on_server(tree: RemoteTree, node_id: uuid.UUID) -> str | None:
+    """Where the server has the node now, as a key; None if it is gone."""
+    if tree.node(node_id) is None:
+        return None
+    path = tree.path_of(node_id)
+    return None if path is None else paths.key_of(path)
+
+
+def _is_refused(key: str, refused: set[str]) -> bool:
+    return any(paths.is_within(key, r) for r in refused)
+
+
+def _covered(key: str, collected: set[str]) -> bool:
+    return any(paths.is_within(key, root) for root in collected)
 
 
 def _delete_keys(plan: Plan) -> frozenset[str]:

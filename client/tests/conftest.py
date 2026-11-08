@@ -176,7 +176,11 @@ def make_client(
             ),
             revealed=revealed,
             uploads=UploadController(
-                config, lambda root: Importer(root, MacTrash(trash)), sync, auth.current_user
+                config,
+                # The test server refuses programs (FR-SAFE-03).
+                lambda root: Importer(root, MacTrash(trash), lambda: frozenset({".exe"})),
+                sync,
+                auth.current_user,
             ),
             share=ShareController(sharing),
             shared=SharedController(sharing),

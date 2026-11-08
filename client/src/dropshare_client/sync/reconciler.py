@@ -91,6 +91,9 @@ class Plan:
     again: bool  # some items need another cycle once these actions are done
     local_deletes: int  # files that would leave this computer (to the Recycle Bin)
     remote_deletes: int  # files that would go to the server trash
+    # Moves held because their new place is refused: old key -> where the item is now. The
+    # engine keeps them, so a later cycle that sees only one end still holds it (OQ-59 (1)).
+    parked: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def deletes(self) -> int:
@@ -121,16 +124,24 @@ def reconcile(
     remote: Mapping[str, RemoteItem],
     base: Mapping[str, Entry],
     deferred: Collection[str] = (),
+    refused: Collection[str] = (),
 ) -> Plan:
-    """Actions for every key in `keys`. Keys at or below a `deferred` key are left alone."""
+    """Actions for every key in `keys`. Keys at or below a `deferred` key are left alone.
+    `refused` (among `deferred`): items that can't be synced until the user changes them (a
+    banned type, a name Windows can't use). A synced item moved to one is held where the
+    server has it, quietly: never deleted, and no cycle is planned for it (OQ-59 (1))."""
     deferred_set = set(deferred)
     ordered = sorted(set(keys))
-    moves, waiting = _find_moves(base, local, remote, deferred_set)
+    moves, waiting, parked = _find_moves(base, local, remote, deferred_set, set(refused))
     move_keys = {k for move in moves for k in move.keys}
     decisions: dict[str, Op] = {}
     again = bool(waiting)
     for key in ordered:
-        if _is_deferred(key, deferred_set) or _within_any(key, waiting):
+        if (
+            _is_deferred(key, deferred_set)
+            or _within_any(key, waiting)
+            or _within_any(key, parked.keys())
+        ):
             continue
         if _within_any(key, move_keys):
             # Moves with its folder, or waits for the move: the next cycle compares it with
@@ -163,7 +174,7 @@ def reconcile(
     )
     local_deletes = sum(_files_at(a, files) for a in actions if a.op == Op.DELETE_LOCAL)
     remote_deletes = sum(_files_at(a, files) for a in actions if a.op == Op.DELETE_REMOTE)
-    return Plan(actions, again, local_deletes, remote_deletes)
+    return Plan(actions, again, local_deletes, remote_deletes, parked)
 
 
 @dataclass(frozen=True)
@@ -210,15 +221,18 @@ def _find_moves(
     local: Mapping[str, LocalItem],
     remote: Mapping[str, RemoteItem],
     deferred: set[str],
-) -> tuple[list[_Move], set[str]]:
-    """Synced items now somewhere else on either side, and the old keys of moves that wait a
-    cycle (another item in the way here, or overlapping a move found first). Outermost
+    refused: set[str],
+) -> tuple[list[_Move], set[str], dict[str, str]]:
+    """Synced items now somewhere else on either side; the old keys of moves that wait a
+    cycle (another item in the way here, or overlapping a move found first); and the old
+    keys of moves to a refused place, held until the user changes the item. Outermost
     first; an item inside a moved folder follows in the next cycle, when its base has moved
-    along. A waiting key is left alone, never read as deleted (audit S1)."""
+    along. A waiting or held key is left alone, never read as deleted (audit S1)."""
     remote_at = {item.node.node_id: key for key, item in remote.items()}
     candidates = _Candidates.of(local, base)
     moves: list[_Move] = []
     waiting: set[str] = set()
+    parked: dict[str, str] = {}
     taken: set[str] = set()  # keys a move found so far covers
     for key in sorted(base, key=lambda k: (paths.depth(k), k)):
         if _is_deferred(key, deferred) or _within_any(key, taken):
@@ -231,6 +245,14 @@ def _find_moves(
         here, there = local[local_key], remote[remote_key]
         if here.kind != entry.kind or there.node.kind != entry.kind:
             continue
+        if local_key != key and _is_deferred(local_key, refused):
+            # Renamed here to a refused name: held, whatever the server did meanwhile. Its
+            # rename or move from elsewhere waits too, so the user's file isn't moved back,
+            # and its new place there isn't taken for a new item to download.
+            parked[key] = local_key
+            if remote_key != key:
+                parked[remote_key] = local_key
+            continue
         if remote_key != key or _renamed(there.path, entry.path):
             decided = _server_move(key, local_key, remote_key, local, base)
         elif local_key != key or _renamed(here.path, entry.path):
@@ -240,6 +262,9 @@ def _find_moves(
         if decided is None:
             continue  # the ordinary rules keep both items
         op, target = decided
+        if _is_deferred(target, refused):
+            parked[key] = local_key  # nothing to do until the user renames it again
+            continue
         if op is None or _is_deferred(target, deferred) or _within_any(target, taken):
             waiting.add(key)
             continue
@@ -250,7 +275,7 @@ def _find_moves(
         move = _Move(op, target, local_key, here, there, entry)
         taken.update(move.keys)
         moves.append(move)
-    return moves, waiting
+    return moves, waiting, parked
 
 
 def _server_move(

@@ -9,10 +9,15 @@ from typing import Protocol
 from dropshare_client.services.files import Progress, SourceFile, UploadSessions, UploadTarget
 from dropshare_shared.schemas.nodes import NamespaceOut, NodeOut
 from dropshare_shared.schemas.sync import ChangesResponse
+from dropshare_shared.schemas.uploads import UploadOut
 
 
 class FileServer(Protocol):
     def namespaces(self) -> list[NamespaceOut]: ...
+
+    def banned_extensions(self, *, refresh: bool = False) -> frozenset[str]: ...
+
+    def upload_status(self, upload_id: uuid.UUID) -> UploadOut | None: ...
 
     def changes(self, namespace_id: uuid.UUID, cursor: int) -> ChangesResponse: ...
 

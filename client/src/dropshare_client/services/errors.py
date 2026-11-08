@@ -96,3 +96,13 @@ class RemoteContentChangedError(Exception):
 
 class ContentMismatchError(Exception):
     """A download didn't match its SHA-256 even after a fresh attempt (NFR-REL-02)."""
+
+
+class ScanPendingError(Exception):
+    """The server has the whole file and is still scanning it for malware (FR-SAFE-01, 202).
+    Nothing is sent again: completing the same upload later answers with the file, or with
+    why it was refused. Ask again after `retry_after` seconds."""
+
+    def __init__(self, retry_after: float) -> None:
+        super().__init__(f"Waiting for the virus scan; ask again in {retry_after:g} s")
+        self.retry_after = retry_after

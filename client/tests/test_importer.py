@@ -11,7 +11,12 @@ from pathlib import Path
 import pytest
 
 from dropshare_client.platform.macos.recycle_bin import MacTrash
-from dropshare_client.services.errors import FileActionError, FileProblem, TransferCancelledError
+from dropshare_client.services.errors import (
+    FileActionError,
+    FileProblem,
+    OfflineError,
+    TransferCancelledError,
+)
 from dropshare_client.services.importer import (
     Importer,
     ImportTakenBackError,
@@ -389,3 +394,52 @@ def test_upload_into_a_subfolder(importer: Importer, chosen: Path, root: Path) -
 
     assert result.changed == ["Reports/fresh.txt"]
     assert (root / "Reports" / "fresh.txt").read_text() == "fresh"
+
+
+# --- Banned file types (FR-SAFE-03) -----------------------------------------------------------
+
+
+def test_banned_files_are_left_out_of_an_upload_and_listed(
+    root: Path, trash: Path, chosen: Path
+) -> None:
+    (chosen / "setup.EXE").write_bytes(b"MZ")
+    (chosen / "Reports" / "deep" / "run.ps1").write_text("script")
+    importer = Importer(root, MacTrash(trash), lambda: frozenset({".exe", ".ps1"}))
+
+    plan = importer.plan([chosen / "setup.EXE", chosen / "fresh.txt", chosen / "Reports"], "")
+    changed = importer.run(
+        plan, {"Reports": Resolution.KEEP_BOTH}, threading.Event(), lambda _: None
+    ).changed
+
+    assert plan.not_allowed == ["Reports/deep/run.ps1", "setup.EXE"]
+    assert plan.total == len("fresh") + len("new q1new q2deep")
+    assert sorted(changed) == ["Reports (1)", "fresh.txt"]
+    assert not (root / "setup.EXE").exists()
+    assert (root / "Reports (1)" / "deep" / "d.txt").read_text() == "deep"
+    assert not (root / "Reports (1)" / "deep" / "run.ps1").exists()
+    assert (chosen / "setup.EXE").read_bytes() == b"MZ"  # the originals are never touched
+
+
+def test_only_banned_files_chosen_copies_nothing(root: Path, trash: Path, chosen: Path) -> None:
+    (chosen / "a.exe").write_bytes(b"MZ")
+    importer = Importer(root, MacTrash(trash), lambda: frozenset({".exe"}))
+
+    plan = importer.plan([chosen / "a.exe"], "")
+
+    assert (plan.sources, plan.total, plan.not_allowed) == ([], 0, ["a.exe"])
+    assert importer.run(plan, {}, threading.Event(), lambda _: None).changed == []
+
+
+def test_without_the_server_nothing_is_left_out_here(root: Path, trash: Path, chosen: Path) -> None:
+    # The engine still lists such files once the server refuses them (FR-SAFE-02).
+    (chosen / "a.exe").write_bytes(b"MZ")
+
+    def offline() -> frozenset[str]:
+        raise OfflineError("no connection")
+
+    importer = Importer(root, MacTrash(trash), offline)
+
+    plan = importer.plan([chosen / "a.exe"], "")
+
+    assert [source.name for source in plan.sources] == ["a.exe"]
+    assert plan.not_allowed == []

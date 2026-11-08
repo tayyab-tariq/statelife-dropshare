@@ -1,6 +1,8 @@
 """User-facing text for every failure, in one place (architecture.md §4, NFR-UX-03)."""
 
 import math
+from collections.abc import Collection
+from pathlib import PureWindowsPath
 
 from pydantic import ValidationError
 
@@ -31,6 +33,10 @@ _BY_CODE: dict[ErrorCode | str, str] = {
     ErrorCode.RATE_LIMITED: "Too many attempts. Wait a moment, then try again.",
     ErrorCode.PASSWORD_CHANGE_REQUIRED: "Choose a new password to continue.",
 }
+
+
+# Files named in a message before the rest are counted.
+_NAMES_SHOWN = 5
 
 
 def message_for(exc: BaseException) -> str:
@@ -206,6 +212,17 @@ def upload_taken_back(*, cancelled: bool, kept: int) -> str:
     return text
 
 
+def not_allowed(paths: list[str]) -> str:
+    """Files an upload left out because DropShare doesn't allow their type (FR-SAFE-03)."""
+    shown = ", ".join(str(PureWindowsPath(path)) for path in paths[:_NAMES_SHOWN])
+    more = len(paths) - _NAMES_SHOWN
+    if more > 0:
+        shown = f"{shown} and {more} more"
+    if len(paths) == 1:
+        return f"1 file wasn't added because DropShare doesn't allow its type: {shown}."
+    return f"{len(paths)} files weren't added because DropShare doesn't allow their types: {shown}."
+
+
 def kept_aside(count: int) -> str:
     """Replaced files the Recycle Bin refused (they stay in DropShare's hidden folder)."""
     items = "1 replaced file" if count == 1 else f"{count} replaced files"
@@ -301,6 +318,10 @@ LINK_COPIED = "Link copied. Only people with access can open it."
 ADDED_TO_DROPSHARE = "Added to your DropShare. It syncs in a moment."
 LEFT_SHARED_FOLDER = "Removed from your DropShare. Others still have it."
 NEW_VERSION_UPLOADED = "New version uploaded."
+NEW_VERSION_SCANNING = (
+    "New version uploaded. It's added once DropShare's virus scan has finished, and you're "
+    "told here if the scan finds a problem. There's no need to upload it again."
+)
 TRANSFER_CANCELLED = "Cancelled. Nothing was changed."
 
 
@@ -415,6 +436,7 @@ def some_failed(failed: int, reason: str) -> str:
 NOTICE_NEW_SHARE = "Shared with you"
 NOTICE_CONFLICTS = "Conflicting changes"
 NOTICE_CANT_SYNC = "Can't sync"
+NOTICE_VIRUS = "Virus found"
 NOTICE_QUOTA_NEARLY_FULL = "Storage almost full"
 NOTICE_QUOTA_FULL = "Storage full"
 NOTICE_UPDATE = "Update available"
@@ -424,13 +446,29 @@ def update_notice(version: str) -> str:
     return f"DropShare {version} is ready to install. Open Settings in DropShare to install it."
 
 
-def cant_sync_notice(paths: list[str]) -> str:
+def cant_sync_notice(paths: list[str], viruses: Collection[str] = ()) -> tuple[str, str]:
+    """(title, text). A virus found is said so (FR-SAFE-01, OQ-59 (3)); it is still a Can't
+    sync item, listed there with the details."""
+    found = [path for path in paths if path in viruses]
+    if found:
+        name = found[0].rpartition("/")[2]
+        text = (
+            f"A virus was found in “{name}”, so it wasn't uploaded. Your copy hasn't been changed."
+            if len(found) == 1
+            else f"Viruses were found in {len(found)} files, so they weren't uploaded. Your "
+            "copies haven't been changed."
+        )
+        others = len(paths) - len(found)
+        if others:
+            items = "1 more item" if others == 1 else f"{others} more items"
+            text = f"{text} {items} can't be synced."
+        return NOTICE_VIRUS, f"{text} Open Can't sync in DropShare for details."
     if len(paths) == 1:
         name = paths[0].rpartition("/")[2]
-        return (
+        return NOTICE_CANT_SYNC, (
             f"“{name}” can't be synced. Open Can't sync in DropShare to see why and how to fix it."
         )
-    return (
+    return NOTICE_CANT_SYNC, (
         f"{len(paths)} items can't be synced. Open Can't sync in DropShare to see why and how "
         "to fix them."
     )

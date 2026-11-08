@@ -7,13 +7,13 @@ import stat
 import threading
 import time
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from dropshare_client.platform.base import FileIdentity
 from dropshare_client.services.sync_folder import is_link
-from dropshare_client.store.records import Problem
+from dropshare_client.store.records import Entry, Problem
 from dropshare_client.sync import paths
 from dropshare_client.sync.errors import (
     FileChangingError,
@@ -36,6 +36,10 @@ _TOO_LONG = (
     "The full path is too long for Windows. Use a shorter name or move it to a folder "
     "nearer the top of your DropShare folder."
 )
+_BANNED_TYPE = (
+    "This file type isn't allowed in DropShare ({extension}), so it isn't synced. Keep it "
+    "outside your DropShare folder. Your copy stays here as it is."
+)
 
 
 @dataclass(frozen=True)
@@ -57,12 +61,40 @@ class LocalScan:
     problems: dict[str, Problem] = field(default_factory=dict)
     still_writing: set[str] = field(default_factory=set)  # look again in a moment
     unreadable: set[str] = field(default_factory=set)  # folders we couldn't list
+    # Refused items that are on disk all the same: never synced, but a synced item renamed
+    # to one of these is recognised as moved there, so the move waits and its old place is
+    # never read as deleted (the server copy is kept; OQ-59 (1), FR-SAFE-03).
+    held: dict[str, LocalItem] = field(default_factory=dict)
+    # Among `held`: refused only for a banned type. One already synced and unchanged since is
+    # taken back by the engine: it stays synced (OQ-57 (2)).
+    banned: set[str] = field(default_factory=set)
 
-    def refuse(self, key: str, path: str, reason: str) -> None:
-        """Leave `key` and everything below it alone, and list why."""
+    def present(self) -> list["LocalItem"]:
+        """Everything on disk, refused or not: for marking files read-only, never for
+        syncing."""
+        return [*self.items.values(), *self.held.values()]
+
+    def accept_synced(self, base: Mapping[str, Entry]) -> None:
+        """Files of a banned type that were synced before the ban and are unchanged since
+        stay synced: the server's changes to them still arrive (OQ-57 (2)). Changed here,
+        they stay refused: never sent."""
+        for key in list(self.banned):
+            entry, item = base.get(key), self.held[key]
+            if entry is None or (entry.size, entry.mtime_ns) != (item.size, item.mtime_ns):
+                continue
+            del self.held[key]
+            self.banned.discard(key)
+            self.deferred.discard(key)
+            self.problems.pop(key, None)
+            self.items[key] = item
+
+    def refuse(self, key: str, path: str, reason: str, item: "LocalItem | None" = None) -> None:
+        """Leave `key` and everything below it alone, and list why. `item`: what is there."""
         self.items.pop(key, None)
         self.deferred.add(key)
         self.problems[key] = Problem(key, path, reason)
+        if item is not None:
+            self.held[key] = item
 
 
 class Scanner:
@@ -81,6 +113,8 @@ class Scanner:
         self._stable_after_ns = stable_after_ns
         self._clock_ns = clock_ns
         self._max_path = max_path
+        # The server's banned file types (FR-SAFE-03), as it last told us; set on connect.
+        self.banned: frozenset[str] = frozenset()
 
     def disk_path(self, path: str) -> Path:
         """The item's absolute path. UnsafePathError if it would lead out of the sync folder:
@@ -201,18 +235,24 @@ class Scanner:
         if stat.S_ISLNK(info.st_mode) or is_link(self.disk_path(path)):
             result.refuse(key, path, _LINKS_NOT_SYNCED)
             return False
+        item = _item(path, info)
         problem = paths.name_problem(name)
         if problem is not None:
-            result.refuse(key, path, f"{problem} Rename it to sync it.")
+            result.refuse(key, path, f"{problem} Rename it to sync it.", item)
             return False
         if self.too_long(path, folder=stat.S_ISDIR(info.st_mode)):
-            result.refuse(key, path, _TOO_LONG)
+            result.refuse(key, path, _TOO_LONG, item)
             return False
-        if stat.S_ISDIR(info.st_mode):
-            result.items[key] = LocalItem(path, NodeKind.FOLDER, 0, info.st_mtime_ns)
+        if item is not None and item.kind == NodeKind.FOLDER:
+            result.items[key] = item
             return True
-        if stat.S_ISREG(info.st_mode):
-            result.items[key] = LocalItem(path, NodeKind.FILE, info.st_size, info.st_mtime_ns)
+        if item is not None:  # a regular file
+            extension = paths.banned_extension(name, self.banned)
+            if extension is not None:  # never uploaded, never touched (FR-SAFE-03)
+                result.refuse(key, path, _BANNED_TYPE.format(extension=extension), item)
+                result.banned.add(key)
+                return False
+            result.items[key] = item
             if abs(self._clock_ns() - info.st_mtime_ns) < self._stable_after_ns:
                 result.deferred.add(key)  # still being written (FR-SYNC-06)
                 result.still_writing.add(key)
@@ -244,6 +284,15 @@ class Scanner:
             digest.hexdigest(),
             self.file_id(item.path),
         )
+
+
+def _item(path: str, info: os.stat_result) -> LocalItem | None:
+    """What a regular file or folder is on disk; None for anything else."""
+    if stat.S_ISDIR(info.st_mode):
+        return LocalItem(path, NodeKind.FOLDER, 0, info.st_mtime_ns)
+    if stat.S_ISREG(info.st_mode):
+        return LocalItem(path, NodeKind.FILE, info.st_size, info.st_mtime_ns)
+    return None
 
 
 def _nfc(text: str) -> str:

@@ -16,6 +16,7 @@ from dropshare_client.controllers import messages
 from dropshare_client.controllers.worker import Worker
 from dropshare_client.services.config import ConfigStore, NotificationSettings
 from dropshare_client.store.records import Activity, Problem
+from dropshare_client.sync.status import is_virus
 from dropshare_shared.schemas.users import UserOut
 
 logger = logging.getLogger(__name__)
@@ -118,7 +119,7 @@ class NotificationController(QObject):
             ),
             Notice.CONFLICTS: _Gatherer(_conflicts, gather_ms, gap_ms),
             Notice.CANT_SYNC: _Gatherer(
-                lambda paths: (messages.NOTICE_CANT_SYNC, messages.cant_sync_notice(paths)),
+                lambda paths: messages.cant_sync_notice(paths, self._viruses),
                 gather_ms,
                 gap_ms,
             ),
@@ -133,6 +134,7 @@ class NotificationController(QObject):
             gatherer.setParent(self)
             gatherer.show = self.notify.emit
         self._known_problems: set[str] | None = None  # None: the next report is the baseline
+        self._viruses: set[str] = set()  # paths refused because a virus was found (OQ-59 (3))
         self._quota_level = 0
         self._usage: UserOut | None = None  # as last read
         self._quota_checked_at: float | None = None
@@ -143,6 +145,7 @@ class NotificationController(QObject):
         for gatherer in self._gatherers.values():
             gatherer.clear()
         self._known_problems = None
+        self._viruses = set()
         self._quota_level = 0
         self._usage = None
         self._quota_checked_at = None
@@ -161,6 +164,9 @@ class NotificationController(QObject):
         starting is what earlier runs left: listed in Can't sync, not notified again."""
         keys = {problem.key for problem in problems}
         known, self._known_problems = self._known_problems, keys
+        # Rebuilt from the current list: a path refused for a virus once and for something
+        # else later is never announced as a virus again.
+        self._viruses = {problem.path for problem in problems if is_virus(problem)}
         if known is None:
             return
         for problem in problems:

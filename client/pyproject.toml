@@ -1,6 +1,6 @@
 [project]
 name = "dropshare-client"
-version = "0.2.2"
+version = "0.2.3"
 description = "StateLife DropShare desktop client"
 requires-python = ">=3.12,<3.13"
 dependencies = [

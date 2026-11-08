@@ -14,19 +14,21 @@ from typing import Protocol
 
 import httpx
 
-from dropshare_client.services.api_client import ApiClient
+from dropshare_client.services.api_client import Accepted, ApiClient
 from dropshare_client.services.errors import (
     ApiError,
     ContentMismatchError,
     OfflineError,
     RemoteContentChangedError,
+    ScanPendingError,
     SourceChangedError,
     TransferCancelledError,
 )
 from dropshare_client.store.records import StoredUpload
 from dropshare_shared.errors import ErrorCode
-from dropshare_shared.naming import normalize_name
+from dropshare_shared.naming import normalize_extension, normalize_name
 from dropshare_shared.schemas.envelope import PAGE_LIMIT_MAX, DataResponse, ListResponse
+from dropshare_shared.schemas.file_policy import FilePolicyOut
 from dropshare_shared.schemas.nodes import FolderCreateIn, NamespaceOut, NodeOut, NodeUpdateIn
 from dropshare_shared.schemas.sync import ChangesResponse, WaitIn, WaitOut
 from dropshare_shared.schemas.uploads import (
@@ -47,6 +49,8 @@ _MAX_CHUNK_SIZE = 64 * 1024 * 1024
 # Completing assembles and hashes the whole file on the server before it answers.
 _COMPLETE_SECONDS_PER_BYTE = 1 / (20 * 1024 * 1024)
 _COMPLETE_MIN_SECONDS = 60.0
+# How soon to ask again when an earlier upload of the same file is still being scanned.
+_DEFAULT_SCAN_WAIT = 5.0
 # The upload can't continue: the target changed, the session is gone, or it was refused for
 # good. Its reserved space is given back (it would otherwise count against quota for 24 h).
 _UPLOAD_OVER = frozenset(
@@ -57,6 +61,10 @@ _UPLOAD_OVER = frozenset(
         ErrorCode.NOT_FOUND,
         ErrorCode.QUOTA_EXCEEDED,
         ErrorCode.FILE_TOO_LARGE,
+        # Refused for good (FR-SAFE-01/02): the sync engine lists the file and sends it again
+        # only once it has changed, as a new upload.
+        ErrorCode.FILE_TYPE_NOT_ALLOWED,
+        ErrorCode.MALWARE_DETECTED,
     }
 )
 
@@ -138,11 +146,50 @@ class RemoteFiles:
     def __init__(self, api: ApiClient) -> None:
         self._api = api
         self._memory = MemoryUploadSessions()  # when the caller has no store of its own
+        self._policy_lock = threading.Lock()
+        self._banned: frozenset[str] | None = None  # the server's banned types, once asked
 
     def forget_uploads(self) -> None:
         """Signed out: the next user never resumes this one's uploads (their session IDs
-        would only be refused, and audited as denied)."""
+        would only be refused, and audited as denied), and the next server's rules are
+        asked for afresh."""
         self._memory.clear()
+        with self._policy_lock:
+            self._banned = None
+
+    def upload_status(self, upload_id: uuid.UUID) -> UploadOut | None:
+        """Where an upload stands on the server; None if it doesn't know it (any more)."""
+        try:
+            return self._api.data("GET", f"/api/v1/uploads/{upload_id}", UploadOut)
+        except ApiError as exc:
+            if exc.code == ErrorCode.NOT_FOUND:
+                return None
+            raise
+
+    def banned_extensions(self, *, refresh: bool = False) -> frozenset[str]:
+        """The file types the server refuses (FR-SAFE-03), in `naming.normalize_extension`
+        form, so a banned file is never sent just to be refused. Asked once and kept; asked
+        again with `refresh` (each time sync connects). A server from before banned types
+        has none. The server's own check still decides (FR-SAFE-02)."""
+        with self._policy_lock:
+            if refresh or self._banned is None:
+                self._banned = self._fetch_banned()
+            return self._banned
+
+    def _fetch_banned(self) -> frozenset[str]:
+        try:
+            policy = self._api.data("GET", "/api/v1/file-policy", FilePolicyOut)
+        except ApiError as exc:
+            if exc.status == 404:
+                return frozenset()
+            raise
+        banned: set[str] = set()
+        for entry in policy.banned_extensions:
+            try:
+                banned.add(normalize_extension(entry))
+            except ValueError:
+                logger.warning("Ignoring the server's banned type %r", entry)
+        return frozenset(banned)
 
     # --- metadata ------------------------------------------------------------------------
 
@@ -256,7 +303,9 @@ class RemoteFiles:
                 store.forget_upload_session(key)
                 return self.upload(source, target, stop, progress, sessions=sessions)
         except ApiError as exc:
-            if exc.code in _UPLOAD_OVER:
+            # A refused upload (the server said so after its malware scan) can't complete:
+            # whatever its answer, it is let go and planned again from what is here now.
+            if exc.code in _UPLOAD_OVER or upload.status == UploadStatus.REJECTED:
                 self._abandon(store, key, upload)
             if exc.code == ErrorCode.FILE_HASH_MISMATCH:
                 raise SourceChangedError(str(source.path)) from exc
@@ -285,7 +334,9 @@ class RemoteFiles:
     def _complete(
         self, source: SourceFile, upload: UploadOut, stop: threading.Event, progress: Progress
     ) -> NodeOut:
-        """Complete; if the server is missing a chunk after all, send what it lists, once."""
+        """Complete; if the server is missing a chunk after all, send what it lists, once.
+        ScanPendingError while the server is still scanning the file: the session is kept, so
+        asking again later sends nothing (FR-SAFE-01)."""
         timeout = httpx.Timeout(
             connect=10.0,
             read=max(_COMPLETE_MIN_SECONDS, source.size * _COMPLETE_SECONDS_PER_BYTE),
@@ -294,14 +345,20 @@ class RemoteFiles:
         )
         path = f"/api/v1/uploads/{upload.id}/complete"
         try:
-            return self._api.data("POST", path, NodeOut, timeout=timeout)
+            return self._completed(path, timeout)
         except ApiError as exc:
             if exc.code != ErrorCode.UPLOAD_INCOMPLETE:
                 raise
         current = self._api.data("GET", f"/api/v1/uploads/{upload.id}", UploadOut)
         self._send_chunks(source, current, stop, progress)
         self._check_unchanged(source)
-        return self._api.data("POST", path, NodeOut, timeout=timeout)
+        return self._completed(path, timeout)
+
+    def _completed(self, path: str, timeout: httpx.Timeout) -> NodeOut:
+        result = self._api.data_or_accepted("POST", path, NodeOut, UploadOut, timeout=timeout)
+        if isinstance(result, Accepted):
+            raise ScanPendingError(result.retry_after)
+        return result
 
     def _start(self, source: SourceFile, target: UploadTarget) -> UploadOut:
         if isinstance(target, NewFile):
@@ -333,7 +390,11 @@ class RemoteFiles:
         if stored is None:
             return None
         if (stored.sha256, stored.size) != (source.sha256, source.size):
-            self._cancel(stored.upload_id)
+            if not self._cancel(stored.upload_id):
+                # The server is scanning the earlier content and may still publish it: wait
+                # for that, so this edit goes up as the next version, not as a conflict with
+                # the earlier one (FR-SAFE-01). The session stays; the engine adopts it.
+                raise ScanPendingError(_DEFAULT_SCAN_WAIT)
             store.forget_upload_session(key)
             return None
         try:
@@ -386,11 +447,20 @@ class RemoteFiles:
         if upload.status != UploadStatus.COMPLETED:
             self._cancel(upload.id)
 
-    def _cancel(self, upload_id: uuid.UUID) -> None:
+    def _cancel(self, upload_id: uuid.UUID) -> bool:
+        """Let the server drop the session. False while it is scanning it: that upload may
+        still be published, so it isn't over (409 UPLOAD_SCANNING)."""
         try:
             self._api.no_content("DELETE", f"/api/v1/uploads/{upload_id}")
-        except (ApiError, OfflineError):
+        except ApiError as exc:
+            if exc.code == ErrorCode.UPLOAD_SCANNING:
+                return False
+            logger.info(
+                "Couldn't cancel upload %s (%s); it expires on its own", upload_id, exc.code
+            )
+        except OfflineError:
             logger.info("Couldn't cancel upload %s; it expires on its own", upload_id)
+        return True
 
     @staticmethod
     def _check_unchanged(source: SourceFile) -> None:

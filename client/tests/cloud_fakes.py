@@ -36,6 +36,7 @@ from dropshare_shared.schemas.nodes import (
     NodeOut,
 )
 from dropshare_shared.schemas.sync import ChangeOut, ChangesMeta, ChangesResponse, ChangeType
+from dropshare_shared.schemas.uploads import UploadOut
 
 
 @dataclass
@@ -88,6 +89,7 @@ class FakeCloud:
         self.namespaces: dict[uuid.UUID, CloudNamespace] = {}
         self.nodes: dict[uuid.UUID, CloudNode] = {}
         self.personal: dict[str, uuid.UUID] = {}
+        self.banned: set[str] = set()  # file types the server refuses (FR-SAFE-02)
         self.lock = threading.RLock()
 
     def account(self, user: str) -> "Account":
@@ -398,6 +400,12 @@ class Account:
         if write and role == AccessRole.VIEWER:
             raise ApiError(403, ErrorCode.FORBIDDEN, "You can view this item but not change it.")
         return node
+
+    def banned_extensions(self, *, refresh: bool = False) -> frozenset[str]:
+        return frozenset(self.cloud.banned)
+
+    def upload_status(self, upload_id: uuid.UUID) -> UploadOut | None:
+        return None
 
     def namespaces(self) -> list[NamespaceOut]:
         with self.cloud.lock:

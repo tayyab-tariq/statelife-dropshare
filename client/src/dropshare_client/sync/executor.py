@@ -505,7 +505,7 @@ class Executor:
         if node.mount_namespace_id is not None:
             return
         read_only = self._view_only(node.namespace_id)
-        for item in self._scanner.scan(key).items.values():
+        for item in self._scanner.scan(key).present():
             if item.kind == NodeKind.FILE:
                 self._attributes.set_read_only(self._disk(item.path), read_only)
 
@@ -554,6 +554,7 @@ class Executor:
         """Everything in the folder is as last synced, so recycling it loses no edit."""
         scan = self._scanner.scan(key)
         base = self._index.entries_under(key)
+        scan.accept_synced(base)
         if scan.deferred or scan.problems:
             raise LocalChangedError(key)
         for item_key, item in scan.items.items():

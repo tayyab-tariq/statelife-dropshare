@@ -10,6 +10,7 @@ from pytestqt.qtbot import QtBot
 from dropshare_client.controllers.notification_controller import Notice, NotificationController
 from dropshare_client.services.config import ConfigStore, NotificationSettings
 from dropshare_client.store.records import Activity, Problem
+from dropshare_client.sync.status import malware_reason
 from dropshare_shared.schemas.users import UserOut
 
 _GATHER_MS = 20
@@ -183,3 +184,48 @@ def test_uploads_read_the_usage_again_at_most_once_a_minute(
 
 def test_every_notification_type_has_its_switch() -> None:
     assert {notice.value for notice in Notice} == set(NotificationSettings.model_fields)
+
+
+def test_a_virus_found_is_said_so(qtbot: QtBot, shown: Shown) -> None:
+    # FR-SAFE-01, OQ-59 (3): still a Can't sync notice, worded for a virus.
+    controller, notes = shown
+    virus = Problem(
+        "docs/report.docx",
+        "Docs/report.docx",
+        malware_reason("Win.Test.EICAR_HDB-1"),
+    )
+
+    controller.problems_changed([])
+    controller.problems_changed([virus])
+
+    qtbot.waitUntil(lambda: len(notes) == 1)
+    assert notes == [
+        "Virus found: A virus was found in “report.docx”, so it wasn't uploaded. Your copy "
+        "hasn't been changed. Open Can't sync in DropShare for details."
+    ]
+
+
+def test_a_virus_among_other_items_is_named_first(qtbot: QtBot, shown: Shown) -> None:
+    controller, notes = shown
+    virus = Problem("bad.txt", "bad.txt", malware_reason("Eicar"))
+
+    controller.problems_changed([])
+    controller.problems_changed([virus, _problem("odd?.txt")])
+
+    qtbot.waitUntil(lambda: len(notes) == 1)
+    assert notes[0].startswith("Virus found: A virus was found in “bad.txt”")
+    assert "1 more item can't be synced" in notes[0]
+
+
+def test_a_path_once_refused_for_a_virus_isnt_called_one_later(qtbot: QtBot, shown: Shown) -> None:
+    controller, notes = shown
+    controller.problems_changed([])
+    controller.problems_changed([Problem("r.pdf", "r.pdf", malware_reason("Eicar"))])
+    qtbot.waitUntil(lambda: len(notes) == 1)
+
+    controller.problems_changed([])  # cleaned up and synced
+    qtbot.wait(_GAP_MS * 2)
+    controller.problems_changed([_problem("r.pdf")])  # a new, unrelated problem there
+
+    qtbot.waitUntil(lambda: len(notes) == 2, timeout=3000)
+    assert notes[1].startswith("Can't sync:")
