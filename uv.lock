@@ -276,7 +276,7 @@ dev = [
 
 [[package]]
 name = "dropshare-client"
-version = "0.2.2"
+version = "0.2.3"
 source = { editable = "client" }
 dependencies = [
     { name = "dropshare-shared" },
