@@ -21,7 +21,13 @@ from dropshare_client.controllers.sync_log_controller import (
     CantSyncController,
 )
 from dropshare_client.ui import theme
-from dropshare_client.ui.forms import announce, message_label, show_message, status_label
+from dropshare_client.ui.forms import (
+    announce,
+    clear_reload_message,
+    message_label,
+    show_message,
+    status_label,
+)
 from dropshare_client.ui.stateful_view import StatefulView
 from dropshare_client.ui.sync_log_models import (
     CANT_SYNC_ITEM,
@@ -136,6 +142,12 @@ class _LogView(QWidget):
     def _failed(self, message: str) -> None:
         show_message(self._error, message)
 
+    def _reload_failed(self, message: str) -> None:
+        show_message(self._error, message, from_reload=True)
+
+    def _reloaded(self) -> None:
+        clear_reload_message(self._error)
+
     def _announce(self, text: str) -> None:
         show_message(self._error, "")
         announce(self._status, text)
@@ -167,7 +179,9 @@ class ActivityView(_LogView):
             lambda: self._view.show_loading(messages.LOADING_ACTIVITY, keep_content=False)
         )
         controller.loaded.connect(self._show)
+        controller.loaded.connect(self._reloaded)
         controller.failed.connect(self._view.show_error)
+        controller.reload_failed.connect(self._reload_failed)
         controller.action_failed.connect(self._failed)
         controller.open_file.connect(
             lambda path: QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
@@ -235,7 +249,9 @@ class CantSyncView(_LogView):
             lambda: self._view.show_loading(messages.LOADING_CANT_SYNC, keep_content=False)
         )
         controller.loaded.connect(self._show)
+        controller.loaded.connect(self._reloaded)
         controller.failed.connect(self._view.show_error)
+        controller.reload_failed.connect(self._reload_failed)
         controller.action_failed.connect(self._failed)
         controller.retried.connect(self._announce)
         self._update()

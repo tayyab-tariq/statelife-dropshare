@@ -197,8 +197,20 @@ def test_restoring_several_says_which_couldnt_be_done(
     _button(find_by_name, shell.trash_view, "Restore").click()
 
     qtbot.waitUntil(lambda: bool(_error_text(shell)))
-    assert _error_text(shell) == messages.some_failed(1, messages.NOT_IN_TRASH)
+    qtbot.waitUntil(lambda: table.model().rowCount() == 1)  # the reload after the action
+    failed = messages.some_failed(1, messages.NOT_IN_TRASH)
+    assert _error_text(shell) == failed
     assert _status(shell) == messages.restored(1)
+
+    # Still true when a later reload fails, and once one works again.
+    client.server.offline = True
+    client.trashed.refresh()
+    qtbot.waitUntil(lambda: _error_text(shell) == f"{failed}\n\n{messages.OFFLINE}")
+    client.server.offline = False
+    client.server.trash_item("budget.xlsx")
+    client.trashed.refresh()
+    qtbot.waitUntil(lambda: table.model().rowCount() == 2)
+    assert _error_text(shell) == failed
 
 
 def test_enter_or_double_click_restores_that_row_only(
@@ -281,6 +293,13 @@ def test_a_failed_reload_keeps_the_list(
     qtbot.waitUntil(lambda: bool(_error_text(shell)))
     assert shell.trash_view.state == "content" and table.model().rowCount() == 1
     assert _error_text(shell) == messages.OFFLINE
+
+    client.server.offline = False
+    client.server.trash_item("budget.xlsx")
+    client.trashed.refresh()
+
+    qtbot.waitUntil(lambda: table.model().rowCount() == 2)
+    assert _error_text(shell) == ""
 
 
 def test_a_large_trash_empties_in_several_calls_and_can_be_stopped(

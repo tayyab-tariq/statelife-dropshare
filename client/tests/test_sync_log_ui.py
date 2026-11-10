@@ -266,3 +266,35 @@ def test_activity_and_settings_in_the_tray_wait_for_sign_in(
     qtbot.waitUntil(lambda: shell.tray.state is TrayState.UP_TO_DATE)
 
     assert shell.tray.recent_activity.isEnabled() and shell.tray.settings.isEnabled()
+
+
+# --- a failed reload while a list is shown ------------------------------------------------
+
+
+def test_a_reload_that_works_clears_the_message_of_one_that_failed(
+    qtbot: QtBot, client: Client
+) -> None:
+    index = _index(client)
+    index.add_activity("uploaded", "plan.docx")
+    index.set_problem(Problem("a:b.txt", "a:b.txt", _NAME_REASON))
+    index.close()
+    activity = _activity_view(qtbot, client)
+    cant_sync = _cant_sync_view(qtbot, client)
+    qtbot.waitUntil(lambda: activity.state == "content" and cant_sync.state == "content")
+    index_path = client.app_data / "index.db"
+    readable = index_path.read_bytes()
+    index_path.write_bytes(b"not a database")
+
+    client.activity.refresh()  # as when the engine reports, not the Refresh button
+    client.cant_sync.refresh()
+
+    qtbot.waitUntil(lambda: bool(_text(activity, "ActivityError")))
+    qtbot.waitUntil(lambda: bool(_text(cant_sync, "CantsyncError")))
+    assert activity.state == "content" and cant_sync.state == "content"
+
+    index_path.write_bytes(readable)
+    client.activity.refresh()
+    client.cant_sync.refresh()
+
+    qtbot.waitUntil(lambda: not _text(activity, "ActivityError"))
+    qtbot.waitUntil(lambda: not _text(cant_sync, "CantsyncError"))

@@ -27,12 +27,34 @@ def message_label(object_name: str) -> QLabel:
     return label
 
 
-def show_message(label: QLabel, text: str) -> None:
-    """Show (or hide, for "") a message and have screen readers announce it."""
-    label.setText(text)
-    label.setVisible(bool(text))
-    if text:
+_FROM_RELOAD = "fromReload"  # the label ends with a failed reload's message
+_KEPT = "keptMessage"  # what it showed before that, still true
+
+
+def show_message(
+    label: QLabel, text: str, *, from_reload: bool = False, alert: bool = True
+) -> None:
+    """Show (or hide, for "") a message and have screen readers announce it (unless `alert`
+    is False). `from_reload`: it says a reload failed. A message already shown (an action
+    that failed) stays in front of it, and the next reload that works takes away only the
+    reload's part (`clear_reload_message`); any other message replaces the whole text."""
+    kept = ""
+    if from_reload and text:
+        kept = str(label.property(_KEPT) or "") if label.property(_FROM_RELOAD) else label.text()
+    label.setProperty(_FROM_RELOAD, from_reload and bool(text))
+    label.setProperty(_KEPT, kept)
+    shown = kept if kept == text else "\n\n".join(part for part in (kept, text) if part)
+    label.setText(shown)
+    label.setVisible(bool(shown))
+    if shown and alert:
         QAccessible.updateAccessibility(QAccessibleEvent(label, QAccessible.Event.Alert))
+
+
+def clear_reload_message(label: QLabel) -> None:
+    """A reload worked: take away a failed reload's message, leaving what was shown before it
+    (not announced again: nothing new happened to it)."""
+    if label.property(_FROM_RELOAD):
+        show_message(label, str(label.property(_KEPT) or ""), alert=False)
 
 
 def add_field(form: QFormLayout, text: str, field: QWidget) -> None:

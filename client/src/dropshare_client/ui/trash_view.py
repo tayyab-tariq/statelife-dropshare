@@ -20,7 +20,14 @@ from PySide6.QtWidgets import (
 from dropshare_client.controllers import messages
 from dropshare_client.controllers.trash_controller import TrashController, TrashItemOut
 from dropshare_client.ui import theme
-from dropshare_client.ui.forms import announce, confirm, message_label, show_message, status_label
+from dropshare_client.ui.forms import (
+    announce,
+    clear_reload_message,
+    confirm,
+    message_label,
+    show_message,
+    status_label,
+)
 from dropshare_client.ui.stateful_view import StatefulView
 from dropshare_client.ui.trash_model import DELETED, DELETED_BY, LOCATION, NAME, SIZE, TrashModel
 
@@ -124,6 +131,9 @@ class TrashView(QWidget):
         controller.busy_changed.connect(self._busy)
         controller.succeeded.connect(self._announce)
         controller.action_failed.connect(lambda message: show_message(self._error, message))
+        controller.reload_failed.connect(
+            lambda message: show_message(self._error, message, from_reload=True)
+        )
         controller.progressed.connect(lambda text: announce(self._status, text))
         controller.cleared.connect(self._cleared)
         self._show()
@@ -152,6 +162,7 @@ class TrashView(QWidget):
             self._view.show_loading("Loading the trash…", keep_content=False)
 
     def _show(self) -> None:
+        clear_reload_message(self._error)  # the list loaded: a failed reload is past
         items = self._controller.items()
         self._model.set_rows(items)
         if items:
