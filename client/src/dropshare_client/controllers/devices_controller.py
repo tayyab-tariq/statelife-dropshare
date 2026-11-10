@@ -23,6 +23,7 @@ class DevicesController(QObject):
     busy_changed = Signal(bool)
     revoked = Signal(str)  # a short confirmation
     action_failed = Signal(str)
+    reload_failed = Signal(str)  # the list is kept; the next reload that works clears it
 
     def __init__(self, devices: Devices, worker: Worker | None = None) -> None:
         super().__init__()
@@ -79,7 +80,7 @@ class DevicesController(QObject):
             return
         logger.info("Couldn't list devices: %s", type(exc).__name__)
         if self._loaded_once:
-            self.action_failed.emit(messages.message_for(exc))
+            self.reload_failed.emit(messages.message_for(exc))
         else:
             self.failed.emit(messages.message_for(exc))
 

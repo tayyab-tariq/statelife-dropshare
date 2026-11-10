@@ -427,3 +427,32 @@ def test_going_offline_while_browsing_keeps_the_user_where_they_are(
 
     qtbot.waitUntil(lambda: shell.tray.state is TrayState.OFFLINE)
     assert shell.window._pages.currentWidget() is shell.browser_view
+
+
+def test_a_refresh_that_works_clears_the_message_of_one_that_failed(
+    qtbot: QtBot,
+    make_client: MakeClient,
+    make_shell: MakeShell,
+    find_by_name: FindByName,
+    tmp_path: Path,
+) -> None:
+    """The server came back: Refresh shows the folder again without the old "Can't reach"."""
+    client, shell = _signed_in_with(qtbot, make_client, make_shell, tmp_path)
+    qtbot.waitUntil(lambda: _names(shell) == ["Docs", "top.txt"])
+    error = shell.browser_view.findChild(QLabel, "browser_error")
+    assert isinstance(error, QLabel)
+    refresh = find_by_name(shell.browser_view, QPushButton, "Refresh")
+    assert isinstance(refresh, QPushButton)
+    client.server.offline = True
+
+    QTest.mouseClick(refresh, Qt.MouseButton.LeftButton)
+
+    qtbot.waitUntil(lambda: error.isVisibleTo(shell.browser_view))
+    assert error.text() == messages.OFFLINE and _state(shell) == "content"
+
+    client.server.offline = False
+    client.server.add(client.server.root_id, "new.txt", 1)
+    QTest.mouseClick(refresh, Qt.MouseButton.LeftButton)
+
+    qtbot.waitUntil(lambda: "new.txt" in _names(shell))
+    assert not error.isVisibleTo(shell.browser_view)

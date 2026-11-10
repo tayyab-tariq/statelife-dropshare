@@ -300,3 +300,30 @@ def test_a_file_that_just_downloaded_can_be_acted_on_without_a_refresh(
     )
 
     qtbot.waitUntil(lambda: "remote.txt" in s.here())
+
+
+def test_an_action_message_stays_through_a_reload(
+    qtbot: QtBot, make_client: MakeClient, make_shell: MakeShell, tmp_path: Path
+) -> None:
+    """Only a failed reload's message goes when a reload works; this one is still true."""
+    s = _setup(qtbot, make_client, make_shell, tmp_path)
+    s.shell.browser_view.ask_name = lambda *_: "DOCS"
+    s.select("notes.txt")
+    QTest.keyClick(s.table, Qt.Key.Key_F2)
+    qtbot.waitUntil(lambda: "already an item with this name" in s.error())
+    s.client.server.add(s.client.server.root_id, "new.txt", 1)
+
+    s.client.browser.refresh()
+
+    qtbot.waitUntil(lambda: "new.txt" in s.names())
+    failed = s.error()
+    assert "already an item with this name" in failed
+
+    s.client.server.offline = True  # and past a reload that fails
+    s.client.browser.refresh()
+    qtbot.waitUntil(lambda: s.error() == f"{failed}\n\n{messages.OFFLINE}")
+    s.client.server.offline = False
+    s.client.server.add(s.client.server.root_id, "later.txt", 1)
+    s.client.browser.refresh()
+    qtbot.waitUntil(lambda: "later.txt" in s.names())
+    assert s.error() == failed

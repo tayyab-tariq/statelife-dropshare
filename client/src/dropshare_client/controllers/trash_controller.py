@@ -45,7 +45,8 @@ class TrashController(QObject):
     failed = Signal(str)  # nothing to show: the view shows the error state
     busy_changed = Signal(bool)
     succeeded = Signal(str)
-    action_failed = Signal(str)  # also a reload that failed while the list is shown
+    action_failed = Signal(str)
+    reload_failed = Signal(str)  # the list is kept; the next reload that works clears it
     progressed = Signal(str)  # "Restoring 3 of 40…", from the pool thread (queued)
     cleared = Signal()  # signed out or another account: forget messages and selection
 
@@ -107,7 +108,7 @@ class TrashController(QObject):
             return
         logger.info("Couldn't load the trash: %s", _logged(exc))
         if self._loaded_once:  # keep the list; say so above it
-            self.action_failed.emit(messages.message_for(exc))
+            self.reload_failed.emit(messages.message_for(exc))
         else:
             self.failed.emit(messages.message_for(exc))
 

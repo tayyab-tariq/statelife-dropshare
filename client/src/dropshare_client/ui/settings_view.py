@@ -62,6 +62,8 @@ class SettingsView(QScrollArea):
         space = theme.SPACE
         self._diagnostics = diagnostics
         self._lasting_error = ""
+        self._message = ""  # what last happened here (an action failed); "" for none
+        self._reload_message = ""  # the computers couldn't be listed again, until they are
         self._has_folder = False
         self._move_blocked = ""
         # Hook (tests replace it): where to save diagnostics; "" when cancelled.
@@ -153,6 +155,8 @@ class SettingsView(QScrollArea):
         self._updates.changed.connect(self._show_updates)
         self._settings.failed.connect(self._show_error)
         self._devices.action_failed.connect(self._show_error)
+        self._devices.reload_failed.connect(self._devices_reload_failed)
+        self._devices.loaded.connect(self._devices_reloaded)
         self._devices.revoked.connect(self._announce)
         self._diagnostics.exported.connect(self._announce)
         self._diagnostics.failed.connect(self._show_error)
@@ -247,8 +251,26 @@ class SettingsView(QScrollArea):
             self._diagnostics.export(destination)
 
     def _show_error(self, text: str) -> None:
-        """A message above the sections ("" clears it), always after the lasting one."""
-        show_message(self._error, "\n\n".join(part for part in (self._lasting_error, text) if part))
+        """A message above the sections ("" clears it), always after the lasting one. It
+        replaces the previous one, and a failed listing of the computers with it."""
+        self._message, self._reload_message = text, ""
+        self._show_messages()
+
+    def _devices_reload_failed(self, text: str) -> None:
+        """Shown after the message already there, which stays true: the next listing that
+        works takes away only this part."""
+        self._reload_message = text
+        self._show_messages()
+
+    def _devices_reloaded(self) -> None:
+        if self._reload_message:
+            self._reload_message = ""
+            self._show_messages(alert=False)  # what stays was announced when it came
+
+    def _show_messages(self, *, alert: bool = True) -> None:
+        reload = "" if self._reload_message == self._message else self._reload_message
+        parts = (self._lasting_error, self._message, reload)
+        show_message(self._error, "\n\n".join(part for part in parts if part), alert=alert)
 
     def _announce(self, text: str) -> None:
         self._show_error("")

@@ -103,6 +103,7 @@ class ActivityController(_LocalItems):
     loading = Signal()
     loaded = Signal()  # read rows()
     failed = Signal(str)  # nothing to show: the view shows the error state
+    reload_failed = Signal(str)  # the list is kept; the next reload that works clears it
 
     def __init__(
         self,
@@ -151,7 +152,7 @@ class ActivityController(_LocalItems):
             return
         logger.info("Couldn't read the activity: %s", type(exc).__name__)
         if self._loaded_once:
-            self.action_failed.emit(messages.message_for(exc))
+            self.reload_failed.emit(messages.message_for(exc))
         else:
             self.failed.emit(messages.message_for(exc))
 
@@ -165,6 +166,7 @@ class CantSyncController(_LocalItems):
     loading = Signal()
     loaded = Signal()  # read rows()
     failed = Signal(str)
+    reload_failed = Signal(str)  # the list is kept; the next reload that works clears it
     retried = Signal(str)  # a short confirmation for the status line
 
     def __init__(
@@ -220,7 +222,7 @@ class CantSyncController(_LocalItems):
             return
         logger.info("Couldn't read what can't be synced: %s", type(exc).__name__)
         if self._loaded_once:
-            self.action_failed.emit(messages.message_for(exc))
+            self.reload_failed.emit(messages.message_for(exc))
         else:
             self.failed.emit(messages.message_for(exc))
 

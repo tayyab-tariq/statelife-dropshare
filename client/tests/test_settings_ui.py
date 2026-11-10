@@ -613,3 +613,51 @@ def test_with_no_computers_listed_the_list_says_so(qtbot: QtBot, client: Client)
 
     qtbot.waitUntil(lambda: view.devices_card.state == "empty")
     assert _text(view.devices_card, "empty_message") == messages.DEVICES_EMPTY
+
+
+def test_listing_the_computers_again_clears_the_message_of_a_failed_listing(
+    qtbot: QtBot, client: Client
+) -> None:
+    """Only that message goes: a lasting one (a folder move needing attention) stays."""
+    client.server.device("Office PC", current=True)
+    view = _view(qtbot, client)
+    qtbot.waitUntil(lambda: view.devices_card.state == "content")
+    view.set_lasting_error("Lasting.")
+    client.server.devices_error = _error(500, "INTERNAL_ERROR", "Something went wrong.")
+
+    client.devices.refresh()
+
+    qtbot.waitUntil(lambda: _text(view, "settingsError").startswith("Lasting.\n\n"))
+    assert view.devices_card.state == "content"
+
+    client.server.devices_error = None
+    client.devices.refresh()
+
+    qtbot.waitUntil(lambda: _text(view, "settingsError") == "Lasting.")
+
+
+def test_a_failed_sign_out_of_a_computer_stays_through_the_listings_after_it(
+    qtbot: QtBot, client: Client, find_by_name: FindByName
+) -> None:
+    """Still true after the list is shown again, even past a listing that failed."""
+    client.server.device("Office PC", current=True)
+    client.server.device("Home laptop")
+    view = _view(qtbot, client)
+    qtbot.waitUntil(lambda: view.devices_card.state == "content")
+    client.server.offline = True
+    view.devices_card.table.selectRow(1)
+    _find(find_by_name, view, QPushButton, "Sign out selected computer…").click()
+    qtbot.waitUntil(lambda: _text(view, "settingsError") == messages.OFFLINE)
+    client.server.offline = False
+    client.server.devices_error = _error(500, "INTERNAL_ERROR", "Something went wrong.")
+
+    client.devices.refresh()
+
+    qtbot.waitUntil(lambda: _text(view, "settingsError").startswith(messages.OFFLINE + "\n\n"))
+
+    client.server.devices_error = None
+    client.server.device("New PC")
+    client.devices.refresh()
+
+    qtbot.waitUntil(lambda: view.devices_card.table.model().rowCount() == 3)
+    assert _text(view, "settingsError") == messages.OFFLINE

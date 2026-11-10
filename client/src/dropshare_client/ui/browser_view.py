@@ -53,7 +53,7 @@ from dropshare_client.ui.browser_model import (
     BrowserModel,
 )
 from dropshare_client.ui.file_dialogs import NameDialog, RecycleDialog
-from dropshare_client.ui.forms import show_message
+from dropshare_client.ui.forms import clear_reload_message, show_message
 from dropshare_client.ui.stateful_view import StatefulView
 from dropshare_client.ui.upload_flow import UploadFlow
 
@@ -231,6 +231,7 @@ class BrowserView(QWidget):
         controller.location_changed.connect(self._show_location)
         controller.loading.connect(self._loading)
         controller.loaded.connect(self._show_rows)
+        controller.appended.connect(lambda *_: clear_reload_message(self._error))
         controller.failed.connect(self._failed)
         controller.notice.connect(self._announce)
         controller.reveal.connect(self._select_node)
@@ -481,6 +482,7 @@ class BrowserView(QWidget):
         self._view.show_loading("Loading…", keep_content=keep)
 
     def _show_rows(self) -> None:
+        clear_reload_message(self._error)  # the folder loaded: a failed reload is past
         if self._model.rowCount() == 0:
             if not self._controller.crumbs():
                 return  # signed out, or still finding My files: loading or blank
@@ -498,7 +500,7 @@ class BrowserView(QWidget):
         """Keep what's shown when a refresh fails (ui.md §3); the full error page only when
         there is nothing to show."""
         if self._model.rowCount():
-            show_message(self._error, message)
+            show_message(self._error, message, from_reload=True)
         else:
             self._view.show_error(message)
 
