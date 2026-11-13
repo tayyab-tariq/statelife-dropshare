@@ -18,6 +18,8 @@ class AuditAction(StrEnum):
     USER_LISTED = "user.listed"
     USER_QUOTA_CHANGED = "user.quota_changed"
     USER_CHANNEL_CHANGED = "user.channel_changed"
+    USER_ROLE_CHANGED = "user.role_changed"
+    USER_PASSWORD_EMAILED = "user.password_emailed"  # noqa: S105 - action name, not a secret
     RELEASE_PUBLISHED = "release.published"
     RELEASE_WITHDRAWN = "release.withdrawn"
     AUDIT_EXPORTED = "audit.exported"

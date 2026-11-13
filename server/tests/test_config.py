@@ -192,3 +192,25 @@ def test_startup_refuses_an_invalid_ban_list(values: list[str]) -> None:
         _app_settings(banned_extensions=values)
 
     assert "banned_extensions" in {error["loc"][0] for error in caught.value.errors()}
+
+
+def test_email_is_off_unless_configured() -> None:
+    settings = _app_settings(email_api_url="", email_api_key="")  # as docker-compose passes them
+
+    assert (settings.email_api_url, settings.email_api_key) == (None, None)
+    assert settings.admin_rate_limit_per_minute == 30  # NFR-SEC-13, OQ-61 (2)
+
+
+@pytest.mark.parametrize(
+    "values",
+    [{"email_api_url": "https://mail.example.com/send"}, {"email_api_key": "k"}],
+)
+def test_email_api_needs_both_url_and_key(values: dict[str, str]) -> None:
+    with pytest.raises(ValidationError):
+        _app_settings(**values)
+
+
+def test_email_api_key_is_never_shown() -> None:
+    settings = _app_settings(email_api_url="https://mail.example.com/send", email_api_key="k3y")
+
+    assert "k3y" not in repr(settings)

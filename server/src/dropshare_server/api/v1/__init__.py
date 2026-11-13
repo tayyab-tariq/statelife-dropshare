@@ -5,6 +5,7 @@ with `_SUPPORTED`; tests check that every route checks the version."""
 from fastapi import APIRouter, Depends
 
 from dropshare_server.api.v1 import (
+    admin_users,
     auth,
     changes,
     directory,
@@ -35,4 +36,5 @@ router.include_router(directory.router, dependencies=_SUPPORTED)
 router.include_router(sharing.router, dependencies=_SUPPORTED)
 router.include_router(trash.router, dependencies=_SUPPORTED)
 router.include_router(file_policy.router, dependencies=_SUPPORTED)
+router.include_router(admin_users.router, dependencies=_SUPPORTED)
 router.include_router(releases.router)  # any version: an unsupported client fetches its update

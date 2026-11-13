@@ -173,7 +173,8 @@ mature Oracle support. Therefore:
 - A `current_user` dependency validates the JWT, then loads the user and device and rejects disabled users, revoked devices, and stale token versions (bumped on password change/disable). This is a DB hit per request, which is acceptable at our scale and needed for immediate revocation.
 - A `client_version` dependency reads `X-Client-Version` and raises 426 `UPGRADE_REQUIRED` below the configured minimum (FR-UPD-04).
 - Authorization lives in services. One helper resolves the caller's effective role on a node (`owner` / `editor` / `viewer` / none) via namespace ownership, namespace membership (direct or via group), or a file share. Every service method that touches a node calls it — including the destination parent of a move and the original parent of a restore.
-- No admin endpoints in v1 (FR-ADMIN-01): the admin CLI (`cli.py`) calls services directly, never repositories, and records audit events with actor `cli` plus the OS user. In Phase 2, admin endpoints use a `require_admin` dependency **and** the service re-checks the role.
+- The admin CLI (`cli.py`, FR-ADMIN-01) calls services directly, never repositories, and records audit events with actor `cli` plus the OS user.
+- Admin endpoints (`/admin/users`, FR-ADMIN-02) use `dependencies/admin.py` (`AdminSession`; `AdminWriteSession` adds the per-admin rate limit, NFR-SEC-13) **and** the service re-checks the role. The role comes from the user row loaded for the request, never from the token.
 
 ## 9. Audit events
 

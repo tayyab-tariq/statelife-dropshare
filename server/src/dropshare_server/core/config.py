@@ -4,7 +4,7 @@ from ipaddress import IPv4Address, IPv6Address
 from pathlib import Path
 from typing import Literal, Self
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import Field, HttpUrl, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from dropshare_shared.naming import normalize_extension
@@ -116,6 +116,27 @@ class Settings(DatabaseSettings):
     # rows (FR-AUDIT-03). Unset (dev, test) means the DB_USER account.
     audit_purge_db_user: str | None = Field(default=None, min_length=1)
     audit_purge_db_password: SecretStr | None = Field(default=None, min_length=1)
+
+    # The organization's email API, for temporary passwords (FR-ADMIN-07). Both or neither:
+    # unset, nothing is emailed and admins pass the password on themselves.
+    email_api_url: HttpUrl | None = None
+    email_api_key: SecretStr | None = Field(default=None, min_length=1)
+    email_timeout_seconds: float = Field(default=10, gt=0, le=60)  # OQ-61 (1)
+
+    # Admin write actions per admin per minute, in memory per process (NFR-SEC-13, OQ-61 (2)).
+    admin_rate_limit_per_minute: int = Field(default=30, ge=1)
+
+    @field_validator("email_api_url", "email_api_key", mode="before")
+    @classmethod
+    def _empty_is_unset(cls, value: object) -> object:
+        """docker-compose passes an unset variable as an empty string."""
+        return None if value == "" else value
+
+    @model_validator(mode="after")
+    def _email_api_complete(self) -> Self:
+        if (self.email_api_url is None) != (self.email_api_key is None):
+            raise ValueError("Set both EMAIL_API_URL and EMAIL_API_KEY, or neither")
+        return self
 
     @model_validator(mode="after")
     def _audit_purge_account_complete(self) -> Self:

@@ -25,6 +25,7 @@ Every milestone starts with `/plan` and ends with `/audit` and `/commit`.
 | M13 Distribution | In progress |
 | M14 Ops and go-live | Planned (after M15) |
 | M15 Content safety | Built (15a server types, 15b scanning, 15c client); Windows checks and Oracle run pending |
+| M16 In-app user administration | In progress |
 
 ### Deferred checks (run once the app is complete)
 
@@ -233,6 +234,17 @@ Acceptance:
 - Server tests cover publish rules (higher version, checksum, signature refused), withdrawn releases hidden, the channel per user, ranged installer download, and a too-old client still reaching the release endpoints.
 - Updater tests cover resume, a hash mismatch, a bad signature, and the check repeated just before install; pytest-qt covers the update UI states.
 - On Windows: install an older test-signed build, publish a newer one, and the client updates with sync state intact; uninstall keeps the sync folder.
+
+### M16 — In-app user administration · medium
+
+**Requirements:** FR-ADMIN-02 (manage users from the app), FR-ADMIN-06 (Administration section, users only), FR-ADMIN-07 (email the temporary password), FR-AUDIT-01, NFR-SEC-06/09/13, NFR-UX-01/02. Decided in OQ-60; assumptions in OQ-61.
+
+**Scope:**
+- **Contract:** `schemas/admin.py`, error code `SELF_CHANGE_NOT_ALLOWED`, audit actions `user.role_changed` and `user.password_emailed`.
+- **Server:** `/api/v1/admin/users` (list, create, patch status/role/quota, password reset) on the CLI's user services; admin check from the database on every request; self-change guard and an admin re-check under a lock (an enabled admin always remains); email through the organization's API after commit (`EMAIL_API_URL`, `EMAIL_API_KEY`, httpx); per-admin rate limit in memory.
+- **Client:** an Administration page shown only to admins: user list with filter, create, enable/disable, reset password, quota, role; the one-time password dialog.
+
+**Done when:** TestClient tests per endpoint (happy path, 401/403/404/409/429, email sent/failed/not configured, the change kept when the email fails); guard tests including two admins demoting each other; pytest-qt tests of the four states, the password dialog and the page shown only to admins; `/audit` passes; Windows check list (scaling, high contrast, keyboard, Narrator on the new page and dialogs).
 
 ### M15 — Content safety · large
 

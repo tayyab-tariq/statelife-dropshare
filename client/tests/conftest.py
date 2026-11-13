@@ -19,6 +19,7 @@ from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import QAbstractButton, QLabel, QWidget
 from pytestqt.qtbot import QtBot
 
+from dropshare_client.controllers.admin_controller import AdminController
 from dropshare_client.controllers.browser_controller import BrowserController
 from dropshare_client.controllers.devices_controller import DevicesController
 from dropshare_client.controllers.diagnostics_controller import DiagnosticsController
@@ -37,6 +38,7 @@ from dropshare_client.controllers.trash_controller import TrashController
 from dropshare_client.controllers.update_controller import UpdateController
 from dropshare_client.controllers.upload_controller import UploadController
 from dropshare_client.platform.macos.recycle_bin import MacTrash
+from dropshare_client.services.admin import AdminUsers
 from dropshare_client.services.api_client import ApiClient
 from dropshare_client.services.auth import AuthService, Device
 from dropshare_client.services.config import ConfigStore
@@ -208,6 +210,7 @@ def make_client(
             app_data=tmp_path / "app-data",
             updater=(updater := FakeUpdates(tmp_path / "app-data" / "updates")),
             updates=UpdateController(updater),
+            admin=AdminController(AdminUsers(api)),
         )
 
     yield make
@@ -244,6 +247,7 @@ def make_shell(qtbot: QtBot) -> Iterator[MakeShell]:
             folder_move=client.folder_move,
             diagnostics=client.diagnostics,
             updates=client.updates,
+            admin=client.admin,
             tray_available=tray_available,
         )
         qtbot.addWidget(shell.window)

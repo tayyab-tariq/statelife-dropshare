@@ -18,6 +18,7 @@ from PySide6.QtWidgets import QApplication, QSystemTrayIcon
 
 from dropshare_client import platform
 from dropshare_client.build_info import BUILD
+from dropshare_client.controllers.admin_controller import AdminController
 from dropshare_client.controllers.browser_controller import BrowserController
 from dropshare_client.controllers.devices_controller import DevicesController
 from dropshare_client.controllers.diagnostics_controller import DiagnosticsController
@@ -36,6 +37,7 @@ from dropshare_client.controllers.trash_controller import TrashController
 from dropshare_client.controllers.update_controller import UpdateController
 from dropshare_client.controllers.upload_controller import UploadController
 from dropshare_client.platform.base import Paths
+from dropshare_client.services.admin import AdminUsers
 from dropshare_client.services.api_client import ApiClient
 from dropshare_client.services.app_data import remove_app_data
 from dropshare_client.services.auth import AuthService, this_device
@@ -300,6 +302,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         folder_move=FolderMoveController(mover, sync, config, system.volumes, app_data),
         diagnostics=DiagnosticsController(config, app_data / "logs", client_version),
         updates=updates,
+        admin=AdminController(AdminUsers(api)),
         background=args.background,
         tray_available=QSystemTrayIcon.isSystemTrayAvailable(),
     )

@@ -73,7 +73,7 @@ Decisions agreed with the project owner. Changing any of these requires updating
 | D9  | Sharing                                          | **Yes**: share with users and groups, with permission levels. Share links are **internal only** (OQ-1).                                                                                                                                  |
 | D10 | Trash                                            | **Yes** in v1. **Version history** later, but designed for now (G6).                                                                                                                                                                     |
 | D11 | Selective sync, offline extras, bandwidth limits | **Phase 2.**                                                                                                                                                                                                                             |
-| D12 | Accounts                                         | **Stored in Oracle** (local accounts). 50–100 users initially; must scale beyond. In v1, accounts are created directly against the database with a server CLI; the in-app admin UI is **Phase 2** (OQ-3).                                |
+| D12 | Accounts                                         | **Stored in Oracle** (local accounts). 50–100 users initially; must scale beyond. In v1, accounts are managed with the server CLI and, by admins, from the Administration section of the desktop app (FR-ADMIN-02/06, OQ-60). Groups, storage overview and the audit viewer in the app stay **Phase 2**.                                |
 | D13 | Network                                          | Clients connect **over the public internet**.                                                                                                                                                                                            |
 | D14 | Audit logs                                       | **Required** in v1.                                                                                                                                                                                                                      |
 | D15 | Distribution                                     | **Installer, code signing, and auto-update** all required in v1.                                                                                                                                                                         |
@@ -90,7 +90,7 @@ Decisions agreed with the project owner. Changing any of these requires updating
 | Role                | Who                              | Can do                                                                                                                                                                                                                                                         |
 | ------------------- | -------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **User**            | Any employee with an account     | Sync and manage their own files, share folders and files they own, use trash, manage their devices.                                                                                                                                                            |
-| **Admin**           | IT / system administrators       | In v1: manage users, groups, and quotas, view storage usage, and export audit logs **via the server CLI** (requires server access). In Phase 2: the same from an Administration section in the app. Admins do **not** get access to other users' file content. |
+| **Admin**           | IT / system administrators       | In v1: manage users (create, disable/enable, reset password, change quota and role) from the **Administration section of the desktop app** (FR-ADMIN-02/06) or the server CLI; manage groups, view storage usage, and export audit logs **via the server CLI** (requires server access). In Phase 2: groups, storage, and audit from the app too. Admins do **not** get access to other users' file content. |
 | **Share recipient** | A User who has been given access | Access shared items according to their role (Viewer or Editor).                                                                                                                                                                                                |
 
 Roles are stored on the user account. Authorization is always enforced on the server.
@@ -194,10 +194,12 @@ Acceptance:
 
 ### 6.2 Administration (ADMIN)
 
-In v1 there is no admin UI. IT staff with access to the server run a CLI that writes directly to the
-database through the same services the API uses, so passwords are hashed correctly and every action
-is validated and audited. (Plain SQL inserts can't be used for accounts because passwords must be
-stored as Argon2id hashes.) The in-app Administration section is Phase 2.
+IT staff with access to the server run a CLI that writes directly to the database through the same
+services the API uses, so passwords are hashed correctly and every action is validated and audited.
+(Plain SQL inserts can't be used for accounts because passwords must be stored as Argon2id hashes.)
+In v1, admins can also manage user accounts from an Administration section in the desktop app
+(FR-ADMIN-02/06, roadmap M16, OQ-60), which calls the same services through an admin API. Groups,
+storage overview, and the audit viewer in the app are Phase 2.
 
 **FR-ADMIN-01 — Server administration CLI** `v1`
 Commands (exact names decided at implementation): create user, reset password, disable/enable user, set quota, list users; create/delete group, add/remove group member, list groups; storage report; export audit events to CSV; publish client release (FR-UPD-05).
@@ -211,11 +213,44 @@ Acceptance:
 - Every CLI action is audited with actor `cli` plus the operating-system user who ran it.
 - The CLI refuses to run if the database configuration is missing or invalid.
 
-**FR-ADMIN-02 — Manage users from the app** `P2`
+**FR-ADMIN-02 — Manage users from the app** `v1` (OQ-60)
+Admins manage user accounts from the Administration section (FR-ADMIN-06) through an admin API that calls the same services as the CLI.
+Acceptance:
+
+- Only users whose role is `admin` can use `/admin/*`. The role is read from the database on every request, not trusted from the token, so a demoted or disabled admin loses access at their next request. Anyone else gets `403 FORBIDDEN`, audited as access denied.
+- The user list shows every account, enabled and disabled: username, email, display name, role, status, quota, and storage used. The app filters it by the start of username, display name, or email (case-insensitive). No paging.
+- **Create user:** username, email, display name, role (user/admin), quota (default 50 GB). Same validation and uniqueness rules as FR-ADMIN-01; a conflict says which field is taken.
+- **Reset password:** sets a new temporary password, signs the user out everywhere, and clears any lockout (as the CLI does).
+- Create and reset generate a one-time temporary password the user must change at first sign-in (FR-AUTH-05). It is shown to the admin **once**, in the response to that action; it can't be retrieved later and is never logged or audited. It is also emailed to the user (FR-ADMIN-07). If the email fails or isn't configured, the action still stands and the admin is told the email wasn't sent, so they pass the password on themselves.
+- **Disable** signs the user out everywhere immediately; files and shares are kept. **Enable** lets them sign in again.
+- **Change quota** follows OQ-46: never below what the user already stores, trash included; the refusal says how much they store.
+- **Change role** between user and admin.
+- Guard rails: an admin can't change their own status or role (`409 SELF_CHANGE_NOT_ALLOWED`). Since only an enabled admin can disable or demote another, never themselves, an enabled admin always remains. Before disabling or demoting an admin, the caller's own role is re-checked under a lock on every admin row, so when two admins demote each other at once the second is refused (`403`).
+- Every action is audited with the admin as actor (device, source IP), with the same actions as the CLI (`user.listed`, `user.created`, `user.disabled`, `user.enabled`, `user.quota_changed`, `auth.password_reset`) plus `user.role_changed` (old and new role). Whether the email was sent is recorded as `user.password_emailed` with outcome success or failure. Refused actions are audited as failure or denied.
+- Admin write actions are rate-limited per admin (NFR-SEC-13).
+- The CLI (FR-ADMIN-01) is unchanged and still audits as `cli`.
+
 **FR-ADMIN-03 — Manage groups from the app** `P2`
 **FR-ADMIN-04 — Quotas and storage overview in the app** `P2`
 **FR-ADMIN-05 — Audit log viewer in the app (filter, paginate, export)** `P2`
-**FR-ADMIN-06 — Administration section in the desktop app, visible only to admins** `P2`
+**FR-ADMIN-06 — Administration section in the desktop app, visible only to admins** `v1` (users only, OQ-60)
+Acceptance:
+
+- The section appears in the main window only when `GET /me` reports role `admin`. Hiding it is a convenience; the server decides (FR-ADMIN-02).
+- It holds the user list and the create, disable/enable, reset password, change quota, and change role actions. The list has loading, error (with retry), empty, and populated states (NFR-UX-01); network work runs off the UI thread; everything is keyboard-operable with accessible names (NFR-UX-02).
+- Disable, reset password, and change role ask for confirmation, naming the user.
+- After create or reset, a dialog shows the temporary password once with a Copy button and says whether the email was sent. The client never logs or stores it and drops it when the dialog closes.
+- An admin who loses the role while the section is open sees "You're no longer an administrator" on their next action, and the section is hidden.
+- Groups, storage overview, and the audit viewer aren't in the section in v1 (FR-ADMIN-03/04/05 stay `P2`).
+
+**FR-ADMIN-07 — Email the temporary password** `v1` (OQ-60, OQ-61)
+Acceptance:
+
+- The server sends through the organization's email API: `POST` to `EMAIL_API_URL` with JSON `{ "subject", "reciever", "text" }` (field spelled as the API spells it) and header `X-API-Key: <EMAIL_API_KEY>`. `text` is HTML.
+- The email holds the username and the temporary password and says the password must be changed at first sign-in. Every inserted value is HTML-escaped; no other account data.
+- The email is sent only after the account change is committed; a failed email never undoes it.
+- Sending fails on a network error, a timeout, a non-2xx status, a response that isn't JSON or has no `http_status`, or an `http_status` containing "fail" or "error" (case-insensitive).
+- `EMAIL_API_URL` and `EMAIL_API_KEY` are optional: with neither set the server starts and reports email as not configured; with only one set it refuses to start (NFR-OPS-03). The key never appears in logs, errors, or audit events; the password never appears in logs.
 
 ### 6.3 Files and folders in the file browser (FILE)
 
@@ -442,7 +477,7 @@ Acceptance — at minimum these are recorded:
 - Authentication: sign-in success/failure, sign-out, token refresh reuse detected, lockout/unlock, password change/reset.
 - Files: upload complete, download, create folder, rename, move, delete to trash, restore, permanent delete, upload or rename refused for file type or malware (FR-SAFE-01/02).
 - Sharing: share created/changed/removed, shared folder accepted/left.
-- Admin: user/group created/changed/disabled, quota changed, audit export.
+- Admin: user/group created/changed/disabled/enabled, role changed, password reset by an admin, quota changed, audit export.
 - Authorization failures (access denied).
 
 **FR-AUDIT-02 — Event content** `v1`
@@ -590,12 +625,13 @@ Acceptance:
 | NFR-SEC-03 | Passwords hashed with **Argon2id**. Tokens signed with a server secret held outside the repo; refresh tokens stored only as hashes.                                             | v1        |
 | NFR-SEC-04 | Password policy: minimum 12 characters, maximum 128, rejected if on a bundled common-password list. No forced composition rules (per NIST SP 800-63B).                          | v1        |
 | NFR-SEC-05 | Inputs validated by Pydantic models; unknown fields rejected. File names validated server-side. Path traversal impossible because storage keys are IDs, not paths.              | v1        |
-| NFR-SEC-06 | Rate limiting at the reverse proxy (global and stricter on auth endpoints) plus account lockout (FR-AUTH-06).                                                                   | v1        |
+| NFR-SEC-06 | Rate limiting at the reverse proxy (global and stricter on auth endpoints) plus account lockout (FR-AUTH-06) and an in-app limit on admin actions (NFR-SEC-13).                                                                   | v1        |
 | NFR-SEC-07 | Errors never expose stack traces, SQL, internal IDs of other users, or storage paths.                                                                                           | v1        |
 | NFR-SEC-08 | Encryption at rest via encrypted storage volumes (NAS/SAN or object store). Oracle TDE only if licensed (OQ-10).                                                                | v1        |
-| NFR-SEC-09 | Secrets (DB password, token secret, storage keys) come from environment/secret store, validated at startup. Never committed.                                                    | v1        |
+| NFR-SEC-09 | Secrets (DB password, token secret, storage keys, email API key) come from environment/secret store, validated at startup. Never committed.                                                    | v1        |
 | NFR-SEC-10 | Dependencies pinned via `uv.lock`; vulnerability scan (`pip-audit` or equivalent, needs approval) before each release.                                                          | v1        |
 | NFR-SEC-11 | Antivirus / malware scanning of uploads (FR-SAFE-01; moved from P2, OQ-54).                                                                                                     | v1        |
+| NFR-SEC-13 | Admin write actions (FR-ADMIN-02) are limited per admin inside the app (default 30 per minute, `ADMIN_RATE_LIMIT_PER_MINUTE`); over the limit answers `429 RATE_LIMITED` with `Retry-After`. Kept in memory per server process (standard library): it resets on restart and isn't shared between workers (OQ-60). | v1 |
 | NFR-SEC-12 | MFA (TOTP).                                                                                                                                                                     | P2 (OQ-9) |
 
 ### 7.2 Performance and scale (PERF, SCALE)
@@ -723,12 +759,12 @@ Every request sends `X-Client-Version`; every response includes `X-Request-ID`.
 | Sharing            | `GET /nodes/{id}/members`, `POST /nodes/{id}/members`, `PATCH /members/{id}`, `DELETE /members/{id}`, `GET /shared-with-me`, `POST /mounts`, `DELETE /mounts/{namespace_id}`, `GET /users/search?q=`, `GET /groups/search?q=` |
 | File policy        | `GET /file-policy`: the banned extensions and the maximum file size, for checks before upload (FR-SAFE-03) |
 | Client updates     | `GET /client/releases/latest?platform=` (channel from the user, OQ-49), `GET /client/releases/{id}/installer`                                                                                                     |
-| Admin              | None in v1 (administration is the server CLI). Phase 2: `/admin/users`, `/admin/groups`, `/admin/storage`, `/admin/audit-events`, `/admin/releases`.                                        |
+| Admin              | v1 (FR-ADMIN-02, admins only): `GET /admin/users`, `POST /admin/users`, `PATCH /admin/users/{id}` (status, role, quota), `POST /admin/users/{id}/password-reset`. Phase 2: `/admin/groups`, `/admin/storage`, `/admin/audit-events`, `/admin/releases`.                                        |
 
 Error codes are stable SCREAMING_SNAKE_CASE strings defined in `shared/`, for example
 `VALIDATION_ERROR`, `UNAUTHENTICATED`, `FORBIDDEN`, `NOT_FOUND`, `NAME_CONFLICT`,
 `REVISION_CONFLICT`, `QUOTA_EXCEEDED`, `FILE_TOO_LARGE`, `CHUNK_HASH_MISMATCH`, `FILE_HASH_MISMATCH`,
-`ACCOUNT_LOCKED`, `UPGRADE_REQUIRED`, `RATE_LIMITED`, `FILE_TYPE_NOT_ALLOWED`, `MALWARE_DETECTED` (FR-SAFE-01/02). `FILE_TYPE_NOT_ALLOWED` is `422`, with the reason, the extension, and for a folder up to 10 of the files it holds. `MALWARE_DETECTED` is `422`, with the scanner's detection name. `UPLOAD_SCANNING` is `409`: the upload is being scanned right now and may still complete.
+`ACCOUNT_LOCKED`, `UPGRADE_REQUIRED`, `RATE_LIMITED`, `SELF_CHANGE_NOT_ALLOWED` (`409`, FR-ADMIN-02), `FILE_TYPE_NOT_ALLOWED`, `MALWARE_DETECTED` (FR-SAFE-01/02). `FILE_TYPE_NOT_ALLOWED` is `422`, with the reason, the extension, and for a folder up to 10 of the files it holds. `MALWARE_DETECTED` is `422`, with the scanner's detection name. `UPLOAD_SCANNING` is `409`: the upload is being scanned right now and may still complete.
 
 ---
 
@@ -822,7 +858,7 @@ build installer (Inno Setup) → sign installer → publish release to the serve
 | BL-16 | SSO / LDAP / Active Directory sign-in                                                               | Later     |
 | BL-17 | Web client                                                                                          | Later     |
 | BL-18 | Mobile apps                                                                                         | Later     |
-| BL-19 | In-app administration: users, groups, quotas, storage, audit viewer (FR-ADMIN-02..06) and admin API | P2        |
+| BL-19 | In-app administration of groups, storage overview, and audit viewer (FR-ADMIN-03..05) and their admin API; user management moved to v1 (FR-ADMIN-02/06/07, OQ-60) | P2        |
 
 ---
 
@@ -850,6 +886,7 @@ These need an answer from the project owner. Items marked **Blocks** stop the na
 | **OQ-8**  | Hosting: Docker is allowed and the proxy is an existing nginx on another machine, run by its owners (OQ-50). Still open: public DNS name and TLS certificate (**to be provided later**), and the proxy's internal IP (firewall rule and `TRUSTED_PROXIES`). | Docker Compose; infra team owns proxy and certificates.                | Staging/production                                                                          |
 | **OQ-11** | Which CI/source-control platform do you use (GitHub, GitLab, Azure DevOps, other)? We need a **Windows runner** for Windows-only tests and installer builds, plus a Linux runner for server tests.     | Any platform with hosted Windows and Linux runners.                    | Automated Windows builds (manual builds on the Windows machine work until then)             |
 | **OQ-9**  | MFA is planned for P2. Given the server is internet-facing, do you want to pull it into v1?                                                                                                            | Pull into v1 if the pilot includes users outside the office.           | —                                                                                           |
+| **OQ-61** | Assumptions in M16, proceeding on request with these until confirmed: (1) the email is sent once with a 10 s timeout, no retry; (2) the admin rate limit is 30 write actions per minute per admin, and reading the list isn't counted; (3) admins can disable, reset, re-quota, and demote other admins, subject to the last-admin rule; (4) a temporary password doesn't expire (same as the CLI); (5) quota is entered in whole GB, default 50, at least 1. | As listed | — |
 | **OQ-10** | Encryption at rest: is Oracle Advanced Security (TDE) licensed, or do we rely on encrypted storage volumes only?                                                                                       | Encrypted volumes for v1; TDE if already licensed.                     | —                                                                                           |
 
 ### Resolved
@@ -857,7 +894,7 @@ These need an answer from the project owner. Items marked **Blocks** stop the na
 | ID    | Resolution                                                                                                                                                                                                                                                                                                                                                                                                                        | Date       |
 | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
 | OQ-1  | Share links are **internal only** (FR-SHARE-07). Public links out of scope.                                                                                                                                                                                                                                                                                                                                                       | 2026-10-26 |
-| OQ-3  | v1: accounts created directly against the database via the server CLI (FR-ADMIN-01). Admin UI is Phase 2 (BL-19); self-registration is out of scope.                                                                                                                                                                                                                                                                              | 2026-10-26 |
+| OQ-3  | v1: accounts created directly against the database via the server CLI (FR-ADMIN-01). Admin UI is Phase 2 (BL-19); self-registration is out of scope. **Replaced by OQ-60** for user management.                                                                                                                                                                                                                                                                              | 2026-10-26 |
 | OQ-4  | Proposed limits confirmed (D18).                                                                                                                                                                                                                                                                                                                                                                                                  | 2026-10-26 |
 | OQ-5  | Product name: **StateLife DropShare** (D20).                                                                                                                                                                                                                                                                                                                                                                                      | 2026-10-26 |
 | OQ-12 | Local development: the client accepts `http://` only for `localhost`/`127.0.0.1`; every other server URL must be HTTPS (NFR-SEC-01 unchanged for real deployments).                                                                                                                                                                                                                                                               | 2026-10-26 |
@@ -908,6 +945,7 @@ These need an answer from the project owner. Items marked **Blocks** stop the na
 | OQ-57 | Content safety (FR-SAFE-01 … 03), confirmed: (1) DropShare never deletes, moves, or quarantines a local file because of a ban or a detection; it only declines to sync it. (2) Files already on the server when a type is banned, or larger than the size limit, stay and can still be downloaded; new versions of them, and renames or moves of them, must pass the checks. (3) For v1 the ban list doesn't look inside archives, though ClamAV scans their contents; password-protected archives can't be scanned and are accepted. Revisit after the pilot. (4) Stored files aren't rescanned when signatures update, and downloads aren't scanned again. (5) The scan runs after `POST /uploads/{id}/complete`, with the upload in a "scanning" state that the client checks; this changes the upload API and the client's upload flow. (6) The starting ban list is `.exe .dll .msi .bat .cmd .com .scr .ps1 .vbs .js .jse .wsf .hta .jar .lnk .reg .iso`; macro-enabled Office types (`.docm .xlsm .pptm`) are allowed. (7) Engine: ClamAV (the official image, `clamav/clamav-debian` since it also runs on the development Macs, `clamd` + `freshclam`) as its own container in `docker-compose.yml` on the private network, no published ports, about 4 GB RAM, outbound HTTPS to `database.clamav.net` for signatures; the server talks to it over the `clamd` socket protocol with the standard library only. Approved as new infrastructure. (8) Moving or renaming a folder is refused while it holds a file with a banned extension. (9) Restoring a file with a banned extension from the trash is refused. Restoring a folder brings back everything else and leaves its banned files in the trash, each as its own item that can be deleted for good (assumption, proceeding on request: refusing the whole folder would leave its allowed files unrecoverable, audit 2026-11-05-0304). (10) Sharing a file with a banned extension, or adding a member to a folder that holds one, is refused like a move into a shared folder (assumption, proceeding on request; audit 2026-11-05-0304). | 2026-11-05 |
 | OQ-58 | Malware scanning details (FR-SAFE-01, roadmap M15b): (1) there is no setting that turns scanning off, in development either; developers run the `clamav` container and tests use a fake scanner. (2) ClamAV's size limits are set to their maximum with `AlertExceedsMax`, so a file it can't scan in full (an archive bomb, very deep nesting) is refused as `MALWARE_DETECTED` (`Heuristics.Limits.Exceeded`); password-protected archives stay accepted (OQ-57 (3)). (3) `/health/ready` fails only when the scanner can't be reached; it reports the signature age and logs a warning when signatures are older than 48 hours. Files up to 64 MiB are scanned within `POST /uploads/{id}/complete` (200); larger ones, or any while the scanner is down, answer 202 with the upload `scanning` and a worker finishes them. (4) The maximum file size is **2,000 MiB** (2,097,152,000 bytes), decided 2026-11-07: testing showed ClamAV 1.4 scans at most 2 GiB − 1 byte of a file, whatever its settings, so the 3 GB limit of OQ-54 would have refused files between 2 and 3 GB as unscannable. (5) Interim for clients from before the client part of M15 (0.2.x; assumption, proceeding on request, audit 2026-11-07-0309): they don't know the 202 answer and retry it as an unexpected response until the scan is done, without sending the file again; a refusal after the scan reaches their "Can't sync" list. Uploading a new version of an individually shared file (OQ-32) that is scanned by the worker shows them a "response this app doesn't understand" error although the upload goes on, and trying again after it finished can store the same content as one more version. Whether `MIN_CLIENT_VERSION` is raised with the client part (FR-UPD-04) is decided there. (6) Archives are scanned up to 4000M unpacked in total, 100,000 files and clamd's default nesting of 17 levels; anything beyond is refused as in (2). (7) A file the scanner keeps failing on (5 tries) is refused as unscannable (`MALWARE_DETECTED`, `DropShare.Unscannable`), never published. An upload whose uploader is disabled, or whose device is revoked, while it waits is not published. | 2026-11-05 |
 | OQ-59 | Client side of content safety (FR-SAFE-01/03, roadmap M15c): (1) A synced item renamed locally to a name DropShare can't sync (a banned type, or a path too long for Windows) is held: the server copy keeps its old name and is never trashed, and renaming it back resumes syncing. This also closes the same gap for too-long paths that existed before M15. (2) The first client with the client part of M15 is **0.2.3**; it is published with a minimum supported version of 0.2.3 (OQ-49, FR-UPD-04), so older clients are asked to update and the 0.2.x interim of OQ-58 (5) ends. (3) A malware detection is announced through the existing "Can't sync" notification (OQ-43), worded for a virus; there is no separate notification type. (4) Files synced before their type was banned keep syncing while unchanged here (OQ-57 (2)); edited here, they aren't sent. (5) While the server scans an upload, the client asks again with growing pauses (up to 5 minutes). Once published, the upload is recorded as synced, so a delete, rename or edit made here meanwhile is applied as such; a new file renamed during its scan is uploaded once more under its new name, and the published original then goes to the trash. A new version of an individually shared file (OQ-32) is asked about in the background until it is published or refused, while the app runs, and the user is told either way. (Audit 2026-11-07-0712.) | 2026-11-07 |
+| OQ-60 | In-app user administration moves to **v1** (roadmap M16), changing D12 and replacing OQ-3 for users. "Super user" is the existing `admin` role; no new role. Admins create users (username, email, display name, role, quota) and disable/enable, reset passwords, change quotas (OQ-46 rule), and change roles from an Administration section in the desktop app. The one-time temporary password is always shown once to the admin **and** emailed through the organization's email API (FR-ADMIN-07); if the email fails, the action still stands. Admins can't change their own status or role, and at least one enabled admin always remains. Actions are audited with the admin as actor, under the CLI's action names. Rate limiting is in the app, per admin (NFR-SEC-13). The CLI stays unchanged. `httpx` approved as a server dependency (the client already uses it). | 2026-11-11 |
 
 ## 16. Glossary
 

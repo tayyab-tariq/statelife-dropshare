@@ -14,8 +14,10 @@ from dropshare_server.core.config import Settings
 from dropshare_server.core.db import create_db_engine, create_session_factory
 from dropshare_server.core.error_handlers import error_response, register_error_handlers
 from dropshare_server.core.logging import configure_logging, request_id_var
+from dropshare_server.core.rate_limit import SlidingWindowLimiter
 from dropshare_server.dependencies.context import is_https
 from dropshare_server.dependencies.resources import AppResources
+from dropshare_server.mailer.factory import create_mailer
 from dropshare_server.scanner.factory import create_scanner
 from dropshare_server.services.file_policy import FileTypePolicy
 from dropshare_server.services.releases import MinimumVersion
@@ -50,6 +52,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             scanner_probe=create_scanner(
                 resolved, reply_timeout=resolved.clamd_connect_timeout_seconds
             ),
+            mailer=create_mailer(resolved),
+            admin_limiter=SlidingWindowLimiter(resolved.admin_rate_limit_per_minute, 60),
         )
         try:
             yield

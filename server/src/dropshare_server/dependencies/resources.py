@@ -9,6 +9,8 @@ from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from dropshare_server.core.config import Settings
+from dropshare_server.core.rate_limit import SlidingWindowLimiter
+from dropshare_server.mailer.base import Mailer
 from dropshare_server.scanner.base import Scanner
 from dropshare_server.services.file_policy import FileTypePolicy
 from dropshare_server.services.releases import MinimumVersion
@@ -25,6 +27,8 @@ class AppResources:
     file_types: FileTypePolicy  # banned file types (FR-SAFE-02)
     scanner: Scanner  # the malware scanner for scans within a request (FR-SAFE-01)
     scanner_probe: Scanner  # the same, answering within seconds, for /health/ready
+    mailer: Mailer  # temporary-password emails (FR-ADMIN-07)
+    admin_limiter: SlidingWindowLimiter  # admin write actions per admin (NFR-SEC-13)
 
 
 def get_resources(request: Request) -> AppResources:

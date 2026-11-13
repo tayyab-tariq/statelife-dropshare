@@ -8,9 +8,10 @@ from pathlib import Path
 
 from PySide6.QtCore import QObject, Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QApplication, QDialog
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from dropshare_client.controllers import messages
+from dropshare_client.controllers.admin_controller import AdminController
 from dropshare_client.controllers.browser_controller import BrowserController
 from dropshare_client.controllers.devices_controller import DevicesController
 from dropshare_client.controllers.diagnostics_controller import DiagnosticsController
@@ -31,6 +32,7 @@ from dropshare_client.controllers.transfers_controller import TransfersControlle
 from dropshare_client.controllers.trash_controller import TrashController
 from dropshare_client.controllers.update_controller import UpdateController, UpdateState
 from dropshare_client.controllers.upload_controller import UploadController
+from dropshare_client.ui.admin_view import AdminView
 from dropshare_client.ui.browser_view import BrowserView
 from dropshare_client.ui.change_password_dialog import ChangePasswordDialog
 from dropshare_client.ui.main_window import OVERVIEW, MainWindow
@@ -48,7 +50,7 @@ from dropshare_client.ui.transfers_view import TransfersView
 from dropshare_client.ui.trash_view import TrashView
 from dropshare_client.ui.tray import Tray
 from dropshare_client.ui.update_dialog import UpdateDialog
-from dropshare_shared.schemas.users import UserOut
+from dropshare_shared.schemas.users import UserOut, UserRole
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +95,7 @@ class AppShell(QObject):
         folder_move: FolderMoveController,
         diagnostics: DiagnosticsController,
         updates: UpdateController,
+        admin: AdminController,
         background: bool = False,
         tray_available: bool = True,
     ) -> None:
@@ -136,6 +139,12 @@ class AppShell(QObject):
         self.update_dialog: UpdateDialog | None = None
         self.settings_view = SettingsView(settings, devices, diagnostics, updates)
         self.window.add_page(messages.SETTINGS, self.settings_view)
+        # Administration (FR-ADMIN-06): offered to admins only, once signed in.
+        self._admin = admin
+        self.admin_view = AdminView(admin)
+        self.window.add_page(messages.ADMINISTRATION, self.admin_view)
+        self.window.set_page_visible(messages.ADMINISTRATION, False)
+        self.admin_notice: QMessageBox | None = None
         self.window.show_page(messages.MY_FILES)
         self.tray = Tray()
         self.sign_in_dialog = SignInDialog(session)
@@ -206,6 +215,7 @@ class AppShell(QObject):
         updates.ready.connect(notifications.update_ready)
         updates.install_requested.connect(self.quit)  # app.main runs the installer after
         updates.urgent_status.connect(self.window.show_error)  # the server refused this version
+        admin.access_lost.connect(self._admin_access_lost)
 
     def start(self) -> None:
         if self._tray_available:
@@ -269,8 +279,27 @@ class AppShell(QObject):
         self._activity.clear()
         self._cant_sync.clear()
         self._devices.clear()
+        self._admin.clear()
+        self.window.set_page_visible(messages.ADMINISTRATION, False)
         self.settings_view.set_account("")
         self.settings_view.set_lasting_error("")
+
+    def _admin_access_lost(self) -> None:
+        """The server says this account isn't an admin any more (FR-ADMIN-06)."""
+        showing = self.window.current_page_title() == messages.ADMINISTRATION
+        self.window.set_page_visible(messages.ADMINISTRATION, False)
+        if showing:
+            self.window.show_page(messages.MY_FILES)
+        notice = QMessageBox(
+            QMessageBox.Icon.Information,
+            messages.ADMINISTRATION,
+            messages.NOT_ADMIN_ANY_MORE,
+            QMessageBox.StandardButton.Ok,
+            self.window,
+        )
+        notice.setAccessibleName(messages.ADMINISTRATION)
+        self.admin_notice = notice
+        notice.open()
 
     def open_link(self, link: str) -> None:
         """A `statelife-dropshare://` link (FR-SHARE-07), from the command line or another
@@ -323,6 +352,7 @@ class AppShell(QObject):
         self._notifications.account_loaded(user)
         self._settings.apply_autostart()
         self._updates.start()  # now, and every 6 hours (FR-UPD-03)
+        self.window.set_page_visible(messages.ADMINISTRATION, user.role == UserRole.ADMIN)
         if self._folders.current_folder is None:
             self._set_connection(TrayState.PAUSED, _NO_FOLDER)
         elif not self._sync.running:

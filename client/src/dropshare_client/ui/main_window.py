@@ -144,10 +144,26 @@ class MainWindow(QMainWindow):
             self._nav.setCurrentRow(current + 1)
 
     def show_page(self, title: str) -> None:
+        row = self._row(title)
+        if self._nav.isRowHidden(row):
+            raise KeyError(f"{title} isn't available")
+        self._nav.setCurrentRow(row)
+
+    def set_page_visible(self, title: str, visible: bool) -> None:
+        """Offer a section in the sidebar or take it away (Administration, for admins only).
+        Taking away the section shown moves to the first one."""
+        row = self._row(title)
+        self._nav.setRowHidden(row, not visible)
+        if not visible and self._nav.currentRow() == row:
+            self._nav.setCurrentRow(0)
+
+    def page_visible(self, title: str) -> bool:
+        return not self._nav.isRowHidden(self._row(title))
+
+    def _row(self, title: str) -> int:
         for row in range(self._nav.count()):
             if self._nav.item(row).text() == title:
-                self._nav.setCurrentRow(row)
-                return
+                return row
         raise KeyError(title)
 
     def current_page_title(self) -> str:

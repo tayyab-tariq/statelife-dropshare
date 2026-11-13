@@ -114,6 +114,7 @@ In the `dropshare-production` environment, add the secrets:
 |---|---|
 | `DROPSHARE_POSTGRES_PASSWORD` | A long random password |
 | `DROPSHARE_TOKEN_SECRET` | `[Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(48))` |
+| `DROPSHARE_EMAIL_API_KEY` | The email API's key (FR-ADMIN-07). Optional: set it together with the `DROPSHARE_EMAIL_API_URL` variable, or neither |
 
 Variables (all optional):
 
@@ -125,6 +126,7 @@ Variables (all optional):
 | `DROPSHARE_RELEASE_PUBLISHER` | empty | When the code-signing certificate exists (OQ-6) |
 | `DROPSHARE_RELEASE_CERT_SHA256` | `[]` | Same, as a JSON list: `["<sha256>"]` |
 | `DROPSHARE_POSTGRES_USER`, `DROPSHARE_POSTGRES_DB` | `dropshare` | Before the first deploy only |
+| `DROPSHARE_EMAIL_API_URL` | empty | `https://pyapi4.slichealth.com/send_email`, with the `DROPSHARE_EMAIL_API_KEY` secret. Unset, temporary passwords are only shown to the admin |
 
 ### 6. Firewall, then open the port
 

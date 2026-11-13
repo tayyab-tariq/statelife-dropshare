@@ -32,6 +32,9 @@ _BY_CODE: dict[ErrorCode | str, str] = {
     ErrorCode.ACCOUNT_DISABLED: DISABLED,
     ErrorCode.RATE_LIMITED: "Too many attempts. Wait a moment, then try again.",
     ErrorCode.PASSWORD_CHANGE_REQUIRED: "Choose a new password to continue.",
+    ErrorCode.SELF_CHANGE_NOT_ALLOWED: (
+        "You can't change your own status or role. Ask another administrator."
+    ),
 }
 
 
@@ -699,3 +702,96 @@ def update_on_restart(version: str) -> str:
 
 def update_from_source(version: str) -> str:
     return f"Version {version} is available. This copy runs from source, so it isn't updated."
+
+
+# --- administration (FR-ADMIN-02/06/07) ------------------------------------------------------
+
+ADMINISTRATION = "Administration"
+LOADING_USERS = "Loading users…"
+NO_USERS = "There are no user accounts yet. Choose New user to create one."
+NO_MATCHING_USERS = "No user matches that search."
+NOT_ADMIN_ANY_MORE = (
+    "You're no longer an administrator, so the Administration section was closed. "
+    "Contact another administrator if this is a mistake."
+)
+ACTIVE = "Active"
+DISABLED_STATUS = "Disabled"
+ADMIN_ROLE = "Administrator"
+USER_ROLE = "User"
+# A message, not a password.
+TEMPORARY_PASSWORD_HINT = "Shown only once. The user must choose a new password at first sign-in."  # noqa: S105
+TEMPORARY_PASSWORD_COPIED = "Password copied."  # noqa: S105 - a message, not a password
+
+_GIB = 1024**3
+
+
+def gb_text(size: int) -> str:
+    """A quota or usage in GB as the CLI and the quota field count it (1 GB = 1,024³ bytes)."""
+    value = size / _GIB
+    return f"{value:.0f} GB" if value == int(value) else f"{value:.2f} GB"
+
+
+def storage_text(used: int, quota: int) -> str:
+    return f"{gb_text(used)} of {gb_text(quota)}"
+
+
+def user_created(username: str) -> str:
+    return f"{username} was created."
+
+
+def password_reset_done(username: str) -> str:
+    return f"{username}'s password was reset and they were signed out everywhere."
+
+
+def user_disabled(username: str) -> str:
+    return f"{username} was disabled and signed out everywhere. Their files are kept."
+
+
+def user_enabled(username: str) -> str:
+    return f"{username} was enabled and can sign in again."
+
+
+def account_role_changed(username: str, admin: bool) -> str:
+    return f"{username} is now {'an administrator' if admin else 'a regular user'}."
+
+
+def quota_changed(username: str, quota: int) -> str:
+    return f"{username}'s storage limit is now {gb_text(quota)}."
+
+
+def confirm_disable(username: str) -> str:
+    return (
+        f"Disable {username}? They're signed out on every device and can't sign in until "
+        "an administrator enables them again. Their files and shares are kept."
+    )
+
+
+def confirm_reset(username: str) -> str:
+    return (
+        f"Reset {username}'s password? They're signed out on every device, and a new "
+        "temporary password is emailed to them and shown to you once."
+    )
+
+
+def confirm_role(username: str, admin: bool) -> str:
+    if admin:
+        return (
+            f"Make {username} an administrator? They'll be able to create, disable and change "
+            "every account, including yours."
+        )
+    return f"Make {username} a regular user? They lose access to Administration."
+
+
+def email_outcome(outcome: str, email: str) -> str:
+    """What happened to the temporary-password email (FR-ADMIN-07)."""
+    if outcome == "sent":
+        return f"It was also emailed to {email}."
+    if outcome == "not_configured":
+        return (
+            "Email isn't set up on the server, so nothing was sent. Give the password to the "
+            "user yourself."
+        )
+    return (
+        f"The email to {email} couldn't be sent. Give the password to the user yourself, "
+        "or reset it again later."
+    )

@@ -12,6 +12,7 @@ from pathlib import Path
 import httpx
 from pydantic import ValidationError
 
+from dropshare_client.controllers.admin_controller import AdminController
 from dropshare_client.controllers.browser_controller import BrowserController
 from dropshare_client.controllers.devices_controller import DevicesController
 from dropshare_client.controllers.diagnostics_controller import DiagnosticsController
@@ -74,6 +75,7 @@ class Account:
     failures: int = 0
     quota_bytes: int = 10**12
     used_bytes: int = 0
+    role: str = "user"
 
 
 class FakeServer:
@@ -117,6 +119,11 @@ class FakeServer:
         # Signed-in devices (server services/devices.py), and the answer to listing them.
         self.devices: list[DeviceOut] = []
         self.devices_error: httpx.Response | None = None
+        # User administration (server services/admin_users.py): the answer to give any admin
+        # request instead, the email outcome, and the temporary passwords handed out.
+        self.admin_error: httpx.Response | None = None
+        self.email_outcome = "sent"
+        self.issued: list[str] = []
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.calls.append(f"{request.method} {request.url.path}")
@@ -148,6 +155,8 @@ class FakeServer:
             route = self._trash_route(request.method, request.url.path)
         if route is None:
             route = self._devices_route(request.method, request.url.path)
+        if route is None:
+            route = self._admin_route(request.method, request.url.path)
         if route is None:
             return _error(404, "NOT_FOUND", "Not found")
         return route(request)
@@ -294,6 +303,106 @@ class FakeServer:
         if len(parts) == 3 and parts[:2] == ["me", "devices"] and method == "DELETE":
             return lambda request: self._revoke_device(uuid.UUID(parts[2]))
         return None
+
+    # --- user administration (server api/v1/admin_users.py) ----------------------------------
+
+    @staticmethod
+    def user_id(username: str) -> uuid.UUID:
+        return uuid.uuid5(uuid.NAMESPACE_URL, f"dropshare-user:{username}")
+
+    def _admin_route(
+        self, method: str, path: str
+    ) -> Callable[[httpx.Request], httpx.Response] | None:
+        parts = path.split("/")[3:]  # after /api/v1/
+        if parts[:2] != ["admin", "users"]:
+            return None
+        handler: Callable[[httpx.Request, str], httpx.Response] | None = None
+        if parts == ["admin", "users"]:
+            handler = {"GET": self._admin_list, "POST": self._admin_create}.get(method)
+        elif len(parts) == 3 and method == "PATCH":
+            handler = lambda request, admin: self._admin_update(request, admin, parts[2])  # noqa: E731
+        elif len(parts) == 4 and parts[3] == "password-reset" and method == "POST":
+            handler = lambda request, admin: self._admin_reset(admin, parts[2])  # noqa: E731
+        if handler is None:
+            return None
+        chosen = handler
+
+        def guarded(request: httpx.Request) -> httpx.Response:
+            username = self._user(request)
+            if username is None:
+                return _error(401, "UNAUTHENTICATED", "Sign in to continue.")
+            if self.admin_error is not None:
+                return self.admin_error
+            if self.accounts[username].role != "admin":
+                return _error(403, "FORBIDDEN", "Only administrators can do that.")
+            return chosen(request, username)
+
+        return guarded
+
+    def _admin_user(self, username: str) -> dict[str, object]:
+        account = self.accounts[username]
+        return {
+            "id": str(self.user_id(username)),
+            "username": username,
+            "email": f"{username}@example.com",
+            "display_name": username.title(),
+            "role": account.role,
+            "quota_bytes": account.quota_bytes,
+            "used_bytes": account.used_bytes,
+            "status": "disabled" if account.disabled else "active",
+        }
+
+    def _by_id(self, user_id: str) -> str | None:
+        return next((name for name in self.accounts if str(self.user_id(name)) == user_id), None)
+
+    def _admin_list(self, request: httpx.Request, admin: str) -> httpx.Response:
+        return _data([self._admin_user(name) for name in sorted(self.accounts)])
+
+    def _issue(self, username: str) -> httpx.Response:
+        password = f"Temp-{len(self.issued) + 1}-password"
+        self.issued.append(password)
+        account = self.accounts[username]
+        account.password, account.must_change = password, True
+        issued = {
+            "user": self._admin_user(username),
+            "temporary_password": password,
+            "email": self.email_outcome,
+        }
+        return httpx.Response(200, json={"data": issued}, headers={"X-Request-ID": "req-1"})
+
+    def _admin_create(self, request: httpx.Request, admin: str) -> httpx.Response:
+        body = json.loads(request.content)
+        username = body["username"]
+        if username.casefold() in (name.casefold() for name in self.accounts):
+            return _error(409, "NAME_CONFLICT", f"Username '{username}' is already taken.")
+        self.accounts[username] = Account(
+            password="", role=body["role"], quota_bytes=body["quota_bytes"]
+        )
+        response = self._issue(username)
+        response.status_code = 201
+        return response
+
+    def _admin_update(self, request: httpx.Request, admin: str, user_id: str) -> httpx.Response:
+        username = self._by_id(user_id)
+        if username is None:
+            return _error(404, "NOT_FOUND", "That user doesn't exist.")
+        body = json.loads(request.content)
+        if username == admin and ("status" in body or "role" in body):
+            return _error(409, "SELF_CHANGE_NOT_ALLOWED", "You can't change your own role.")
+        account = self.accounts[username]
+        if "quota_bytes" in body and body["quota_bytes"] < account.used_bytes:
+            return _error(400, "VALIDATION_ERROR", f"'{username}' already uses more than that.")
+        if "status" in body:
+            account.disabled = body["status"] == "disabled"
+        account.role = body.get("role", account.role)
+        account.quota_bytes = body.get("quota_bytes", account.quota_bytes)
+        return _data(self._admin_user(username))
+
+    def _admin_reset(self, admin: str, user_id: str) -> httpx.Response:
+        username = self._by_id(user_id)
+        if username is None:
+            return _error(404, "NOT_FOUND", "That user doesn't exist.")
+        return self._issue(username)
 
     def device(self, name: str, *, current: bool = False) -> DeviceOut:
         seen = datetime(2026, 10, 28, 9, 30, tzinfo=UTC)
@@ -572,7 +681,7 @@ class FakeServer:
                 "username": username,
                 "email": f"{username}@example.com",
                 "display_name": username.title(),
-                "role": "user",
+                "role": self.accounts[username].role,
                 "quota_bytes": self.accounts[username].quota_bytes,
                 "used_bytes": self.accounts[username].used_bytes,
             }
@@ -801,6 +910,7 @@ class Client:
     app_data: Path
     updater: "FakeUpdates"
     updates: UpdateController
+    admin: AdminController
 
 
 def release_out(version: str, notes: str = "Faster uploads.") -> ReleaseOut:

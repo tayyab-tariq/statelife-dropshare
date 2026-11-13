@@ -1,4 +1,5 @@
-"""Account administration used by the admin CLI (FR-ADMIN-01). No HTTP endpoints in v1."""
+"""Account administration (FR-ADMIN-01): used by the admin CLI, and by `admin_users` for the
+Administration section of the app (FR-ADMIN-02)."""
 
 import uuid
 from dataclasses import dataclass
@@ -193,6 +194,24 @@ def set_quota(session: Session, ctx: CallContext, username: str, quota_bytes: in
         AuditAction.USER_QUOTA_CHANGED,
         target=user_target(user),
         details={"old_quota_bytes": old_quota, "quota_bytes": quota_bytes},
+    )
+    return to_out(user)
+
+
+def set_role(session: Session, ctx: CallContext, username: str, role: UserRole) -> UserOut:
+    """Make a user an admin or a plain user (FR-ADMIN-02). The caller checks that an enabled
+    admin remains; the role is read from the database on every request, so it takes effect at
+    the user's next request."""
+    user = _require(session, username)
+    old_role = user.role
+    user.role = role
+    user.updated_at = datetime.now(UTC)
+    audit_service.record(
+        session,
+        ctx,
+        AuditAction.USER_ROLE_CHANGED,
+        target=user_target(user),
+        details={"old_role": old_role.value, "role": role.value},
     )
     return to_out(user)
 

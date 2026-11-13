@@ -25,6 +25,10 @@ x-app: &app
     TRUSTED_PROXIES: ${DROPSHARE_TRUSTED_PROXIES:-[]}
     RELEASE_PUBLISHER: ${DROPSHARE_RELEASE_PUBLISHER:-}
     RELEASE_CERT_SHA256: ${DROPSHARE_RELEASE_CERT_SHA256:-[]}
+    # Email API for temporary passwords (FR-ADMIN-07): both or neither. Empty means admins
+    # pass the password on themselves.
+    EMAIL_API_URL: ${DROPSHARE_EMAIL_API_URL:-}
+    EMAIL_API_KEY: ${DROPSHARE_EMAIL_API_KEY:-}
     # Malware scanner (FR-SAFE-01). While it can't be reached, uploads wait (OQ-55).
     CLAMD_HOST: clamav
   volumes:

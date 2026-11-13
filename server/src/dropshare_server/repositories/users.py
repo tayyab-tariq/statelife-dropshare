@@ -4,7 +4,7 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from dropshare_server.models import User
-from dropshare_shared.schemas.users import UserStatus
+from dropshare_shared.schemas.users import UserRole, UserStatus
 
 
 def add(session: Session, user: User) -> None:
@@ -29,6 +29,21 @@ def get_for_update(session: Session, user_id: uuid.UUID) -> User | None:
         .with_for_update(key_share=True)
         .execution_options(populate_existing=True)
     ).one_or_none()
+
+
+def lock_admins(session: Session) -> list[User]:
+    """Lock every admin's row, in ID order so two callers never deadlock (FR-ADMIN-02). A change
+    that could leave no enabled admin counts them under this lock, so two admins demoting each
+    other at once can't both succeed. `key_share` as in `get_for_update`."""
+    return list(
+        session.scalars(
+            select(User)
+            .where(User.role == UserRole.ADMIN)
+            .order_by(User.id)
+            .with_for_update(key_share=True)
+            .execution_options(populate_existing=True)
+        )
+    )
 
 
 def get_by_username(session: Session, username_normalized: str) -> User | None:
